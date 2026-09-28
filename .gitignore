@@ -1,0 +1,17 @@
+sortie*/
+comparaison/
+__pycache__/
+*.pyc
+*.pkl
+*.log
+*.jsonl
+.ruff_cache/
+.venv/
+venv/
+.env
+*.pdf
+*.zip
+*.jpg
+*.jpeg
+*.png
+!benchmark/pages/*.png

@@ -1,0 +1,8 @@
+pytesseract>=0.3.10
+pillow>=10.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+# Recommandé : active les passes 2 et 3 (EasyOCR arabe + français). Installe PyTorch (~2 Go).
+# Sans lui, le script fonctionne avec Tesseract seul (moins précis).
+easyocr>=1.7.0
