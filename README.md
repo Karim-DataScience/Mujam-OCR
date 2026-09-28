@@ -1,96 +1,156 @@
-# Extraction du « Livre des prénoms arabes » en local (pipeline OCR à 3 passes)
+# Extraction du « Livre des prénoms arabes » — v2 (multi-cœur + GPU)
 
-Ce dossier contient le script qui produit `prenoms_arabes.csv` / `.json` / `.xlsx`
-à partir du PDF scanné. Tout est **local, gratuit et open source** :
-Tesseract (Apache-2.0), EasyOCR (Apache-2.0), Poppler, pandas, openpyxl.
+Réécriture pour ta config (Ryzen 9 9955HX, RTX 5070 Ti 12 Go, 32 Go RAM),
+optimisée pour du **multi-cœur** et un **GPU récent**, avec du code plus
+robuste : reprise automatique par page, tests unitaires, autotest de
+qualité, colonne « à vérifier ».
 
-## Pourquoi plusieurs outils ?
+**Lis la section « Ce qui est solide / ce qui est incertain » avant de te fier
+aux chiffres d'exactitude arabe.** Je préfère être direct là-dessus plutôt que
+de survendre.
 
-Le PDF est un scan sans texte, mêlant français et arabe. Aucun OCR généraliste
-n'est bon partout, donc chaque outil fait ce qu'il fait le mieux :
+## Nouveautés vs la v1
 
-| Passe | Outil | Rôle |
+| | v1 | v2 |
 |---|---|---|
-| 1 | **Tesseract** `fra+ara` | Structure de la page, positions, couleurs (rouge = féminin), texte français |
-| 2 | **EasyOCR arabe** | Relit chaque zone en script arabe repérée par Tesseract |
-| 3 | **EasyOCR français** | Relit *uniquement* les mots latins que Tesseract juge peu fiables (confiance < 80), avec des garde-fous stricts avant tout remplacement (confiance ≥ 0,80, caractères plausibles, longueur cohérente, apostrophes préservées) |
+| Tesseract | 1 processus, séquentiel | **N processus en parallèle** (1/cœur) |
+| Image source | rasterisée à 300 DPI (~5700×9000 px) | **image native du scan** (~1800×2900 px) : 2 à 3× plus rapide, et au moins aussi précise dans mes tests |
+| GPU | non | **oui** (CUDA), avec détection réelle (pas juste « torch.cuda.is_available() ») et messages d'aide spécifiques RTX 50 |
+| Reprise | reprend après la dernière page réussie | **cache par page** (OCR et relectures séparément) : relancer la même commande ne refait *rien* de déjà calculé, même après avoir changé une option |
+| Erreurs | une page en échec pouvait interrompre le lot | **une page en échec est journalisée et sautée**, le reste continue |
+| Contrôle qualité | aucun | **colonne "À vérifier"** (chiffres mêlés à des lettres, arabe vide, définition tronquée...) + feuille Excel séparée pour ces lignes |
+| Tests | aucun | **13 tests unitaires** (`test_parsing.py`) + **autotest** (`--autotest`, 4 pages, vérité terrain) |
+| Portabilité | Poppler obligatoire | **PyMuPDF en option** (`pip install pymupdf`) : plus simple sous Windows, pas d'exécutable externe à installer |
 
-Exemples vérifiés (test sur 10 entrées, pages PDF 55-56) :
+## Installation
 
-| Cas | Tesseract seul | 3 passes |
-|---|---|---|
-| Arabe de *Idris* | `سحي` | `إدريس` |
-| Arabe de *Houd* | `صود` | `هود` |
-| Arabe de *Adam* | `ادم` | `آدم` |
-| Sens de *Salih* (mot en italique) | `11116916,` | `intègre,` |
-| Sens d'*Idris* (mot en italique) | `00/141…` | `calame` |
-| Sens de *Salih* | `Thamüûd` | `Thamûd` |
+### 1. Outils système (Tesseract obligatoire ; Poppler optionnel si PyMuPDF installé)
 
-⚠️ Ce test porte sur un petit échantillon : il montre que la méthode marche, pas
-un taux d'amélioration global. Le reste de l'arabe n'est pas parfait (ex. *Hawa*
-`حسواء`, *Chisse* `شث`, *Ibrahim* partiel).
+```bash
+# Ubuntu/Debian
+sudo apt-get install tesseract-ocr tesseract-ocr-fra tesseract-ocr-ara
 
-## 1. Installer les outils système
+# macOS
+brew install tesseract tesseract-lang
+```
+Windows : installer Tesseract via [UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki)
+(cocher French + Arabic). Pas besoin de Poppler si tu installes `pymupdf` (étape 2).
 
-**macOS** (Homebrew) : `brew install tesseract tesseract-lang poppler`
-
-**Ubuntu / Debian** : `sudo apt-get install tesseract-ocr tesseract-ocr-fra tesseract-ocr-ara poppler-utils`
-
-**Windows** : installer Tesseract ([UB-Mannheim](https://github.com/UB-Mannheim/tesseract/wiki), cocher French + Arabic)
-et [Poppler pour Windows](https://github.com/oschwartz10612/poppler-windows) (ajouter `bin` au PATH).
-
-Vérifier : `tesseract --list-langs` doit afficher `fra` et `ara`.
-
-## 2. Installer les paquets Python
+### 2. Paquets Python
 
 ```bash
 pip install -r requirements.txt
 ```
-Au premier lancement, EasyOCR télécharge automatiquement ses modèles (~300 Mo,
-depuis GitHub). Ensuite tout fonctionne hors ligne.
 
-## 3. Lancer
+### 3. PyTorch avec le bon CUDA pour une RTX 50 (Blackwell)
+
+**Point important pour ta carte** : `pip install easyocr` installe un PyTorch
+générique qui ne reconnaît PAS encore l'architecture `sm_120` des RTX 50 —
+tu obtiendrais une erreur `no kernel image is available` ou EasyOCR
+tournerait silencieusement sur CPU. Force la bonne version :
 
 ```bash
-python3 extraire_prenoms.py chemin/vers/lelivredesprenom0000geof.pdf
+pip uninstall -y torch torchvision torchaudio
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
-Par défaut : pages PDF 53 à 338 (tout le dictionnaire), résultats dans `./sortie/`.
+Si l'erreur persiste (pilote très récent, ou cu128 pas encore diffusé pour
+Blackwell au moment où tu lis ceci), essaie la version nightly :
+```bash
+pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+```
+
+### 4. Vérifier
+
+```bash
+python extraire_prenoms.py --diagnostic
+```
+Doit afficher `GPU OK : NVIDIA GeForce RTX 5070 Ti (sm_120, 12 Go)...`. Si ce
+n'est pas le cas, le message d'erreur affiché contient la commande à essayer.
+
+## Utilisation
+
+```bash
+# 1) Vérifie d'abord la qualité sur 4 pages connues (~1 min avec GPU)
+python extraire_prenoms.py livre.pdf --autotest
+
+# 2) Le livre entier
+python extraire_prenoms.py livre.pdf --gpu oui --workers 14
+```
+
+Avec ton CPU (16 cœurs / 32 threads) et ta RTX 5070 Ti, compter grossièrement
+**10-20 minutes** pour les 286 pages (Tesseract en parallèle sur CPU pendant
+qu'EasyOCR tourne sur GPU) — contre 1h30-2h30 en CPU pur sur un portable
+classique. Le detail dépend beaucoup de `--batch` (essaie 32, monte à 64 si
+`nvidia-smi` montre de la VRAM libre, baisse à 8-16 si tu vois une erreur
+"out of memory").
+
+### Options principales
 
 | Option | Effet |
 |---|---|
-| `--debut N --fin M` | Limiter la plage de pages (pour tester : `--debut 55 --fin 60`) |
-| `--dossier-sortie DIR` | Dossier de sortie |
-| `--reprendre` | Reprend après une interruption (progression sauvegardée après **chaque** page) |
-| `--sans-easyocr-latin` | Garde la passe arabe, saute la passe française |
-| `--sans-easyocr` | Tesseract seul (le plus rapide, le moins précis) |
-| `--gpu` | Passes EasyOCR sur GPU (CUDA) : beaucoup plus rapide si tu as une carte NVIDIA |
-| `--dpi 300` | Résolution de rasterisation (200 va ~40 % plus vite mais perd des entrées) |
+| `--workers 14` | processus Tesseract en parallèle (0 = auto ≈ cœurs physiques − 1) |
+| `--gpu oui/non/auto` | GPU pour EasyOCR (par défaut auto : utilisé s'il passe le test réel) |
+| `--batch 32` | taille de lot GPU EasyOCR |
+| `--arabe mots` | relecture arabe mot par mot (défaut, validé) — `bandes` est expérimental, `non` désactive |
+| `--sans-latin` | désactive seulement la relecture des mots latins douteux |
+| `--sans-easyocr` | Tesseract seul, aucune relecture |
+| `--pages 55,56,100-104` | traite une liste explicite de pages |
+| `--refaire` | ignore le cache pour les pages demandées |
+| `--tesseract CHEMIN` / `--poppler DOSSIER` | si les outils ne sont pas dans le PATH |
 
-**Durée** : sur CPU, compter ~20-30 s/page avec les 3 passes, soit **1h30 à 2h30**
-pour tout le livre (~1h avec `--sans-easyocr`). Sans easyocr installé, le script
-le signale et continue avec Tesseract seul.
+Le **cache** (`sortie/cache/`) sépare l'OCR de base et les relectures : si tu
+relances avec une autre option (ex. `--arabe non` puis `--arabe mots`), seul
+ce qui a changé est recalculé.
 
-## Fichiers produits
+## Ce qui est solide / ce qui est incertain
 
-`prenoms_arabes.csv` (UTF-8 avec BOM, s'ouvre bien dans Excel), `.json`, `.xlsx`.
-Colonnes : `ID`, `Prénom(s)`, `Genre`, `Arabe`, `Translittération`, `Équivalent`,
-`Signification`, `Thème`, `Sous-thème`, `Page (imprimée)`, `Page (PDF)`
-(la page permet de vérifier n'importe quelle entrée dans le PDF).
+**Solide, mesuré** :
+- Le passage à l'image native (au lieu du 300 DPI suréchantillonné) : 2-3×
+  plus rapide, sans perte de qualité mesurée sur mes pages de test.
+- Le parallélisme Tesseract : aucune perte de qualité (c'est le même calcul,
+  juste réparti), gain ≈ proportionnel au nombre de cœurs utilisés.
+- Les garde-fous de la relecture latine (tests unitaires dédiés) : ils
+  corrigent des cas concrets (mot italique lu comme des chiffres) sans
+  introduire les régressions que j'ai détectées puis corrigées en cours de
+  route (troncatures acceptées à tort, par ex.).
 
-## Limites connues
+**Incertain, à ton propre risque** : la relecture EasyOCR de l'arabe. En
+testant ce script, j'ai mesuré des résultats **incohérents d'une exécution à
+l'autre sur les mêmes pages** — parfois une nette amélioration (comme montré
+dans la v1), parfois un résultat pire que Tesseract seul, sans que j'aie pu
+identifier la cause exacte dans le temps disponible (peut-être une
+sensibilité d'EasyOCR au cadrage exact, peut-être une interaction entre les
+passes). Le mode par défaut (`--arabe mots`) est la version la plus simple et
+la plus testée, mais **ne considère pas le taux d'exactitude arabe comme
+fiable tant que tu ne l'as pas vérifié toi-même** avec `--autotest` sur ta
+machine. La colonne `Arabe (Tesseract)` est conservée à côté de `Arabe`
+quand les deux moteurs sont en désaccord, précisément pour te permettre de
+comparer plutôt que de faire confiance aveuglément.
 
-- Diacritiques arabes (tashkeel) : perdus par les deux moteurs ; les consonnes sont mieux lues qu'avant mais pas toujours.
-- Lignes mêlant arabe et français : des mots peuvent être réordonnés ou tronqués (ex. la définition de *Khalilallah*).
-- Certaines variantes bizarres sont **imprimées telles quelles** dans le livre (ex. *Ralilallah*) : ce n'est pas du bruit OCR.
-- Les garde-fous de la passe 3 sont volontairement prudents : ils préfèrent laisser un mot douteux que d'introduire une erreur.
+`--autotest` te donne un repère chiffré en ~1 minute : si `arabe_exact` est
+proche de 0/22 sur ta machine, désactive l'arabe (`--arabe non`) et garde
+seulement les gains solides (vitesse, français, structure).
 
-## Pour aller plus loin (non testé ici)
+## Fichiers
 
-- **PaddleOCR** (Apache-2.0) : autre moteur avec modèle arabe, utilisable comme quatrième passe / vote.
-- **Kraken** (Apache-2.0) : OCR entraînable — la meilleure piste pour un gain durable est d'entraîner un modèle sur la typographie de ce livre à partir de quelques dizaines de pages corrigées à la main.
-- **Vérification ciblée** : filtrer dans le CSV les entrées à `Arabe` vide ou à `Signification` contenant beaucoup de chiffres, et les corriger à la main via la colonne page.
+- `extraire_prenoms.py` — le script (1236 lignes, commenté)
+- `verite_terrain.py` — les 4 pages + réponses attendues utilisées par `--autotest`
+- `test_parsing.py` — 13 tests unitaires (`python test_parsing.py`), sans OCR ni GPU, s'exécutent en une seconde
+- `requirements.txt`
+
+## Colonnes du fichier de sortie
+
+`ID`, `Prénom(s)`, `Genre`, `Arabe`, `Arabe (Tesseract)` (rempli seulement si
+les deux moteurs divergent), `Translittération`, `Équivalent`,
+`Signification`, `Thème`, `Sous-thème`, `Page (imprimée)`, `Page (PDF)`,
+**`À vérifier`** (liste de drapeaux : `arabe_vide`, `arabe_divergent`,
+`chiffres_dans_mot`, `suite_de_chiffres`, `caracteres_suspects`,
+`sans_point_final`, `translit_vide`, `vedette_courte`). Le fichier Excel a
+une deuxième feuille ne contenant que les lignes à drapeau (hors
+`arabe_vide`, trop fréquent pour être utile seul), et surligne ces mêmes
+lignes en jaune dans la feuille principale.
 
 ## Adapter à un autre livre
 
-Le bloc `CHAPTERS` en tête de script encode la table des matières de CE livre
-(chapitres, sous-thèmes, pages) ; `PAGE_OFFSET` = décalage pagination PDF / imprimée.
+Le bloc `CHAPTERS` en tête de fichier encode la table des matières de CE
+livre ; `PAGE_OFFSET` = décalage pagination PDF / imprimée.
