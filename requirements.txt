@@ -1,10 +1,5 @@
-pytesseract>=0.3.10
 pillow>=10.0.0
 numpy>=1.24.0
-pandas>=2.0.0
 openpyxl>=3.1.0
-psutil>=5.9.0
-# Optionnel mais recommandé : relecture de l'arabe et des mots latins douteux (~2 Go, PyTorch inclus)
-easyocr>=1.7.0
-# Pour extraire les pages sans Poppler (plus simple sous Windows) :
+# Lecture de l'image d'origine de chaque page du PDF (aucun exécutable externe à installer)
 pymupdf>=1.24.0
