@@ -1,24 +1,38 @@
 # -*- coding: utf-8 -*-
-"""Tests de extraire_prenoms_llm.py — sans LM Studio ni GPU (un FAUX serveur simule le modèle).
+"""Tests de extraire_prenoms_llm.py (v4) — sans LM Studio ni GPU : un FAUX serveur LM Studio simule le modèle
+(API native + API OpenAI, streaming SSE, pannes : boucle de réflexion, silence, réglage « off » ignoré, erreurs HTTP...).
 
     python test_extraire_prenoms_llm.py
     python test_extraire_prenoms_llm.py -v
 
-Le test de bout en bout utilise le vrai PDF s'il est trouvé (variable PDF_LIVRE, ou à côté du script,
-ou /mnt/user-data/uploads) ; sinon il est ignoré.
+Les tests de bout en bout utilisent le vrai PDF (variable PDF_LIVRE, ou livre.pdf à côté du script) et sont ignorés
+s'il est introuvable.
 """
+import _thread
+import argparse
+import base64
+import contextlib
 import csv
+import glob
 import hashlib
+import io
 import json
 import os
+import random
 import shutil
 import tempfile
 import threading
+import time
 import unittest
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 import numpy as np
 from PIL import Image
+
+# la configuration de l'utilisateur ne doit jamais influencer les tests
+os.environ["PRENOMS_CONFIG"] = os.path.join(tempfile.gettempdir(), "prenoms_config_tests_absent.json")
 
 import extraire_prenoms_llm as X
 import verite_terrain as VT
@@ -66,9 +80,13 @@ class TestJSON(unittest.TestCase):
         self.assertEqual(len(obj["entrees"]), 1)
 
     def test_exemple_du_prompt_detecte(self):
-        self.assertTrue(X.est_exemple(X.normaliser_page(EXEMPLE_PROMPT)))
-        self.assertFalse(X.est_exemple(X.normaliser_page({"entrees": [
-            {"prenoms": [{"genre": "MASCULIN", "orthographes": ["Youssef"], "arabe": ""}], "description": "x"}]})))
+        copie = {"entrees": [{"prenoms": [{"genre": "MASCULIN", "orthographes": ["Karim"], "arabe": "كَرِيم"}],
+                              "description": X.EXEMPLE_DESC}]}
+        self.assertTrue(X.est_exemple(X.normaliser_page(copie)))
+        autre = {"entrees": [{"prenoms": [{"genre": "MASCULIN", "orthographes": ["Karim"], "arabe": ""}],
+                              "description": "Karîm : noble."}]}
+        self.assertFalse(X.est_exemple(X.normaliser_page(autre)))
+        self.assertFalse(X.est_exemple([]))
 
 
 class TestNormalisation(unittest.TestCase):
@@ -278,13 +296,545 @@ P150 = [
 ]
 
 
+
+
+# ---------------------------------------------------------------- tests unitaires du client et du pipeline v4
+
+class TestBoucle(unittest.TestCase):
+    def test_phrase_repetee(self):
+        t = "Je vérifie encore l'arabe de ce prénom pour être sûr. " * 20
+        self.assertTrue(X.detecter_boucle(t))
+        self.assertTrue(X.detecter_boucle(t, prose=True))
+
+    def test_texte_court_ou_normal_non_detecte(self):
+        self.assertFalse(X.detecter_boucle("abcabcabc"))
+        rnd = random.Random(1)
+        vocab = [f"mot{i}" for i in range(300)]
+        prose = " ".join(rnd.choice(vocab) for _ in range(700))
+        self.assertFalse(X.detecter_boucle(prose, prose=True))
+
+    def test_variantes_detectees_en_prose_seulement(self):
+        t = " ".join(f"Je vérifie encore l'entrée numéro {i} pour être sûr que tout est correct." for i in range(60))
+        self.assertTrue(X.detecter_boucle(t, prose=True))
+        self.assertFalse(X.detecter_boucle(t))
+
+    def test_json_realiste_non_detecte(self):
+        self.assertFalse(X.detecter_boucle(json.dumps({"entrees": P150 + P55}, ensure_ascii=False)))
+
+    def test_longue_suite_de_caracteres_identiques(self):
+        self.assertTrue(X.detecter_boucle("x" * 600))
+
+
+class TestPhaseOpenAI(unittest.TestCase):
+    def sortie(self, morceaux):
+        ph, out = X.PhaseOpenAI(), []
+        for m in morceaux:
+            out += ph.separer(m)
+        out += ph.vider()
+        ref = "".join(t for k, t in out if k == "reflexion")
+        rep_ = "".join(t for k, t in out if k == "reponse")
+        return ref, rep_
+
+    def test_json_direct(self):
+        self.assertEqual(self.sortie(['{"entrees"', ': []}']), ("", '{"entrees": []}'))
+
+    def test_balise_think_ouverte(self):
+        ref, rep_ = self.sortie(["<thi", "nk>Je regarde la page.", "</think>", '{"a": 1}'])
+        self.assertEqual((ref, rep_), ("Je regarde la page.", '{"a": 1}'))
+
+    def test_reflexion_implicite_balise_fermante_coupee_entre_deux_morceaux(self):
+        ref, rep_ = self.sortie(["Je regarde la page et je réfléchis longuement.", "</thi", "nk>", "\n{\"a\": 1}"])
+        self.assertEqual(ref, "Je regarde la page et je réfléchis longuement.")
+        self.assertEqual(rep_.strip(), '{"a": 1}')
+
+    def test_bloc_markdown_est_une_reponse(self):
+        ref, rep_ = self.sortie(["```json\n", '{"a": 1}', "\n```"])
+        self.assertEqual(ref, "")
+        self.assertIn('{"a": 1}', rep_)
+
+    def test_reponse_courte_videe_a_la_fin(self):
+        self.assertEqual(self.sortie(["OK"]), ("", "OK"))
+
+
+class _FauxFlux:
+    def __init__(self, data: bytes):
+        self.f = io.BytesIO(data)
+
+    def readline(self):
+        return self.f.readline()
+
+
+class TestSSE(unittest.TestCase):
+    def test_lignes_sse(self):
+        data = b'event: a\ndata: {"x":1}\n\n: commentaire\nevent: b\ndata: {"y":2}\n\ndata: [DONE]\n\n'
+        self.assertEqual(list(X._lignes_sse(_FauxFlux(data))), [("a", '{"x":1}'), ("b", '{"y":2}'), ("", "[DONE]")])
+
+    def test_flux_natif(self):
+        evs = [("prompt_processing.progress", {"progress": 0.5}), ("reasoning.delta", {"content": "pense"}),
+               ("message.delta", {"content": "{}"}), ("error", {"error": {"message": "boum"}}),
+               ("chat.end", {"result": {"stats": {"input_tokens": 12}}})]
+        data = "".join(f"event: {t}\ndata: {json.dumps(dict(d, type=t))}\n\n" for t, d in evs).encode()
+        self.assertEqual(list(X._flux_natif(_FauxFlux(data))),
+                         [("prefill", 0.5), ("reflexion", "pense"), ("reponse", "{}"), ("erreur", "boum"),
+                          ("fin", {"stats": {"input_tokens": 12}})])
+
+    def test_flux_openai_usage_et_raison(self):
+        chunks = [{"choices": [{"delta": {"reasoning_content": "hm"}}]}, {"choices": [{"delta": {"content": "{}"}}]},
+                  {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                  {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}}]
+        data = ("".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
+        evs = list(X._flux_openai(_FauxFlux(data)))
+        self.assertEqual(evs[:2], [("reflexion", "hm"), ("reponse", "{}")])
+        self.assertEqual(evs[-1], ("fin", {"finish": "stop", "stats": {"input_tokens": 7, "total_output_tokens": 3}}))
+
+
+class TestUrlEtCommande(unittest.TestCase):
+    def test_cible(self):
+        cfg = X.Config(url="http://127.0.0.1:1234/v1")
+        self.assertEqual(X._cible(cfg), ("http", "127.0.0.1", 1234, ""))
+        self.assertEqual(X._cible(X.Config(url="localhost:5000/")), ("http", "localhost", 5000, ""))
+        self.assertEqual(X._chemin(X.Config(url="http://h:1/proxy/v1/"), "/api/v1/chat"), "/proxy/api/v1/chat")
+
+    def test_commande_lms_et_arrondi(self):
+        self.assertEqual(X.arrondi_1024(9000), 9216)
+        self.assertEqual(X.arrondi_1024(1024), 1024)
+        c = X.commande_lms("prism-ml/bonsai-27b", 12288, 1)
+        self.assertEqual(c, "lms load prism-ml/bonsai-27b --context-length 12288 --parallel 1 --gpu max "
+                            "--identifier prism-ml/bonsai-27b -y")
+
+
+class TestBudget(unittest.TestCase):
+    def etat(self, ctx, entree, parallele=1, reflexion="non"):
+        cfg = X.Config(paralleles=parallele, reflexion=reflexion)
+        info = X.InfoModele(id="m", cle="m", natif=True, ctx=ctx, options_reflexion=["off", "on"])
+        etat = X.Etat(cfg, info)
+        etat.tokens_entree = entree
+        return cfg, etat
+
+    def test_sortie_bornee_par_le_contexte(self):
+        cfg, etat = self.etat(12000, 6000)
+        with contextlib.redirect_stdout(io.StringIO()):
+            X.budgeter(cfg, etat)
+        self.assertEqual(etat.sortie_max, 12000 - 6000 - 128)
+
+    def test_contexte_trop_court(self):
+        cfg, etat = self.etat(6500, 6000)
+        with self.assertRaises(X.ErreurFatale) as cm:
+            X.budgeter(cfg, etat)
+        self.assertIn("Contexte trop court", str(cm.exception))
+        self.assertIn("lms load", str(cm.exception))
+
+    def test_parallelisme_reduit(self):
+        cfg, etat = self.etat(12000, 3000, parallele=3)
+        with contextlib.redirect_stdout(io.StringIO()):
+            X.budgeter(cfg, etat)
+        self.assertEqual(cfg.paralleles, 1)
+        cfg, etat = self.etat(30000, 3000, parallele=3)
+        with contextlib.redirect_stdout(io.StringIO()):
+            X.budgeter(cfg, etat)
+        self.assertEqual(cfg.paralleles, 3)
+
+    def test_modes_de_reflexion(self):
+        _, e = self.etat(32768, 3000, reflexion="auto")
+        self.assertFalse(e.penser)                                      # LM Studio permet « off » : réflexion coupée
+        _, e = self.etat(32768, 3000, reflexion="oui")
+        self.assertTrue(e.penser)
+        self.assertEqual(e.budget(False), 200)
+        self.assertEqual(e.budget(True), max(1000, e.sortie_max - 2500))
+        cfg = X.Config(reflexion="auto")
+        e = X.Etat(cfg, X.InfoModele(id="m", natif=True, options_reflexion=[]))
+        self.assertTrue(e.penser)                                       # pas de réglage exposé : réflexion bornée
+
+
+class TestCacheEtStatuts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = X.Config(sortie=self.tmp, pages=[55, 56])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def ecrire(self, page, **champs):
+        d = {"page": page, "bande": 1, "statut": "ok", "empreinte": X.empreinte(self.cfg), "max_tokens": 8000,
+             "duree": 3.0, "tokens": 10, "entrees": []}
+        d.update(champs)
+        X.ecrire_atomique(X.chemin_cache(self.cfg, page, 1), json.dumps(d))
+
+    def test_lire_cache(self):
+        self.assertEqual(X.lire_cache(self.cfg, 55, 1), (None, False))                  # absent
+        self.ecrire(55)
+        d, perime = X.lire_cache(self.cfg, 55, 1)
+        self.assertEqual((d["page"], perime), (55, False))
+        self.cfg.prompt = "autre prompt"
+        self.assertEqual(X.lire_cache(self.cfg, 55, 1), (None, True))                   # prompt changé : périmé
+
+    def test_partiel_retente_avec_un_budget_plus_grand(self):
+        self.ecrire(55, statut="partiel", max_tokens=4000)
+        self.assertEqual(X.lire_cache(self.cfg, 55, 1), (None, False))
+        self.cfg.max_tokens = 3000
+        self.assertIsNotNone(X.lire_cache(self.cfg, 55, 1)[0])
+
+    def test_empreinte_ignore_les_reglages_de_generation(self):
+        a = X.empreinte(self.cfg)
+        self.cfg.temperature, self.cfg.max_tokens, self.cfg.reflexion = 0.9, 123, "oui"
+        self.assertEqual(a, X.empreinte(self.cfg))
+        self.cfg.tokens_image = 1000
+        self.assertNotEqual(a, X.empreinte(self.cfg))
+
+    def test_construire_statuts(self):
+        res = {"page": 55, "bande": 1, "statut": "ok", "entrees": [], "duree": 2.0, "tokens": 5, "tokens_reflexion": 0,
+               "tokens_entree": 100, "tps": 20.0}
+        rows, infos, _ = X.construire(self.cfg, {(55, 1): res}, {(56, 1): "ErreurLLM: HTTP 500 : boom"})
+        self.assertEqual([(i["page_pdf"], i["statut"]) for i in infos], [(55, "ok"), (56, "échec")])
+        self.assertIn("boom", infos[1]["remarque"])
+        rows, infos, _ = X.construire(self.cfg, {(55, 1): res}, {})
+        self.assertEqual(infos[1]["statut"], "à faire")
+        self.assertEqual(infos[0]["tok_s"], 20.0)
+
+
+class TestGPU(unittest.TestCase):
+    def test_sans_nvidia_smi(self):
+        with mock.patch.object(X.shutil, "which", return_value=None):
+            g = X.EchantillonGPU()
+        self.assertFalse(g.disponible)
+        self.assertIsNone(g.instantane())
+        self.assertIsNone(g.resume())
+
+    def test_lecture_et_resume(self):
+        sortie = "37, 4321, 12227, 55.2, 115.00, 2100, 61, NVIDIA GeForce RTX 5070 Ti Laptop GPU\n"
+        faux = mock.Mock(stdout=sortie)
+        with mock.patch.object(X.shutil, "which", return_value="nvidia-smi"), \
+                mock.patch.object(X.subprocess, "run", return_value=faux):
+            g = X.EchantillonGPU(0.01)
+            m = g.instantane()
+            self.assertEqual((m["util"], m["mem"], m["mem_tot"], m["nom"]), (37.0, 4321.0, 12227.0, "NVIDIA GeForce RTX 5070 Ti Laptop GPU"))
+            with g:
+                time.sleep(0.15)
+        r = g.resume()
+        self.assertIsNotNone(r)
+        self.assertEqual((r["util_moy"], r["mem_max"], r["mem_tot"]), (37.0, 4321.0, 12227.0))
+
+    def test_valeurs_non_disponibles(self):
+        faux = mock.Mock(stdout="10, 100, 12000, [N/A], [N/A], 1500, 50, GPU\n")
+        with mock.patch.object(X.shutil, "which", return_value="nvidia-smi"), \
+                mock.patch.object(X.subprocess, "run", return_value=faux):
+            m = X.EchantillonGPU().instantane()
+        self.assertIsNone(m["pw"])
+        self.assertEqual(m["util"], 10.0)
+
+
+# ---------------------------------------------------------------- journal, configuration, rapport, pont moteur/interface
+
+class TestJournal(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        X.JOURNAL.fermer()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def lire(chemin):
+        with open(chemin, encoding="utf-8") as f:
+            return f.read()
+
+    def test_attente_avant_ouverture_puis_ecriture(self):
+        j = X.Journal()
+        j.ecrire("INFO", "avant l'ouverture")
+        chemin = j.ouvrir(self.tmp, "Mode Test")
+        self.assertTrue(chemin.endswith("_mode-test.log"))
+        j.ecrire("DEBUG", "détail\nsur deux lignes")
+        j.evenement("essai", a=1, b="é")
+        j.fermer()
+        txt = self.lire(chemin)
+        self.assertIn("INFO  [MainThread] avant l'ouverture", txt)
+        self.assertIn("DEBUG [MainThread] détail\n    sur deux lignes", txt)
+        ev = [json.loads(ligne) for ligne in self.lire(chemin[:-4] + ".jsonl").splitlines()]
+        self.assertEqual((ev[0]["type"], ev[0]["a"], ev[0]["b"]), ("essai", 1, "é"))
+        self.assertTrue({"t", "dt", "fil"} <= set(ev[0]))
+
+    def test_niveau_info_filtre_le_debug(self):
+        j = X.Journal()
+        chemin = j.ouvrir(self.tmp, "x", "INFO")
+        j.ecrire("DEBUG", "bruit")
+        j.ecrire("INFO", "utile")
+        j.fermer()
+        txt = self.lire(chemin)
+        self.assertNotIn("bruit", txt)
+        self.assertIn("utile", txt)
+
+    def test_purge_des_anciens_journaux(self):
+        for i in range(6):
+            for ext in (".log", ".jsonl"):
+                open(os.path.join(self.tmp, f"2020010{i}_000000_x{ext}"), "w").close()
+        j = X.Journal()
+        j.ouvrir(self.tmp, "x", garder=3)
+        j.fermer()
+        self.assertEqual(len([n for n in os.listdir(self.tmp) if n.endswith(".log")]), 3)
+        self.assertEqual(len([n for n in os.listdir(self.tmp) if n.endswith(".jsonl")]), 3)
+
+    def test_deux_sessions_dans_la_meme_seconde(self):
+        j1, j2 = X.Journal(), X.Journal()
+        a, b = j1.ouvrir(self.tmp, "x"), j2.ouvrir(self.tmp, "x")
+        j1.fermer()
+        j2.fermer()
+        self.assertNotEqual(a, b)
+
+    def test_les_secrets_sont_masques_partout(self):
+        X.SECRETS.add("sk-secret-123")
+        try:
+            chemin = X.JOURNAL.ouvrir(self.tmp, "m")
+            with contextlib.redirect_stdout(io.StringIO()) as o:
+                X.log("jeton sk-secret-123 utilisé")
+            X.evenement("e", jeton="sk-secret-123")
+            X.JOURNAL.fermer()
+        finally:
+            X.SECRETS.discard("sk-secret-123")
+        tout = self.lire(chemin) + self.lire(chemin[:-4] + ".jsonl") + o.getvalue()
+        self.assertNotIn("sk-secret-123", tout)
+        self.assertIn("***", tout)
+
+    def test_trace_complete_dans_le_fichier_pas_dans_la_console(self):
+        chemin = X.JOURNAL.ouvrir(self.tmp, "exc")
+        try:
+            raise RuntimeError("boum")
+        except RuntimeError as e:
+            with contextlib.redirect_stdout(io.StringIO()) as o:
+                X.log_exception("contexte", e)
+        X.JOURNAL.fermer()
+        txt = self.lire(chemin)
+        self.assertIn("Traceback", txt)
+        self.assertIn("RuntimeError: boum", txt)
+        self.assertNotIn("Traceback", o.getvalue())
+        self.assertIn("contexte : RuntimeError: boum", o.getvalue())
+        ev = [json.loads(ligne) for ligne in self.lire(chemin[:-4] + ".jsonl").splitlines()]
+        self.assertEqual(ev[-1]["type"], "exception")
+        self.assertIn("boum", ev[-1]["message"])
+
+    def test_ecouteurs_et_mode_muet(self):
+        recu = []
+        X.ECOUTEURS.append(lambda niveau, ligne: recu.append((niveau, ligne)))
+        X.MUET = True
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as o:
+                X.log("bonjour")
+                X.debug("silence")
+        finally:
+            X.MUET = False
+            X.ECOUTEURS.clear()
+        self.assertEqual(o.getvalue(), "")
+        self.assertEqual(len(recu), 1)
+        self.assertIn("bonjour", recu[0][1])
+
+
+class TestConfig(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.chemin = os.path.join(self.tmp, "cfg.json")
+
+    def tearDown(self):
+        X.JOURNAL.fermer()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_valeurs_effectives(self):
+        with open(self.chemin, "w", encoding="utf-8") as f:
+            json.dump({"url": "http://h:9", "reflexion": "oui", "inconnu": 1}, f)
+        v = X.valeurs_effectives(self.chemin)
+        self.assertEqual((v["url"], v["reflexion"], v["tokens_image"]), ("http://h:9", "oui", 2500))
+        self.assertNotIn("inconnu", v)
+
+    def test_fichier_absent_ou_illisible(self):
+        self.assertEqual(X.charger_config(os.path.join(self.tmp, "absent.json")), {})
+        with open(self.chemin, "w", encoding="utf-8") as f:
+            f.write("{pas du json")
+        with contextlib.redirect_stdout(io.StringIO()) as o:
+            self.assertEqual(X.charger_config(self.chemin), {})
+        self.assertIn("illisible", o.getvalue())
+
+    def test_ecrire_ne_garde_que_les_cles_de_config(self):
+        X.ecrire_config(self.chemin, {"url": "u", "refaire": True, "pdf": "p.pdf"})
+        with open(self.chemin, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"pdf": "p.pdf", "url": "u"})
+
+    def test_options_de_la_ligne_de_commande_surchargent_et_ecrire_config_fusionne(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(X.main(["--config", self.chemin, "--url", "http://z:1", "--ecrire-config"]), 0)
+            self.assertEqual(X.main(["--config", self.chemin, "--reflexion", "oui", "--ecrire-config"]), 0)
+        with open(self.chemin, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual((d["url"], d["reflexion"]), ("http://z:1", "oui"))
+
+    def test_construire_cfg(self):
+        a = argparse.Namespace(**X.valeurs_effectives(self.chemin))
+        cfg = X.construire_cfg(a)
+        self.assertEqual((cfg.pages[0], cfg.pages[-1], cfg.decoupe, cfg.reflexion), (53, 338, 1, "auto"))
+        self.assertTrue(cfg.sortie.endswith("sortie_llm"))
+        a.corps_extra = "{pas json"
+        with self.assertRaises(ValueError):
+            X.construire_cfg(a)
+        a.corps_extra = "[1, 2]"
+        with self.assertRaises(ValueError):
+            X.construire_cfg(a)
+        a.corps_extra = '{"min_p": 0.1}'
+        self.assertEqual(X.construire_cfg(a).corps_extra, {"min_p": 0.1})
+
+    def test_la_cle_d_api_est_masquee_dans_les_journaux(self):
+        a = argparse.Namespace(**X.valeurs_effectives(self.chemin))
+        a.cle_api = "azerty-1234"
+        try:
+            cfg = X.construire_cfg(a)
+            self.assertIn("azerty-1234", X.SECRETS)
+            self.assertEqual(X.cfg_pour_log(cfg)["cle_api"], "***")
+            self.assertNotIn("azerty-1234", json.dumps(X.cfg_pour_log(cfg)))
+        finally:
+            X.SECRETS.discard("azerty-1234")
+
+    def test_sans_argument_et_sans_terminal_ou_avec_cli_affiche_l_aide(self):
+        for argv in ([], ["--cli"]):
+            with mock.patch.object(X, "_terminal_interactif", return_value=False), \
+                    mock.patch.object(X, "lancer_tui", return_value=0) as lt, contextlib.redirect_stdout(io.StringIO()) as o:
+                self.assertEqual(X.main(argv), 0)
+            lt.assert_not_called()
+            self.assertIn("usage:", o.getvalue())
+        with mock.patch.object(X, "_terminal_interactif", return_value=True), \
+                mock.patch.object(X, "lancer_tui", return_value=0) as lt, contextlib.redirect_stdout(io.StringIO()) as o:
+            self.assertEqual(X.main(["--cli"]), 0)             # même dans un terminal : --cli = pas de TUI
+        lt.assert_not_called()
+        self.assertIn("usage:", o.getvalue())
+
+    def test_lancement_automatique_de_la_tui_sans_argument(self):
+        with mock.patch.object(X, "_terminal_interactif", return_value=True), \
+                mock.patch.object(X, "lancer_tui", return_value=0) as lt:
+            self.assertEqual(X.main([]), 0)
+            lt.assert_called_once()
+            lt.reset_mock()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    X.main(["--cli", "--sortie", self.tmp])           # --cli : pas de TUI, donc erreur d'usage (pas de PDF)
+            lt.assert_not_called()
+            self.assertEqual(X.main(["--tui"]), 0)
+
+
+class TestRapport(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        X.JOURNAL.fermer()
+        X.SECRETS.discard("topsecret-123")
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_contenu_du_zip_sans_secret(self):
+        cfg = X.Config(sortie=self.tmp, pages=[55, 56], cle_api="topsecret-123")
+        X.SECRETS.add("topsecret-123")
+        X.JOURNAL.ouvrir(os.path.join(self.tmp, "logs"), "extraction")
+        with contextlib.redirect_stdout(io.StringIO()):
+            X.log("la clé topsecret-123 ne doit pas fuiter")
+            X.debug("détail")
+        X.evenement("requete", chunk="p055")
+        X.JOURNAL.fermer()
+        X.ecrire_atomique(X.chemin_cache(cfg, 55, 1), json.dumps(
+            {"page": 55, "bande": 1, "statut": "ok", "empreinte": X.empreinte(cfg), "max_tokens": 8000, "duree": 12.5,
+             "tokens": 900, "tokens_reflexion": 0, "tokens_entree": 3000, "tps": 15.0, "ttft": 4.0, "penser": False,
+             "avertissements": ["a"], "entrees": [{}]}))
+        X.ecrire_atomique(os.path.join(self.tmp, "cache", "brut", "p056_essai1.txt"), "abandon=boucle topsecret-123\n...")
+        chemin_cfg = os.path.join(self.tmp, "prenoms_config.json")
+        with open(chemin_cfg, "w", encoding="utf-8") as f:
+            json.dump({"cle_api": "topsecret-123", "url": "u"}, f)
+        z = X.creer_rapport(cfg, chemin_cfg)
+        self.assertTrue(os.path.exists(z) and z.endswith(".zip"))
+        with zipfile.ZipFile(z) as zf:
+            contenu = {n: zf.read(n).decode("utf-8", "replace") for n in zf.namelist()}
+        for attendu in ("LISEZMOI.txt", "environnement.json", "configuration.json", "pages.csv", "prenoms_config.json",
+                        "brut/p056_essai1.txt"):
+            self.assertIn(attendu, contenu)
+        self.assertTrue(any(n.startswith("logs/") and n.endswith(".log") for n in contenu))
+        self.assertTrue(any(n.startswith("logs/") and n.endswith(".jsonl") for n in contenu))
+        for n, texte in contenu.items():
+            self.assertNotIn("topsecret-123", texte, n)
+        lignes = contenu["pages.csv"].splitlines()
+        self.assertEqual(lignes[1], "55,1,ok,False,False,1,12.5,900,0,3000,15.0,4.0,False,a")
+        self.assertTrue(lignes[2].startswith("56,1,a_faire"))
+        self.assertIn("python", json.loads(contenu["environnement.json"]))
+
+    def test_option_rapport(self):
+        with contextlib.redirect_stdout(io.StringIO()) as o:
+            code = X.main(["--rapport", "--sortie", self.tmp, "--config", os.path.join(self.tmp, "absent.json")])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(glob.glob(os.path.join(self.tmp, "rapports", "rapport_debug_*.zip"))), 1)
+        self.assertIn("rapport de debug", o.getvalue())
+
+
+class TestControle(unittest.TestCase):
+    def test_registre_d_activite(self):
+        c = X.Controle()
+        c.maj_actif("p055", tokens=10)
+        c.maj_actif("p055", tps=3.5)
+        c.maj_actif("p056", tokens=1)
+        s = c.instantane()
+        self.assertEqual(set(s["actifs"]), {"p055", "p056"})
+        self.assertEqual((s["actifs"]["p055"]["tokens"], s["actifs"]["p055"]["tps"]), (10, 3.5))
+        c.fin_actif("p055")
+        self.assertEqual(set(c.instantane()["actifs"]), {"p056"})
+        s["actifs"]["p056"]["tokens"] = 999                       # l'instantané est une copie
+        self.assertEqual(c.instantane()["actifs"]["p056"]["tokens"], 1)
+
+    def test_etat_cache_et_resultats_du_cache(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            cfg = X.Config(sortie=tmp, pages=[55, 56, 57])
+            base = {"bande": 1, "statut": "ok", "empreinte": X.empreinte(cfg), "max_tokens": 8000, "duree": 10.0, "entrees": []}
+            X.ecrire_atomique(X.chemin_cache(cfg, 55, 1), json.dumps(dict(base, page=55)))
+            X.ecrire_atomique(X.chemin_cache(cfg, 56, 1), json.dumps(dict(base, page=56, empreinte="autre")))
+            e = X.etat_cache(cfg)
+            self.assertEqual((e["cats"]["ok"], e["cats"]["périmé"], e["cats"]["à faire"]), ([55], [56], [57]))
+            self.assertEqual((e["reste"], e["moyenne"], e["reste_s"]), (2, 10.0, 20.0))
+            self.assertEqual(set(X.resultats_du_cache(cfg)), {(55, 1), (56, 1)})                  # périmé conservé
+            self.assertEqual(set(X.resultats_du_cache(cfg, tolerer=False)), {(55, 1)})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- bout en bout avec un FAUX serveur LM Studio
+
+MODEL_ID = "prism-ml/ternary-bonsai-27b"
+
+
+def _sans_image(o):
+    if isinstance(o, dict):
+        return {k: _sans_image(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_sans_image(v) for v in o]
+    if isinstance(o, str) and o.startswith("data:image"):
+        return "<image>"
+    return o
+
+
 class FauxLMStudio(BaseHTTPRequestHandler):
-    reponses: dict = {}
-    requetes: list = []
-    mode = ""
-    erreurs: set = set()
-    dernier_corps: dict = {}
-    modeles = ["text-embedding-nomic-embed-text-v1.5", "prism-ml/ternary-bonsai-27b-mlx-2bit"]
+    """Imite LM Studio : API native (/api/v1/models, /api/v1/chat) et API compatible OpenAI, en streaming SSE,
+    avec les pannes qu'on veut tester (boucle de réflexion, silence, réglage « off » ignoré, erreurs HTTP...)."""
+    protocol_version = "HTTP/1.1"
+
+    @classmethod
+    def reset(cls):
+        cls.natif = True
+        cls.ctx = 32768
+        cls.parallel = 4
+        cls.options_reflexion = ["off", "on"]
+        cls.charge = True
+        cls.honore_off = True          # False : le modèle réfléchit même si « reasoning: off » est demandé
+        cls.pensee = 30                # nombre d'événements de réflexion quand elle est active
+        cls.reponses = {}              # md5 du PNG -> (contenu, texte de réflexion)
+        cls.defaut = None              # réponse pour les images inconnues et les requêtes sans image
+        cls.erreurs = set()            # md5 d'images pour lesquelles on répond HTTP 500
+        cls.sequence = []              # mode de chaque requête de chat en streaming, dans l'ordre
+        cls.mode_global = ""           # sans_vision | reasoning_refuse
+        cls.requetes = []
+        cls.deconnexions = 0
+        cls.tps = 42.0
+        cls.tokens_texte = 900
+        cls.chunked = True             # False : flux délimité par la fermeture de la connexion (HTTP/1.0)
+        cls.jeton = ""                 # non vide : l'API exige « Authorization: Bearer <jeton> »
 
     def log_message(self, *a):
         pass
@@ -297,25 +847,186 @@ class FauxLMStudio(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _modele_natif(self):
+        c = FauxLMStudio
+        inst = [{"id": MODEL_ID, "config": {"context_length": c.ctx, "eval_batch_size": 512, "parallel": c.parallel,
+                                            "flash_attention": True, "offload_kv_cache_to_gpu": True}}] if c.charge else []
+        return {"type": "llm", "publisher": "prism-ml", "key": MODEL_ID, "display_name": "Ternary Bonsai 27B",
+                "architecture": "qwen3_5", "quantization": {"name": "Q2_0", "bits_per_weight": 2.0},
+                "size_bytes": 7150000000, "params_string": "27B", "loaded_instances": inst, "max_context_length": 262144,
+                "format": "gguf", "capabilities": {"vision": True, "trained_for_tool_use": False,
+                                                   "reasoning": {"allowed_options": c.options_reflexion, "default": "on"}}}
+
+    def _refuse(self):
+        c = FauxLMStudio
+        if c.jeton and self.headers.get("Authorization") != f"Bearer {c.jeton}":
+            self._json(401, {"error": {"message": "Invalid or missing API token"}})
+            return True
+        return False
+
     def do_GET(self):
-        self._json(200, {"data": [{"id": m} for m in self.modeles]})
+        c = FauxLMStudio
+        if self._refuse():
+            return
+        if self.path == "/api/v1/models":
+            if not c.natif:
+                return self._json(404, {"error": {"message": "Unexpected endpoint or method"}})
+            return self._json(200, {"models": [{"type": "embedding", "key": "text-embedding-nomic-embed-text-v1.5",
+                                                "loaded_instances": []}, self._modele_natif()]})
+        if self.path == "/v1/models":
+            return self._json(200, {"data": [{"id": "text-embedding-nomic-embed-text-v1.5"}, {"id": MODEL_ID}]})
+        self._json(404, {"error": {"message": "unknown"}})
+
+    @staticmethod
+    def _png(corps, natif):
+        if natif:
+            for it in corps.get("input") or []:
+                if isinstance(it, dict) and it.get("type") == "image":
+                    return base64.b64decode(it["data_url"].split(",", 1)[1])
+        else:
+            for m in corps.get("messages") or []:
+                if isinstance(m.get("content"), list):
+                    for p in m["content"]:
+                        if p.get("type") == "image_url":
+                            return base64.b64decode(p["image_url"]["url"].split(",", 1)[1])
+        return None
 
     def do_POST(self):
+        c = FauxLMStudio
         corps = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        url = corps["messages"][0]["content"][0]["image_url"]["url"]
-        png = __import__("base64").b64decode(url.split(",", 1)[1])
-        cle = hashlib.md5(png).hexdigest()
-        FauxLMStudio.requetes.append((corps["model"], cle))
-        FauxLMStudio.dernier_corps = {k: v for k, v in corps.items() if k != "messages"}
-        if FauxLMStudio.mode == "no_vision":
+        if self._refuse():
+            return
+        natif = self.path == "/api/v1/chat"
+        if not natif and self.path != "/v1/chat/completions":
+            return self._json(404, {"error": {"message": "unknown"}})
+        png = self._png(corps, natif)
+        cle = hashlib.md5(png).hexdigest() if png else ""
+        stream = bool(corps.get("stream"))
+        mode = c.sequence.pop(0) if (stream and c.sequence) else ""
+        taille = Image.open(io.BytesIO(png)).size if png else None
+        c.requetes.append({"chemin": self.path, "stream": stream, "cle": cle, "mode": mode, "taille": taille,
+                           "corps": _sans_image(corps)})
+        if c.mode_global == "sans_vision":
             return self._json(400, {"error": {"message": "Model does not support image input"}})
-        if cle in FauxLMStudio.erreurs:
+        if c.mode_global == "reasoning_refuse" and "reasoning" in corps:
+            return self._json(400, {"error": {"message": "The model does not support the reasoning setting you specified"}})
+        if cle in c.erreurs:
             return self._json(500, {"error": {"message": "boom"}})
-        if cle not in self.reponses:
-            return self._json(200, {"choices": [{"message": {"content": "{\"entrees\": []}"}, "finish_reason": "stop"}]})
-        content, reasoning = self.reponses[cle]
-        self._json(200, {"choices": [{"message": {"content": content, "reasoning_content": reasoning},
-                                      "finish_reason": "stop"}], "usage": {"completion_tokens": 123}})
+        entree = c.tokens_texte + (taille[0] * taille[1] // 1024 if taille else 0)
+        if not stream:
+            stats = {"input_tokens": entree, "total_output_tokens": 1, "reasoning_output_tokens": 0,
+                     "tokens_per_second": c.tps, "time_to_first_token_seconds": 0.5}
+            if natif:
+                return self._json(200, {"model_instance_id": MODEL_ID, "output": [{"type": "message", "content": "x"}], "stats": stats})
+            return self._json(200, {"choices": [{"message": {"content": "x"}, "finish_reason": "length"}],
+                                    "usage": {"prompt_tokens": entree, "completion_tokens": 1}})
+        if mode == "avant_entetes":
+            time.sleep(3)
+        if mode == "json_au_lieu_de_sse":
+            return self._json(200, {"inattendu": "pas du SSE"})
+        try:
+            self._stream(natif, corps, cle, mode, entree)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            c.deconnexions += 1
+
+    def _w(self, data: bytes):
+        if FauxLMStudio.chunked:
+            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+        else:
+            self.wfile.write(data)
+        self.wfile.flush()
+
+    def _ev(self, t, **d):
+        d["type"] = t
+        self._w(f"event: {t}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n".encode("utf-8"))
+
+    def _data(self, obj):
+        self._w(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+    def _fin_flux(self):
+        if FauxLMStudio.chunked:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        self.close_connection = True
+
+    def _stream(self, natif, corps, cle, mode, entree):
+        c = FauxLMStudio
+        contenu, raison = c.reponses.get(cle) or c.defaut or ('{"entrees": []}', "")
+        if natif:
+            off = corps.get("reasoning") == "off"
+        else:
+            off = (corps.get("chat_template_kwargs") or {}).get("enable_thinking") is False
+        penser = (not off) or (not c.honore_off)
+        if mode == "boucle" and penser:
+            ref = None                                              # réflexion infinie
+        elif mode == "reflexion_longue" and penser:
+            ref = [f"mot{i} " for i in range(600)]
+        elif penser:
+            ref = [raison[i:i + 10] for i in range(0, len(raison), 10)] if raison else [f"mot{i} " for i in range(c.pensee)]
+        else:
+            ref = []
+        morceaux = [contenu[i:i + 6] for i in range(0, len(contenu), 6)]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        if c.chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        if natif:
+            self._ev("chat.start", model_instance_id=MODEL_ID)
+            self._ev("prompt_processing.start")
+            self._ev("prompt_processing.progress", progress=0.5)
+            self._ev("prompt_processing.end")
+            if mode == "erreur_contexte":
+                self._ev("error", error={"type": "invalid_request", "message": "Context size has been exceeded."})
+                self._fin_flux()
+                return
+            if mode == "silence":
+                time.sleep(3)
+            if mode == "silence_long":
+                time.sleep(10)
+            if ref is None:
+                self._ev("reasoning.start")
+                for _ in range(20000):
+                    self._ev("reasoning.delta", content="Je vérifie encore l'arabe de ce prénom. ")
+                    time.sleep(0.0005)
+                return
+            if ref:
+                self._ev("reasoning.start")
+                for p in ref:
+                    self._ev("reasoning.delta", content=p)
+                self._ev("reasoning.end")
+            self._ev("message.start")
+            for p in morceaux:
+                self._ev("message.delta", content=p)
+                if mode == "lent":
+                    time.sleep(0.02)
+            self._ev("message.end")
+            stats = {"input_tokens": entree, "total_output_tokens": len(ref) + len(morceaux),
+                     "reasoning_output_tokens": len(ref), "tokens_per_second": c.tps, "time_to_first_token_seconds": 0.5}
+            self._ev("chat.end", result={"model_instance_id": MODEL_ID, "output": [{"type": "message", "content": contenu}],
+                                         "stats": stats})
+            self._fin_flux()
+            return
+        if mode == "silence":
+            time.sleep(3)
+        if mode == "think_inline":
+            texte = "Je regarde la page et je réfléchis un moment.</think>" + contenu
+            for i in range(0, len(texte), 6):
+                self._data({"choices": [{"delta": {"content": texte[i:i + 6]}}]})
+            n_ref = 8
+        else:
+            for p in ref or []:
+                self._data({"choices": [{"delta": {"reasoning_content": p}}]})
+            for p in morceaux:
+                self._data({"choices": [{"delta": {"content": p}}]})
+            n_ref = len(ref or [])
+        self._data({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        self._data({"choices": [], "usage": {"prompt_tokens": entree, "completion_tokens": len(morceaux) + n_ref}})
+        self._w(b"data: [DONE]\n\n")
+        self._fin_flux()
 
 
 @unittest.skipUnless(PDF, "PDF du livre introuvable (variable PDF_LIVRE)")
@@ -333,35 +1044,76 @@ class TestBoutEnBout(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        FauxLMStudio.requetes = []
-        FauxLMStudio.reponses = {}
-        FauxLMStudio.mode = ""
-        FauxLMStudio.erreurs = set()
+        self.out = ""
+        FauxLMStudio.reset()
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
+
+    # --- outils
+    def lancer(self, *args, pdf=True):
+        base = ([PDF] if pdf else []) + ["--url", self.url, "--sortie", self.tmp, "--tokens-image", "0", "--suivi", "0"]
+        tampon = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(tampon):
+                return X.main(base + list(args))
+        finally:
+            self.out += tampon.getvalue()
+
+    def md5(self, page, bande=1, decoupe=1):
+        cfg = X.Config(pdf=PDF, decoupe=decoupe)
+        return hashlib.md5(X.preparer_image(cfg, page, bande)[0]).hexdigest()
 
     def lire(self):
         with open(os.path.join(self.tmp, "prenoms_arabes.json"), encoding="utf-8") as f:
             return json.load(f)
 
-    def cfg(self, decoupe=1):
-        return X.Config(pdf=PDF, url=self.url, sortie=self.tmp, decoupe=decoupe)
+    def cache(self, page, bande=1, decoupe=1):
+        with open(os.path.join(self.tmp, "cache", X.id_chunk(page, bande, decoupe) + ".json"), encoding="utf-8") as f:
+            return json.load(f)
 
-    def md5(self, cfg, page, bande=1):
-        return hashlib.md5(X.preparer_image(cfg, page, bande)[0]).hexdigest()
+    @staticmethod
+    def generations():
+        return [r for r in FauxLMStudio.requetes if r["stream"]]
 
-    def test_modele_resolu_meme_si_le_nom_differe(self):
-        self.assertEqual(X.resoudre_modele(self.cfg()), "prism-ml/ternary-bonsai-27b-mlx-2bit")
+    def pages_sheet(self):
+        from openpyxl import load_workbook
+        wb = load_workbook(os.path.join(self.tmp, "prenoms_arabes.xlsx"))
+        return list(wb["Pages"].iter_rows(values_only=True))
 
+    def reponses_p55_p150(self):
+        FauxLMStudio.reponses[self.md5(55)] = ("```json\n" + json.dumps({"entrees": P55}, ensure_ascii=False) + "\n```", "")
+        FauxLMStudio.reponses[self.md5(150)] = (json.dumps({"entrees": P150}, ensure_ascii=False), "")
+
+    # --- modèle chargé
+    def test_modele_resolu_par_correspondance_approchee(self):
+        info = X.resoudre_modele(X.Config(url=self.url, modele="prism-ml/bonsai-27b"))
+        self.assertEqual((info.id, info.natif, info.ctx, info.parallel), (MODEL_ID, True, 32768, 4))
+        self.assertTrue(info.peut_couper_reflexion)
+        self.assertEqual((info.flash, info.batch, info.kv_gpu, info.vision), (True, 512, True, True))
+        self.assertIn("Q2_0", info.quant)
+
+    def test_modele_non_charge_est_fatal(self):
+        FauxLMStudio.charge = False
+        with self.assertRaises(X.ErreurFatale) as cm:
+            X.resoudre_modele(X.Config(url=self.url))
+        self.assertIn("lms load", str(cm.exception))
+
+    def test_api_openai_si_lm_studio_ancien(self):
+        FauxLMStudio.natif = False
+        info = X.resoudre_modele(X.Config(url=self.url))
+        self.assertEqual((info.id, info.natif, info.ctx), (MODEL_ID, False, 0))
+
+    def test_serveur_injoignable(self):
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(io.StringIO()) as o:
+            X.main([PDF, "--url", "http://127.0.0.1:9", "--sortie", self.tmp, "--pages", "55"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("injoignable", o.getvalue())
+
+    # --- chemin nominal
     def test_pipeline_complet_reprise_et_score(self):
-        cfg = self.cfg()
-        # page 55 : réflexion balisée dans le contenu + JSON en bloc markdown ; page 150 : réflexion séparée
-        FauxLMStudio.reponses[self.md5(cfg, 55)] = (
-            "<think>je regarde la page… " + json.dumps(EXEMPLE_PROMPT) + "</think>\n```json\n"
-            + json.dumps({"entrees": P55}, ensure_ascii=False) + "\n```", "")
-        FauxLMStudio.reponses[self.md5(cfg, 150)] = (json.dumps({"entrees": P150}, ensure_ascii=False), "réflexion séparée")
-        X.main([PDF, "--url", self.url, "--pages", "55,150", "--sortie", self.tmp])
+        self.reponses_p55_p150()
+        self.assertEqual(self.lancer("--pages", "55,150"), 0)
         lignes = self.lire()
         self.assertEqual(len(lignes), 18)                                  # 6 + 12 prénoms, un par ligne
         par = {r["prénom_fr"]: r for r in lignes}
@@ -370,102 +1122,441 @@ class TestBoutEnBout(unittest.TestCase):
         self.assertEqual(par["Haoua"]["prénom_arab_diacritiques"], "حَوَّاء")     # tatwil retiré
         self.assertEqual(par["Haoua"]["genre"], "FEMININ")
         self.assertEqual(par["Nadila"]["forme_associée"], "Nadil")
-        self.assertEqual(par["Nadila"]["description_en_français"], "Nâḍil / Nâḍila : qui l'emporte au combat.")
         self.assertEqual(par["Idris"]["équivalent_étranger"], "Enoch")
         self.assertEqual(par["Habbar"]["thème"], "4. Puissance et protection")
         s = VT.score(lignes, [55, 150])
         self.assertEqual((s["vedettes"], s["parasites"], s["genre"], s["arabe_exact"]), ("18/18", 0, "18/18", "16/16"))
-        self.assertEqual(s["sens"], "16/16")
-        for f in ("prenoms_arabes.csv", "prenoms_arabes.xlsx"):
-            self.assertTrue(os.path.exists(os.path.join(self.tmp, f)))
-        # relance : tout vient du cache, aucune requête de plus
-        n = len(FauxLMStudio.requetes)
-        X.main([PDF, "--url", self.url, "--pages", "55,150", "--sortie", self.tmp])
-        self.assertEqual(len(FauxLMStudio.requetes), n)
+        gen = self.generations()
+        self.assertEqual(len(gen), 2)
+        self.assertTrue(all(g["corps"]["reasoning"] == "off" for g in gen))   # réflexion coupée par défaut
+        c = self.cache(55)
+        self.assertEqual((c["penser"], c["tokens_reflexion"], c["tps"]), (False, 0, 42.0))
+        # relance : tout vient du cache
+        n = len(gen)
+        self.lancer("--pages", "55,150")
+        self.assertEqual(len(self.generations()), n)
+        self.assertIn("2 déjà en cache", self.out)
         # --refaire : les deux pages sont redemandées
-        X.main([PDF, "--url", self.url, "--pages", "55,150", "--sortie", self.tmp, "--refaire"])
-        self.assertEqual(len(FauxLMStudio.requetes), n + 2)
+        self.lancer("--pages", "55,150", "--refaire")
+        self.assertEqual(len(self.generations()), n + 2)
+
+    def test_parametres_de_generation_envoyes(self):
+        self.reponses_p55_p150()
+        self.lancer("--pages", "55")
+        c = self.generations()[-1]["corps"]
+        self.assertEqual((c["temperature"], c["top_p"], c["top_k"], c["max_output_tokens"]), (0.3, 0.8, 20, 8000))
+        self.assertEqual((c["model"], c["store"], c["stream"], c["reasoning"]), (MODEL_ID, False, True, "off"))
+        self.assertEqual(c["system_prompt"], X.PROMPT)
+        self.assertEqual([i["type"] for i in c["input"]], ["image", "text"])
+
+    def test_reflexion_oui_garde_la_reflexion(self):
+        self.reponses_p55_p150()
+        self.lancer("--pages", "55", "--reflexion", "oui")
+        c = self.generations()[-1]["corps"]
+        self.assertEqual((c["reasoning"], c["temperature"], c["top_p"]), ("on", 0.6, 0.95))
+        res = self.cache(55)
+        self.assertEqual((res["penser"], res["tokens_reflexion"]), (True, 30))
 
     def test_demi_pages_avec_suite_de_definition(self):
-        cfg = self.cfg(decoupe=2)
         haut = [P55[0], entree([(F, ["Hawa", "Haoua"], "حَوَّاء")], "Ḥawâ' (Ève) : épouse d'Âdam.", inc=True)]
         bas = [entree([], "De l'hébreu : vie, source de vie.", suite=True), P55[2], P55[3]]
-        FauxLMStudio.reponses[self.md5(cfg, 55, 1)] = (json.dumps({"entrees": haut}, ensure_ascii=False), "")
-        FauxLMStudio.reponses[self.md5(cfg, 55, 2)] = (json.dumps({"entrees": bas}, ensure_ascii=False), "")
-        X.main([PDF, "--url", self.url, "--pages", "55", "--decoupe", "2", "--paralleles", "2", "--sortie", self.tmp])
+        FauxLMStudio.reponses[self.md5(55, 1, 2)] = (json.dumps({"entrees": haut}, ensure_ascii=False), "")
+        FauxLMStudio.reponses[self.md5(55, 2, 2)] = (json.dumps({"entrees": bas}, ensure_ascii=False), "")
+        self.lancer("--pages", "55", "--decoupe", "2", "--paralleles", "2")
         lignes = self.lire()
         self.assertEqual([r["prénom_fr"] for r in lignes], ["Adam", "Adame", "Hawa", "Haoua", "Chisse", "Idris"])
         self.assertEqual(lignes[2]["description_en_français"], "Ḥawâ' (Ève) : épouse d'Âdam. De l'hébreu : vie, source de vie.")
         self.assertNotIn("description_coupee", lignes[2]["à_vérifier"])
 
-    def test_coupure_fixe_dans_un_blanc_sur_la_vraie_page(self):
-        im = X.image_native(PDF, 55)
-        net = X.nettoyer_page(im)
-        haut, bas = X.decouper(net, im, 2)
-        a = np.asarray(net)
-        ligne_de_coupe = a[haut.height]
-        self.assertLessEqual(int(((255 - ligne_de_coupe.min(axis=1)) > 60).sum()), 2)     # aucune encre sur la ligne de coupe
+    def test_page_blanche_aucune_requete_de_generation(self):
+        self.lancer("--pages", "134")
+        self.assertEqual(self.generations(), [])
+        lignes = self.pages_sheet()
+        self.assertEqual((lignes[1][0], lignes[1][2]), (134, "ok"))
+        self.assertIn("page blanche", lignes[1][10])
+
+    def test_cache_perime_si_le_prompt_change(self):
+        self.reponses_p55_p150()
+        self.lancer("--pages", "55")
+        self.lancer("--pages", "55")
+        self.assertEqual(len(self.generations()), 1)                       # 2e passage : cache
+        prompt = os.path.join(self.tmp, "prompt.txt")
+        with open(prompt, "w", encoding="utf-8") as f:
+            f.write("consigne différente")
+        self.lancer("--pages", "55", "--prompt-fichier", prompt)
+        self.assertEqual(len(self.generations()), 2)                       # prompt changé : recalcul
+        self.assertIn("périmés", self.out)
 
     def test_comparaison_avec_ancien_csv(self):
-        cfg = self.cfg()
-        FauxLMStudio.reponses[self.md5(cfg, 55)] = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        self.reponses_p55_p150()
         ancien = os.path.join(self.tmp, "ancien.csv")
         with open(ancien, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             w.writerow(["ID", "Prénom(s)", "Page (PDF)"])
             w.writerows([[1, "Adam / Adame", 55], [2, "Hawa / Haoua", 55], [3, "Chisse", 55], [4, "Idris", 55], [5, "Zorglub", 55]])
-        X.main([PDF, "--url", self.url, "--pages", "55", "--sortie", self.tmp, "--ancien", ancien])
+        self.lancer("--pages", "55", "--ancien", ancien)
         with open(os.path.join(self.tmp, "comparaison_ancien.csv"), encoding="utf-8-sig") as f:
             ligne = list(csv.reader(f))[1]
         self.assertEqual((ligne[0], ligne[1], ligne[2], ligne[3], ligne[4]), ("55", "7", "6", "zorglub", ""))
 
-    def test_parametres_de_generation_envoyes(self):
-        cfg = self.cfg()
-        FauxLMStudio.reponses[self.md5(cfg, 55)] = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
-        X.main([PDF, "--url", self.url, "--pages", "55", "--sortie", self.tmp])
-        c = FauxLMStudio.dernier_corps
-        self.assertEqual((c["temperature"], c["top_p"], c["top_k"], c["max_tokens"]), (0.6, 0.95, 20, 16000))
-        self.assertEqual(c["model"], "prism-ml/ternary-bonsai-27b-mlx-2bit")
+    def test_coupure_fixe_dans_un_blanc_sur_la_vraie_page(self):
+        im = X.image_native(PDF, 55)
+        net = X.nettoyer_page(im)
+        haut, _ = X.decouper(net, im, 2)
+        ligne_de_coupe = np.asarray(net)[haut.height]
+        self.assertLessEqual(int(((255 - ligne_de_coupe.min(axis=1)) > 60).sum()), 2)     # aucune encre sur la ligne de coupe
 
-    def test_page_blanche_aucune_requete(self):
-        X.main([PDF, "--url", self.url, "--pages", "134", "--sortie", self.tmp])
-        self.assertEqual(FauxLMStudio.requetes, [])
-        from openpyxl import load_workbook
-        wb = load_workbook(os.path.join(self.tmp, "prenoms_arabes.xlsx"))
-        lignes = list(wb["Pages"].iter_rows(values_only=True))
-        self.assertEqual((lignes[1][0], lignes[1][2]), (134, "ok"))
-        self.assertIn("page blanche", lignes[1][7])
-
-    def test_cache_perime_si_le_prompt_change(self):
-        cfg = self.cfg()
-        FauxLMStudio.reponses[self.md5(cfg, 55)] = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
-        X.main([PDF, "--url", self.url, "--pages", "55", "--sortie", self.tmp])
-        X.main([PDF, "--url", self.url, "--pages", "55", "--sortie", self.tmp])
-        self.assertEqual(len(FauxLMStudio.requetes), 1)                    # 2e passage : cache
-        prompt = os.path.join(self.tmp, "prompt.txt")
-        with open(prompt, "w", encoding="utf-8") as f:
-            f.write("consigne différente")
-        X.main([PDF, "--url", self.url, "--pages", "55", "--sortie", self.tmp, "--prompt-fichier", prompt])
-        self.assertEqual(len(FauxLMStudio.requetes), 2)                    # prompt changé : recalcul
-
+    # --- pannes : le script doit s'en sortir seul
     def test_modele_sans_vision_arrete_tout_sans_exporter(self):
-        FauxLMStudio.mode = "no_vision"
+        FauxLMStudio.mode_global = "sans_vision"
         with self.assertRaises(SystemExit) as cm:
-            X.main([PDF, "--url", self.url, "--pages", "55,56,57", "--sortie", self.tmp])
+            self.lancer("--pages", "55,56,57")
         self.assertEqual(cm.exception.code, 2)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "prenoms_arabes.csv")))
 
     def test_une_page_en_echec_nempeche_pas_les_autres(self):
-        cfg = self.cfg()
-        FauxLMStudio.reponses[self.md5(cfg, 150)] = (json.dumps({"entrees": P150}, ensure_ascii=False), "")
-        FauxLMStudio.erreurs = {self.md5(cfg, 55)}
-        X.main([PDF, "--url", self.url, "--pages", "55,150", "--sortie", self.tmp, "--essais", "2"])
+        self.reponses_p55_p150()
+        FauxLMStudio.erreurs = {self.md5(55)}
+        self.lancer("--pages", "55,150", "--essais", "2")
         self.assertEqual({r["page_pdf"] for r in self.lire()}, {150})
-        self.assertEqual(sum(1 for _, k in FauxLMStudio.requetes if k == self.md5(cfg, 55)), 2)      # 2 essais
-        from openpyxl import load_workbook
-        wb = load_workbook(os.path.join(self.tmp, "prenoms_arabes.xlsx"))
-        statuts = {r[0]: r[2] for r in list(wb["Pages"].iter_rows(values_only=True))[1:]}
+        self.assertEqual(sum(1 for g in self.generations() if g["cle"] == self.md5(55)), 2)      # 2 essais
+        statuts = {r[0]: r[2] for r in self.pages_sheet()[1:]}
         self.assertEqual(statuts, {55: "échec", 150: "ok"})
+
+    def test_reflexion_ignoree_bascule_en_mode_avec_reflexion(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.honore_off = False
+        FauxLMStudio.pensee = 600
+        self.lancer("--pages", "55", "--reflexion", "non")
+        gen = self.generations()
+        self.assertEqual([g["corps"]["reasoning"] for g in gen], ["off", "on"])
+        res = self.cache(55)
+        self.assertEqual((res["penser"], res["tokens_reflexion"]), (True, 600))
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_boucle_de_reflexion_abandonnee_puis_sans_reflexion(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.sequence = ["boucle", ""]
+        debut = time.time()
+        self.lancer("--pages", "55", "--reflexion", "oui")
+        self.assertLess(time.time() - debut, 20)
+        gen = self.generations()
+        self.assertEqual([g["corps"]["reasoning"] for g in gen], ["on", "off"])
+        self.assertEqual(len(self.lire()), 6)
+        for _ in range(40):                                                 # le serveur voit la connexion se fermer
+            if FauxLMStudio.deconnexions:
+                break
+            time.sleep(0.05)
+        self.assertGreaterEqual(FauxLMStudio.deconnexions, 1)
+
+    def test_silence_abandonne_puis_reessaye(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.sequence = ["silence", ""]
+        debut = time.time()
+        self.lancer("--pages", "55", "--stall", "1")
+        self.assertLess(time.time() - debut, 12)
+        self.assertEqual(len(self.generations()), 2)
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_aucune_reponse_avant_les_entetes_puis_reessaye(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.sequence = ["avant_entetes", ""]
+        self.lancer("--pages", "55", "--attente", "1")
+        self.assertEqual(len(self.generations()), 2)
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_reglage_de_reflexion_refuse_par_lm_studio(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.mode_global = "reasoning_refuse"
+        self.lancer("--pages", "55")
+        gen = self.generations()
+        self.assertEqual(len(gen), 2)
+        self.assertIn("reasoning", gen[0]["corps"])
+        self.assertNotIn("reasoning", gen[1]["corps"])                     # réglage retiré après le refus
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_ctrl_c_exporte_et_rend_la_main(self):
+        FauxLMStudio.sequence = ["silence_long"]
+
+        def interrompre():
+            for _ in range(200):
+                if self.generations():
+                    break
+                time.sleep(0.05)
+            time.sleep(0.5)
+            _thread.interrupt_main()
+        threading.Thread(target=interrompre, daemon=True).start()
+        debut = time.time()
+        code = self.lancer("--pages", "55", "--stall", "30", "--essais", "1")
+        self.assertEqual(code, 130)
+        self.assertLess(time.time() - debut, 15)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "prenoms_arabes.csv")))
+        self.assertEqual(self.pages_sheet()[1][2], "à faire")
+
+    def test_erreur_de_contexte_dans_le_flux_est_fatale(self):
+        FauxLMStudio.sequence = ["erreur_contexte"]
+        with self.assertRaises(SystemExit) as cm:
+            self.lancer("--pages", "55")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("Contexte insuffisant", self.out)
+        self.assertEqual(len(self.generations()), 1)                       # pas de nouvel essai inutile
+
+    def test_authentification_exigee_message_explicite(self):
+        FauxLMStudio.jeton = "secret"
+        with self.assertRaises(SystemExit) as cm:
+            self.lancer("--pages", "55")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--cle-api", self.out)
+        self.out = ""
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        self.assertEqual(self.lancer("--pages", "55", "--cle-api", "secret"), 0)
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_reponse_non_sse_est_signalee_clairement(self):
+        FauxLMStudio.sequence = ["json_au_lieu_de_sse"] * 3
+        self.lancer("--pages", "55", "--essais", "3")
+        self.assertIn("aucun événement reconnu", self.out)
+        self.assertEqual(self.pages_sheet()[1][2], "échec")
+
+    def test_diagnostic_quand_la_reflexion_ne_se_coupe_pas(self):
+        FauxLMStudio.defaut = ("ADAM 123", "")
+        FauxLMStudio.honore_off = False
+        FauxLMStudio.pensee = 400
+        self.lancer("--diagnostic")
+        self.assertIn("malgré la demande de la couper", self.out)
+        self.assertIn("test non concluant", self.out)
+        self.assertNotIn("la vision ne semble pas fonctionner", self.out)
+
+    def test_journal_ecrit_pendant_une_extraction(self):
+        self.reponses_p55_p150()
+        self.lancer("--pages", "55,150", "--cle-api", "motdepasse-xyz")
+        logs = sorted(glob.glob(os.path.join(self.tmp, "logs", "*.log")))
+        self.assertEqual(len(logs), 1)
+        with open(logs[0], encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("essai 1 : penser=False", txt)
+        self.assertIn("finish=", txt)
+        self.assertNotIn("motdepasse-xyz", txt)
+        with open(logs[0][:-4] + ".jsonl", encoding="utf-8") as f:
+            ev = [json.loads(ligne) for ligne in f]
+        types = [e["type"] for e in ev]
+        for t in ("demarrage", "cache", "modele", "calibrage", "requete", "page", "export"):
+            self.assertIn(t, types)
+        dem = next(e for e in ev if e["type"] == "demarrage")
+        self.assertEqual(dem["config"]["cle_api"], "***")
+        self.assertIn("python", dem["environnement"])
+        req = next(e for e in ev if e["type"] == "requete")
+        self.assertEqual((req["chunk"], req["essai"], req["penser"]), ("p055", 1, False))
+        self.assertIn("Journal complet", self.out)
+
+    def test_echec_journalise_avec_son_diagnostic(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.erreurs = {self.md5(55)}
+        self.lancer("--pages", "55", "--essais", "2")
+        logs = glob.glob(os.path.join(self.tmp, "logs", "*.log"))
+        with open(logs[0], encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("essai 1/2", txt)
+        self.assertIn("WARN", txt)
+        self.assertIn("Traceback", txt)                                    # trace complète dans le fichier...
+        self.assertNotIn("Traceback", self.out)                            # ...mais pas sur la console
+        with open(logs[0][:-4] + ".jsonl", encoding="utf-8") as f:
+            types = [json.loads(ligne)["type"] for ligne in f]
+        self.assertEqual(types.count("requete_erreur"), 2)
+        self.assertIn("exception", types)
+
+    def test_exception_inattendue_journalisee(self):
+        with mock.patch.object(X, "run_pipeline", side_effect=RuntimeError("boum")):
+            with self.assertRaises(SystemExit) as cm:
+                self.lancer("--pages", "55")
+        self.assertEqual(cm.exception.code, 1)
+        logs = glob.glob(os.path.join(self.tmp, "logs", "*.log"))
+        with open(logs[0], encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("RuntimeError: boum", txt)
+        self.assertIn("Traceback", txt)
+        self.assertIn("fichier de log", self.out)
+
+    def test_le_controle_suit_l_extraction(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.sequence = ["lent", "lent"]
+        ctrl = X.Controle()
+        cfg = X.Config(pdf=PDF, url=self.url, sortie=self.tmp, pages=[55, 150], tokens_image=0, suivi=0, suivi_ui=0.1)
+        instantanes = []
+
+        def surveiller():
+            while ctrl.etat not in ("termine", "interrompu", "erreur"):
+                instantanes.append(ctrl.instantane())
+                time.sleep(0.05)
+        X.MUET = True
+        try:
+            t = threading.Thread(target=surveiller, daemon=True)
+            t.start()
+            rows, infos, avert = X.run_pipeline(cfg, ctrl)
+            t.join(5)
+        finally:
+            X.MUET = False
+        self.assertEqual((ctrl.etat, ctrl.total, ctrl.fait), ("termine", 2, 2))
+        self.assertEqual(ctrl.actifs, {})
+        self.assertEqual(len(rows), 18)
+        self.assertTrue(any(s["etat"] == "en cours" for s in instantanes))
+        self.assertTrue(any(a.get("tokens", 0) > 0 for s in instantanes for a in s["actifs"].values()))
+
+    def test_arret_demande_par_le_controle(self):
+        FauxLMStudio.sequence = ["silence_long"]
+        ctrl = X.Controle()
+        cfg = X.Config(pdf=PDF, url=self.url, sortie=self.tmp, pages=[55], tokens_image=0, suivi=0, stall=30, essais=1)
+
+        def travail():
+            X.run_pipeline(cfg, ctrl)
+        X.MUET = True
+        try:
+            t = threading.Thread(target=travail, daemon=True)
+            t.start()
+            for _ in range(200):
+                if self.generations() and ctrl.actifs:
+                    break
+                time.sleep(0.05)
+            debut = time.time()
+            ctrl.stop.set()
+            t.join(15)
+        finally:
+            X.MUET = False
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.time() - debut, 10)
+        self.assertTrue(cfg.interrompu)
+        self.assertEqual(ctrl.etat, "interrompu")
+
+    def test_diagnostic_prend_en_compte_les_pages(self):
+        FauxLMStudio.defaut = ("ADAM 123", "")
+        self.lancer("--diagnostic", "--pages", "150")
+        self.assertIn("page 150", self.out)
+        self.assertIn("préremplissage", self.out)
+
+    def test_flux_non_chunke_termine_par_la_fermeture(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.chunked = False
+        self.lancer("--pages", "55")
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_reponse_tronquee_gardee_comme_partielle(self):
+        complet = json.dumps({"entrees": P55}, ensure_ascii=False)
+        coupe = complet[:complet.index('"Hawa"') + 12]                     # JSON coupé en plein milieu de la 2e entrée
+        FauxLMStudio.reponses[self.md5(55)] = (coupe, "")
+        self.lancer("--pages", "55", "--max-tokens", str(len(coupe) // 6 - 1))
+        self.assertEqual(len(self.generations()), 3)                       # 3 essais, on garde le meilleur
+        self.assertEqual(self.cache(55)["statut"], "partiel")
+        self.assertEqual([r["prénom_fr"] for r in self.lire()], ["Adam", "Adame"])
+        self.assertIn("page_partielle", self.lire()[0]["à_vérifier"])
+        self.assertIn("pages partielles", self.out)
+
+    def test_ligne_de_progression_pendant_une_requete_lente(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.sequence = ["lent"]
+        self.lancer("--pages", "55", "--suivi", "1")
+        self.assertRegex(self.out, r"p055 en cours : \d+ jetons, [\d.]+ tok/s")
+
+    def test_export_conserve_les_pages_d_une_autre_configuration(self):
+        self.reponses_p55_p150()
+        self.lancer("--pages", "55")
+        tampon = io.StringIO()
+        with contextlib.redirect_stdout(tampon):
+            X.main(["--export", "--pages", "55", "--sortie", self.tmp, "--tokens-image", "1234"])
+        self.assertEqual(len(self.lire()), 6)
+        self.assertIn("autre configuration", tampon.getvalue())
+
+    # --- contexte et image
+    def test_calibrage_reduit_l_image(self):
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        self.lancer("--pages", "55", "--tokens-image", "2500")
+        w, h = self.generations()[-1]["taille"]
+        self.assertEqual(max(w, h), int(2872 * (2500 / (1816 * 2872 // 1024)) ** 0.5))
+        self.assertLess(max(w, h), 2872)
+        self.assertIn("image réduite", self.out)
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_contexte_trop_court_est_fatal(self):
+        FauxLMStudio.ctx = 6000
+        with self.assertRaises(SystemExit) as cm:
+            self.lancer("--pages", "55")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("Contexte trop court", self.out)
+        self.assertEqual(self.generations(), [])
+
+    def test_sortie_bornee_par_le_contexte(self):
+        FauxLMStudio.ctx = 12000
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        self.lancer("--pages", "55")
+        entree = 900 + 1816 * 2872 // 1024
+        self.assertEqual(self.generations()[-1]["corps"]["max_output_tokens"], 12000 - entree - 128)
+        self.assertIn("budget de sortie limité", self.out)
+
+    def test_parallelisme_reduit_si_le_contexte_ne_suffit_pas(self):
+        FauxLMStudio.ctx = 20000
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        self.lancer("--pages", "55,56,57", "--paralleles", "3")
+        self.assertIn("2 à la fois", self.out)
+        self.assertEqual(len(self.generations()), 3)
+
+    # --- repli sur l'API compatible OpenAI (LM Studio < 0.4)
+    def test_repli_openai_en_streaming(self):
+        FauxLMStudio.natif = False
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "réflexion fournie dans le champ dédié")
+        self.lancer("--pages", "55")
+        g = self.generations()[-1]
+        self.assertEqual(g["chemin"], "/v1/chat/completions")
+        self.assertEqual((g["corps"]["messages"][0]["role"], g["corps"]["stream"], g["corps"]["max_tokens"]), ("system", True, 8000))
+        self.assertTrue(g["corps"]["stream_options"]["include_usage"])
+        res = self.cache(55)
+        self.assertEqual((res["penser"], res["tokens_entree"] > 900, res["tokens_reflexion"] > 0), (True, True, True))
+        self.assertEqual(len(self.lire()), 6)
+
+    def test_repli_openai_reflexion_dans_le_contenu(self):
+        FauxLMStudio.natif = False
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        FauxLMStudio.sequence = ["think_inline"]
+        self.lancer("--pages", "55")
+        self.assertEqual(len(self.lire()), 6)
+        self.assertGreater(self.cache(55)["tokens_reflexion"], 0)
+
+    # --- reprise et visibilité
+    def test_export_sans_llm_et_statut(self):
+        self.reponses_p55_p150()
+        self.lancer("--pages", "55,150")
+        avant = len(self.lire())
+        for f in ("prenoms_arabes.csv", "prenoms_arabes.json", "prenoms_arabes.xlsx"):
+            os.remove(os.path.join(self.tmp, f))
+        n = len(FauxLMStudio.requetes)
+        tampon = io.StringIO()
+        with contextlib.redirect_stdout(tampon):
+            code = X.main(["--export", "--pages", "55,150", "--sortie", self.tmp, "--url", "http://127.0.0.1:9"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.lire()), avant)
+        self.assertEqual(len(FauxLMStudio.requetes), n)                    # LM Studio n'a pas été contacté
+        tampon = io.StringIO()
+        with contextlib.redirect_stdout(tampon):
+            X.main(["--statut", "--pages", "55,150,200", "--sortie", self.tmp, "--tokens-image", "0"])
+        self.assertRegex(tampon.getvalue(), r"ok\s+:\s+2")
+        self.assertRegex(tampon.getvalue(), r"à faire\s+:\s+1")
+
+    def test_export_intermediaire_tous_les_n_pages(self):
+        FauxLMStudio.defaut = (json.dumps({"entrees": P55}, ensure_ascii=False), "")
+        appels = []
+        vrai = X.exporter
+
+        def espion(*a, **k):
+            appels.append(1)
+            return vrai(*a, **k)
+        with mock.patch.object(X, "exporter", espion):
+            self.lancer("--pages", "55,56,57", "--export-tous", "1")
+        self.assertGreaterEqual(len(appels), 4)                            # 3 intermédiaires + l'export final
+
+    def test_diagnostic(self):
+        FauxLMStudio.defaut = ("ADAM 123", "")
+        code = self.lancer("--diagnostic", "--tokens-image", "2500")
+        self.assertEqual(code, 0)
+        for attendu in ("VISION OK", "5/5", "lms load", "Max Concurrent Predictions", "jetons d'entrée"):
+            self.assertIn(attendu, self.out)
 
 
 if __name__ == "__main__":

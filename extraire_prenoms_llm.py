@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-extraire_prenoms_llm.py  (v3 : lecture des pages par un modèle de vision, via LM Studio)
-========================================================================================
+extraire_prenoms_llm.py  (v4 : lecture des pages par un modèle de vision via LM Studio, en STREAMING)
+====================================================================================================
 Extrait « Le Livre des prénoms arabes » (PDF scanné, sans couche de texte) vers CSV / Excel / JSON,
 en envoyant chaque page à un modèle de vision servi par LM Studio (ex. prism-ml/bonsai-27b).
 
-PIPELINE
-  1. Image native de la page (PyMuPDF) -> nettoyage (efface le texte fantôme du verso, garde le rouge).
-  2. Une requête par page (ou par demi-page avec --decoupe 2) : le modèle renvoie du JSON.
-  3. Cache par page : relancer la même commande ne refait rien de déjà calculé.
-  4. Assemblage : suites de définitions d'une page à l'autre, puis UNE LIGNE PAR PRÉNOM
-     (« Youssouf/Youssef » devient deux lignes), colonnes d'équivalents, drapeaux « à vérifier ».
-  5. Export : CSV (comme ton exemple), JSON, Excel (+ feuille « À vérifier » et feuille « Pages »).
+CE QUI CHANGE PAR RAPPORT À LA v3 (audit : voir README.md)
+  * Requêtes en STREAMING : progression visible (jetons, tok/s), arrêt anticipé en cas de boucle,
+    de réflexion trop longue, de silence ou de Ctrl+C. La connexion est fermée -> LM Studio abandonne.
+  * Réflexion du modèle COUPÉE par défaut quand LM Studio le permet (« reasoning: off ») : pour recopier une
+    page, elle coûte des milliers de jetons pour rien. `--reflexion oui` la rétablit, avec un budget borné.
+  * Budget de contexte vérifié : jetons d'entrée mesurés (image + consigne), sortie bornée par le contexte chargé.
+  * Image réduite automatiquement à ~2 500 jetons (CUDA ne la réduit pas) : `--tokens-image 0` = image native.
+  * Reprise fiable : cache par page, export intermédiaire tous les N pages, `--export` (sans LM Studio), `--statut`.
+  * `--diagnostic` : configuration chargée, vitesse réelle, mesure GPU (nvidia-smi), commande `lms load` conseillée.
 
 USAGE RAPIDE
-    python extraire_prenoms_llm.py --diagnostic                       # LM Studio + vision OK ?
-    python extraire_prenoms_llm.py livre.pdf --autotest               # 4 pages avec vérité terrain
-    python extraire_prenoms_llm.py livre.pdf                          # tout le dictionnaire (pages 53-338)
-    python extraire_prenoms_llm.py livre.pdf --pages 55,150 --paralleles 2
+    python extraire_prenoms_llm.py --diagnostic livre.pdf        # LM Studio + vitesse + GPU + réglages conseillés
+    python extraire_prenoms_llm.py livre.pdf --autotest          # 4 pages avec vérité terrain
+    python extraire_prenoms_llm.py livre.pdf                     # tout le dictionnaire (pages 53-338), reprenable
+    python extraire_prenoms_llm.py --statut                      # où en est-on ? (sans LM Studio)
+    python extraire_prenoms_llm.py --export                      # régénère CSV/JSON/Excel depuis le cache
 
 Le détail est dans README.md.
 """
@@ -28,28 +31,192 @@ import argparse
 import base64
 import csv
 import hashlib
+import http.client
+import importlib.metadata
 import io
 import json
 import os
+import platform
+import queue
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
+import traceback
 import unicodedata
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+import urllib.parse
+import zipfile
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 from PIL import Image
 
+VERSION = "4.1.0"
 T0 = time.time()
 
+MUET = False            # True : rien sur la console (interface plein écran)
+ECOUTEURS: list = []    # fonctions appelées à chaque ligne affichable : f(niveau, texte)
+SECRETS: set = set()    # valeurs à masquer partout (jeton d'API...)
 
-def log(msg: str) -> None:
-    print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)
+
+def masquer(texte) -> str:
+    texte = str(texte)
+    for s in list(SECRETS):
+        if s and len(s) >= 4:
+            texte = texte.replace(s, "***")
+    return texte
+
+
+class Journal:
+    """Journal de session, écrit au fil de l'eau (une ligne = un flush : un plantage laisse quand même la trace).
+       <dossier>/AAAAMMJJ_HHMMSS_<mode>.log    texte lisible : heure, niveau, fil d'exécution, message (INFO + DEBUG)
+       <dossier>/AAAAMMJJ_HHMMSS_<mode>.jsonl  un événement structuré par ligne (requêtes, pages, GPU, erreurs...)
+    Avant l'ouverture (le dossier n'est connu qu'après la lecture des options), les lignes attendent en mémoire."""
+
+    ATTENTE_MAX = 5000
+
+    def __init__(self):
+        self.verrou = threading.RLock()
+        self.f_txt = self.f_jsonl = None
+        self.chemin = self.chemin_jsonl = ""
+        self.attente_txt: list = []
+        self.attente_jsonl: list = []
+        self.niveau_fichier = "DEBUG"
+
+    def ouvrir(self, dossier: str, mode: str, niveau: str = "DEBUG", garder: int = 30) -> str:
+        with self.verrou:
+            self.fermer()
+            os.makedirs(dossier, exist_ok=True)
+            base = os.path.join(dossier, time.strftime("%Y%m%d_%H%M%S") + "_" + (re.sub(r"[^a-z0-9]+", "-", mode.lower()).strip("-") or "session"))
+            racine, n = base, 1
+            while os.path.exists(racine + ".log"):
+                n += 1
+                racine = f"{base}-{n}"
+            self.chemin, self.chemin_jsonl = racine + ".log", racine + ".jsonl"
+            self.f_txt = open(self.chemin, "a", encoding="utf-8")
+            self.f_jsonl = open(self.chemin_jsonl, "a", encoding="utf-8")
+            self.niveau_fichier = str(niveau).upper()
+            self.f_txt.writelines(self.attente_txt)
+            self.f_jsonl.writelines(self.attente_jsonl)
+            self.f_txt.flush()
+            self.f_jsonl.flush()
+            self.attente_txt, self.attente_jsonl = [], []
+            self._purger(dossier, garder)
+            return self.chemin
+
+    @staticmethod
+    def _purger(dossier: str, garder: int) -> None:
+        try:
+            noms = sorted(n[:-4] for n in os.listdir(dossier) if n.endswith(".log"))
+            for n in noms[:-garder] if garder > 0 else []:
+                for ext in (".log", ".jsonl"):
+                    try:
+                        os.remove(os.path.join(dossier, n + ext))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def _ecrire(self, fichier, attente: list, ligne: str) -> None:
+        with self.verrou:
+            if fichier is not None:
+                try:
+                    fichier.write(ligne)
+                    fichier.flush()
+                except (OSError, ValueError):
+                    pass
+            elif len(attente) < self.ATTENTE_MAX:
+                attente.append(ligne)
+
+    def ecrire(self, niveau: str, msg: str) -> None:
+        if niveau == "DEBUG" and self.niveau_fichier != "DEBUG":
+            return
+        t = time.time()
+        corps = str(msg).replace("\n", "\n    ")
+        ligne = (f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t))}.{int(t % 1 * 1000):03d} {niveau:<5} "
+                 f"[{threading.current_thread().name}] {corps}\n")
+        self._ecrire(self.f_txt, self.attente_txt, ligne)
+
+    def evenement(self, type_: str, **champs) -> None:
+        d = {"t": round(time.time(), 3), "dt": round(time.time() - T0, 2), "fil": threading.current_thread().name, "type": type_}
+        d.update(champs)
+        try:
+            ligne = masquer(json.dumps(d, ensure_ascii=False, default=str)) + "\n"
+        except (TypeError, ValueError):
+            ligne = json.dumps({"type": type_, "erreur_serialisation": True}) + "\n"
+        self._ecrire(self.f_jsonl, self.attente_jsonl, ligne)
+
+    def fermer(self) -> None:
+        with self.verrou:
+            for f in (self.f_txt, self.f_jsonl):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+            self.f_txt = self.f_jsonl = None
+
+
+JOURNAL = Journal()
+
+
+def log(msg: str, niveau: str = "INFO") -> None:
+    """Journal (fichier) + console + écouteurs (interface). Le niveau DEBUG ne va que dans le fichier."""
+    msg = masquer(msg)
+    JOURNAL.ecrire(niveau, msg)
+    if niveau == "DEBUG":
+        return
+    ligne = f"[{time.time() - T0:7.1f}s] {msg}"
+    if not MUET:
+        try:
+            print(ligne, flush=True)
+        except (OSError, ValueError):
+            pass
+    for f in list(ECOUTEURS):
+        try:
+            f(niveau, ligne)
+        except Exception:                                        # noqa: BLE001 : un écouteur défaillant ne doit rien casser
+            pass
+
+
+def debug(msg: str) -> None:
+    log(msg, "DEBUG")
+
+
+def evenement(type_: str, **champs) -> None:
+    JOURNAL.evenement(type_, **champs)
+
+
+def log_exception(contexte: str, exc: BaseException) -> None:
+    """Message court sur la console, trace complète dans le fichier de log."""
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    log(f"{contexte} : {type(exc).__name__}: {exc}", "ERROR")
+    JOURNAL.ecrire("ERROR", "trace :\n" + masquer(tb))
+    JOURNAL.evenement("exception", contexte=contexte, type_exception=type(exc).__name__, message=str(exc), trace=tb)
+
+
+def infos_environnement() -> dict:
+    paquets = {}
+    for nom in ("Pillow", "numpy", "openpyxl", "PyMuPDF", "textual", "rich"):
+        try:
+            paquets[nom] = importlib.metadata.version(nom)
+        except Exception:                                        # noqa: BLE001
+            paquets[nom] = None
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            sha = hashlib.sha1(f.read()).hexdigest()[:10]
+    except OSError:
+        sha = ""
+    try:
+        gpu = EchantillonGPU().instantane()
+    except Exception:                                            # noqa: BLE001
+        gpu = None
+    return {"version_script": VERSION, "sha1_script": sha, "python": sys.version.split()[0], "plateforme": platform.platform(),
+            "processeur": platform.processor(), "cpu_logiques": os.cpu_count(), "dossier_courant": os.getcwd(),
+            "script": os.path.abspath(__file__), "paquets": paquets, "gpu": gpu}
 
 
 # ============================================================================
@@ -122,76 +289,40 @@ def lookup_theme(pdf_page: int) -> tuple[str, str]:
 
 
 # ============================================================================
-# 2) LE PROMPT
+# 2) LE PROMPT (rôle « système » : constant d'une requête à l'autre ; la page vient dans le message utilisateur)
 # ============================================================================
 
-PROMPT = """Tu lis une page scannée du « Livre des prénoms arabes » (Y. et N. Geoffroy), un dictionnaire de prénoms. Extrais TOUTES les entrées de prénoms visibles sur cette page, dans l'ordre de lecture (de haut en bas).
+PROMPT = """Tu transcris une page scannée du « Livre des prénoms arabes » (dictionnaire de prénoms). Réponds UNIQUEMENT par un objet JSON, sans texte avant ni après et sans analyse préalable.
 
-MISE EN PAGE D'UNE ENTRÉE
-1. Un ou deux « blocs de prénom » :
-   - colonne de gauche, texte NOIR en gras = prénom MASCULIN ; colonne de droite, texte ROUGE en gras = prénom FÉMININ ;
-   - un bloc = 1 à 4 orthographes françaises du même prénom, empilées ligne par ligne (ex. « Adam » puis « Adame ») ;
-   - à droite de la première ligne du bloc : le même prénom en écriture arabe (calligraphie), avec ou sans voyelles.
-2. Ensuite UN paragraphe de définition en caractères romains (les sens en italique), commun aux deux blocs s'il y en a deux (dans ce cas : une seule entrée). Il commence en général par la translittération savante, éventuellement suivie d'un équivalent entre parenthèses, puis « : » (ex. « Âdam (Adam) : premier homme… », « Nâḍil / Nâḍila : qui l'emporte… »). Il peut commencer par un astérisque « * » : ne le recopie pas.
+MISE EN PAGE
+Une entrée = un ou deux « blocs de prénom », puis UN paragraphe de définition.
+- Bloc de prénom : 1 à 4 orthographes françaises empilées en gras ; à droite de la 1re ligne, le même prénom en arabe.
+  Colonne de gauche, texte NOIR = MASCULIN ; colonne de droite, texte ROUGE = FEMININ.
+- Deux blocs pour une même définition (ex. Nadil à gauche, Nadila à droite) = UNE entrée à deux blocs. Un prénom « mixte » apparaît dans les deux colonnes : deux blocs aussi.
+- Définition : paragraphe en caractères romains (sens en italique), commun à tous les blocs de l'entrée. Elle commence souvent par un astérisque « * » : ne le recopie pas.
 
 RÈGLES
-- Recopie exactement ce qui est imprimé : orthographes françaises (accents, apostrophes, tirets, majuscules) et texte complet de la définition, sans le résumer, le traduire ni le corriger. Recolle les mots coupés en fin de ligne (« islami- » + « que » -> « islamique »).
-- Arabe : recopie les lettres ET toutes les voyelles brèves visibles (fatha, damma, kasra, shadda, soukoun, tanwin) telles qu'imprimées, sans jamais en ajouter. Ne recopie PAS les barres d'allongement (tatwil « ـ »). Si l'arabe est absent ou illisible : chaîne vide "".
-- genre : "MASCULIN" (noir, colonne gauche) ou "FEMININ" (rouge, colonne droite).
-- Prénom MIXTE : s'il apparaît dans les deux colonnes (noir à gauche ET rouge à droite, définition souvent introduite par « (mixte) »), c'est UNE seule entrée avec deux blocs (un MASCULIN, un FEMININ).
-- Appels de note : ne recopie pas les petits chiffres en exposant collés à la fin d'un mot (« famille¹⁹ » s'écrit « famille »). Les autres exposants s'écrivent en ligne (« 12ᵉ siècle » s'écrit « 12e siècle »).
-- IGNORE : le titre courant et le numéro de page en haut de page (« LE LIVRE DES PRÉNOMS ARABES » ou le titre d'une section, ex. « SAINTS PERSONNAGES CÉLÈBRES »), les bandeaux de section rouges (« A. LES PROPHÈTES… »), la légende soulignée « MASCULIN / FEMININ », les paragraphes d'introduction, les notes de bas de page (petit texte sous un filet, en bas de page), et le texte pâle qui transparaît depuis le verso de la page.
-- Ne fusionne jamais deux entrées différentes ; n'invente aucune entrée ; n'en oublie aucune.
-- Haut de page : si la page commence par la suite d'une définition commencée sur la page précédente (aucun prénom avant), crée une entrée avec "prenoms": [] et "suite_page_precedente": true.
-- Bas de page : si la définition de la dernière entrée est coupée (elle continue sur la page suivante), ou si des prénoms n'ont pas encore leur définition, mets "description_incomplete": true.
-- Ne recopie pas la page en entier pendant ta réflexion : repère les entrées, puis écris directement le JSON.
+- Recopie exactement : orthographes (accents, apostrophes, tirets, majuscules) et définition COMPLÈTE, sans résumer, traduire ni corriger. Recolle les mots coupés en fin de ligne (« islami- » + « que » -> « islamique »).
+- Arabe : les lettres ET toutes les voyelles brèves et signes visibles (fatha, damma, kasra, shadda, soukoun, tanwin), jamais ajoutés ; sans les barres d'allongement (tatwil « ـ »). Illisible ou absent : "".
+- IGNORE : titre courant et numéro de page (en haut), bandeaux rouges de section, légende « MASCULIN / FEMININ », paragraphes d'introduction, notes de bas de page (petit texte sous un filet), texte pâle transparent du verso, petits chiffres d'appel de note collés à un mot (« famille¹⁹ » -> « famille »). Exposants en ligne : « 12e ».
+- Haut de page : si elle commence par la fin d'une définition (aucun prénom avant) : entrée avec "prenoms": [] et "suite_page_precedente": true.
+- Bas de page : définition coupée, ou prénoms sans leur définition : "description_incomplete": true.
+- Ces deux champs ne s'écrivent QUE lorsqu'ils valent true (sinon, ne les écris pas).
+- Ne fusionne pas deux entrées, n'en invente aucune, n'en oublie aucune.
 
-FORMAT DE SORTIE : réponds UNIQUEMENT par un objet JSON (aucun texte autour, aucun commentaire), de cette forme :
-{"entrees": [
-  {"prenoms": [
-     {"genre": "MASCULIN", "orthographes": ["Youssouf", "Youssef"], "arabe": "يُوسُف"}],
-   "description": "Yûsuf (Joseph) : fils de Ya’qub. La 12e sourate du Coran lui est presque entièrement consacrée et porte son nom. Signifie en hébreu : que Dieu ajoute (d’autres enfants à celui qui vient de naître).",
-   "suite_page_precedente": false, "description_incomplete": false},
-  {"prenoms": [
-     {"genre": "MASCULIN", "orthographes": ["Karim"], "arabe": "كَرِيم"},
-     {"genre": "FEMININ", "orthographes": ["Karima"], "arabe": "كَرِيمَة"}],
-   "description": "Karîm / Karîma : généreux.",
-   "suite_page_precedente": false, "description_incomplete": false}
-]}
-Si la page ne contient aucune entrée : {"entrees": []}."""
+FORMAT (exemple, à ne pas recopier) :
+{"entrees":[{"prenoms":[{"genre":"MASCULIN","orthographes":["Karim"],"arabe":"كَرِيم"},{"genre":"FEMININ","orthographes":["Karima"],"arabe":"كَرِيمَة"}],"description":"Karîm / Karîma : généreux."}]}
+Page sans entrée : {"entrees":[]}"""
+
+TEXTE_UTILISATEUR = "Extrais toutes les entrées de cette page (JSON uniquement)."
 
 NOTE_BANDE = {
-    1: "\n\nATTENTION : tu ne vois que la MOITIÉ HAUTE de la page. La dernière entrée peut être coupée en bas (mets alors \"description_incomplete\": true).",
-    2: "\n\nATTENTION : tu ne vois que la MOITIÉ BASSE de la page. Le texte du haut peut être la suite d'une définition commencée plus haut (mets alors \"prenoms\": [] et \"suite_page_precedente\": true).",
+    1: "\nATTENTION : tu ne vois que la MOITIÉ HAUTE de la page. La dernière entrée peut être coupée en bas (mets alors \"description_incomplete\": true).",
+    2: "\nATTENTION : tu ne vois que la MOITIÉ BASSE de la page. Le texte du haut peut être la suite d'une définition commencée plus haut (mets alors \"prenoms\": [] et \"suite_page_precedente\": true).",
 }
 
-# les deux entrées d'exemple du prompt : si elles reviennent telles quelles, le modèle a recopié l'exemple
-EXEMPLE_ORTHOGRAPHES = {"youssouf", "youssef", "karim", "karima"}
-
-SCHEMA_JSON = {
-    "name": "page_prenoms",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["entrees"],
-        "properties": {"entrees": {"type": "array", "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["prenoms", "description", "suite_page_precedente", "description_incomplete"],
-            "properties": {
-                "prenoms": {"type": "array", "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["genre", "orthographes", "arabe"],
-                    "properties": {
-                        "genre": {"type": "string", "enum": ["MASCULIN", "FEMININ"]},
-                        "orthographes": {"type": "array", "items": {"type": "string"}},
-                        "arabe": {"type": "string"}}}},
-                "description": {"type": "string"},
-                "suite_page_precedente": {"type": "boolean"},
-                "description_incomplete": {"type": "boolean"}}}}}},
-}
+# description de l'exemple du prompt : si TOUTES les entrées renvoyées l'ont, le modèle a recopié l'exemple
+EXEMPLE_DESC = "Karîm / Karîma : généreux."
 
 
 # ============================================================================
@@ -201,36 +332,57 @@ SCHEMA_JSON = {
 @dataclass
 class Config:
     pdf: str = ""
-    url: str = "http://localhost:1234/v1"
+    url: str = "http://localhost:1234"          # racine du serveur (« …/v1 » est accepté et ramené à la racine)
     modele: str = "prism-ml/bonsai-27b"
     sortie: str = "sortie_llm"
     pages: list = field(default_factory=list)
     paralleles: int = 1
     decoupe: int = 1
     nettoyage: bool = True
-    max_cote: int = 0
-    temperature: float = 0.6
-    top_p: float = 0.95
+    max_cote: int = 0              # plafond MANUEL (px) du plus grand côté de l'image ; 0 = automatique (tokens_image)
+    max_cote_auto: int = 0         # calculé au démarrage d'après le nombre de jetons d'image mesuré
+    tokens_image: int = 2500       # cible de jetons d'image par requête ; 0 = image native
+    api: str = "auto"              # auto | natif (/api/v1/chat) | openai (/v1/chat/completions)
+    reflexion: str = "auto"        # auto | non | oui
+    budget_reflexion: int = 0      # jetons de réflexion tolérés ; 0 = automatique
+    temperature: float | None = None   # None = 0,3 sans réflexion, 0,6 avec
+    top_p: float | None = None         # None = 0,8 sans réflexion, 0,95 avec
     top_k: int = 20
-    max_tokens: int = 16000
-    timeout: int = 1800
-    essais: int = 2
-    json_schema: bool = False
+    repeat_penalty: float = 0.0
+    max_tokens: int = 8000         # jetons de sortie max par requête, réflexion comprise (borné par le contexte)
+    timeout: int = 1200            # durée totale max d'une requête (s)
+    stall: int = 300               # silence max entre deux jetons (s)
+    attente: int = 900             # attente max du premier octet, c.-à-d. du préremplissage de l'image (s)
+    suivi: int = 20                # intervalle (s) des lignes de progression pendant une requête (0 = aucune)
+    suivi_ui: float = 0            # intervalle (s) des mises à jour destinées à une interface (0 = aucune)
+    log_niveau: str = "DEBUG"      # niveau écrit dans le fichier de log : DEBUG | INFO
+    essais: int = 3
     corps_extra: dict = field(default_factory=dict)
     prompt: str = PROMPT
     refaire: bool = False
     sauver_images: bool = False
     ancien: str = ""
-    interrompu: bool = False
+    export_tous: int = 10          # export intermédiaire tous les N pages terminées (0 = seulement à la fin)
+    sans_llm: bool = False         # --export : reconstruit les fichiers depuis le cache, sans contacter LM Studio
+    cle_api: str = ""
+    interrompu: bool = False       # résultats d'exécution (lus par main)
     fatal: str = ""
 
 
 class ErreurFatale(Exception):
-    """Inutile de continuer (serveur absent, modèle sans vision...) : on arrête tout le lot."""
+    """Inutile de continuer (serveur absent, modèle sans vision, contexte trop court...) : on arrête tout le lot."""
 
 
 class ErreurLLM(Exception):
     """Échec récupérable d'une page (délai dépassé, réponse inexploitable...)."""
+
+
+class ErreurReflexion(ErreurLLM):
+    """LM Studio refuse le réglage de réflexion (« reasoning ») pour ce modèle."""
+
+
+class Interrompu(Exception):
+    """Ctrl+C ou arrêt demandé : on sort proprement, sans compter ça comme un échec de page."""
 
 
 # ============================================================================
@@ -328,8 +480,9 @@ def preparer_image(cfg: Config, page: int, bande: int) -> tuple[bytes, float]:
     envoi = net if cfg.nettoyage else im
     if cfg.decoupe > 1:
         envoi = decouper(net, envoi, cfg.decoupe)[bande - 1]
-    if cfg.max_cote and max(envoi.size) > cfg.max_cote:
-        r = cfg.max_cote / max(envoi.size)
+    plafond = cfg.max_cote or cfg.max_cote_auto
+    if plafond and max(envoi.size) > plafond:
+        r = plafond / max(envoi.size)
         envoi = envoi.resize((round(envoi.width * r), round(envoi.height * r)), Image.LANCZOS)
     encre = float((np.asarray(envoi.convert("L")) < 128).mean() * 100)
     buf = io.BytesIO()
@@ -338,101 +491,571 @@ def preparer_image(cfg: Config, page: int, bande: int) -> tuple[bytes, float]:
 
 
 # ============================================================================
-# 5) DIALOGUE AVEC LM STUDIO (API compatible OpenAI)
+# 5) DIALOGUE AVEC LM STUDIO : streaming, arrêt anticipé, mesures
+#    API native /api/v1/chat (LM Studio >= 0.4.0 : réflexion coupable, statistiques) ou, à défaut,
+#    API compatible OpenAI /v1/chat/completions.
 # ============================================================================
 
-def _requete(url: str, corps: dict | None, timeout: int) -> dict:
-    data = json.dumps(corps).encode("utf-8") if corps is not None else None
-    req = urllib.request.Request(url, data=data, headers={
-        "Content-Type": "application/json", "Authorization": "Bearer lm-studio"})
+@dataclass
+class InfoModele:
+    id: str = ""                    # identifiant de l'instance CHARGÉE (c'est lui qu'on envoie dans « model »)
+    cle: str = ""
+    natif: bool = False             # API native /api/v1 disponible ?
+    charge: bool = True
+    ctx: int = 0                    # contexte chargé (0 = inconnu)
+    parallel: int = 0               # « Max Concurrent Predictions » chargé (0 = inconnu)
+    batch: int = 0                  # taille de lot d'évaluation
+    flash: bool | None = None
+    kv_gpu: bool | None = None
+    vision: bool | None = None
+    options_reflexion: list = field(default_factory=list)   # ex. ["off", "on"]
+    quant: str = ""
+    taille_go: float = 0.0
+    format: str = ""
+
+    @property
+    def peut_couper_reflexion(self) -> bool:
+        return self.natif and "off" in self.options_reflexion
+
+
+def arrondi_1024(n: int) -> int:
+    return ((int(n) + 1023) // 1024) * 1024
+
+
+def _norm_id(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def commande_lms(cle: str, ctx: int, parallel: int = 1) -> str:
+    return f"lms load {cle} --context-length {ctx} --parallel {max(1, parallel)} --gpu max --identifier {cle} -y"
+
+
+# ---------------------------------------------------------------- HTTP de base (http.client : contrôle fin des délais)
+
+def _cible(cfg: Config) -> tuple[str, str, int, str]:
+    brut = cfg.url if "://" in cfg.url else "http://" + cfg.url
+    u = urllib.parse.urlsplit(brut)
+    chemin = u.path.rstrip("/")
+    if chemin.endswith("/v1"):
+        chemin = chemin[:-3]
+    schema = u.scheme or "http"
+    return schema, u.hostname or "localhost", u.port or (443 if schema == "https" else 80), chemin
+
+
+def _entetes(cfg: Config) -> dict:
+    cle = cfg.cle_api or os.environ.get("LM_API_TOKEN", "") or "lm-studio"
+    return {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+            "Authorization": "Bearer " + cle}
+
+
+def _connexion(cfg: Config, timeout: float):
+    schema, hote, port, _ = _cible(cfg)
+    cls = http.client.HTTPSConnection if schema == "https" else http.client.HTTPConnection
+    return cls(hote, port, timeout=timeout)
+
+
+def _chemin(cfg: Config, suite: str) -> str:
+    return _cible(cfg)[3] + suite
+
+
+def _msg_injoignable(cfg: Config, e) -> str:
+    return (f"Serveur LM Studio injoignable sur {cfg.url} ({e}). Lance LM Studio, onglet « Developer » -> "
+            "« Start Server », et charge le modèle.")
+
+
+def _classer_http(statut: int, texte: str):
+    """Transforme une réponse HTTP en erreur : fatale (inutile de continuer) ou récupérable (page suivante)."""
+    t = texte[:600]
+    bas = t.lower()
+    if statut in (401, 403):
+        raise ErreurFatale(f"LM Studio refuse l'accès (HTTP {statut}) : l'authentification de l'API est activée. Crée un jeton "
+                           f"d'API dans les réglages du serveur LM Studio et passe-le avec --cle-api (ou la variable LM_API_TOKEN). Détail : {t}")
+    parle_image = any(k in bas for k in ("image", "vision", "multimodal", "mmproj", "modality"))
+    refuse = any(k in bas for k in ("not support", "unsupported", "does not accept", "not a vision", "no vision",
+                                    "cannot process", "mmproj", "multimodal", "modality"))
+    if statut in (400, 422) and parle_image and refuse:
+        raise ErreurFatale(
+            "Le modèle chargé n'accepte pas d'image (module vision absent ?). Dans LM Studio, télécharge aussi le "
+            f"fichier vision (mmproj) du modèle, ou choisis une variante « vision ». Détail : {t}")
+    if statut in (400, 422) and "reasoning" in bas:
+        raise ErreurReflexion(f"réglage de réflexion refusé par le modèle : {t}")
+    if statut == 404 or ("model" in bas and ("not found" in bas or "not loaded" in bas or "no models" in bas)):
+        raise ErreurFatale(f"Modèle introuvable / non chargé dans LM Studio (HTTP {statut}) : {t}")
+    if "context" in bas and ("length" in bas or "size" in bas or "overflow" in bas):
+        raise ErreurFatale("Contexte insuffisant : recharge le modèle dans LM Studio avec un contexte d'au moins "
+                           f"16 384 jetons (voir --diagnostic). Détail : {t}")
+    raise ErreurLLM(f"HTTP {statut} : {t}")
+
+
+def _requete_simple(cfg: Config, methode: str, suite: str, corps=None, timeout: float = 30):
+    """Requête non-streaming -> (statut HTTP, texte). Serveur injoignable = erreur fatale."""
+    conn = _connexion(cfg, timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            brut = r.read()
-    except urllib.error.HTTPError as e:
-        texte = e.read().decode("utf-8", "replace")[:600]
-        bas = texte.lower()
-        parle_image = any(k in bas for k in ("image", "vision", "multimodal", "mmproj", "modality"))
-        refuse = any(k in bas for k in ("not support", "unsupported", "does not accept", "not a vision", "no vision",
-                                        "cannot process", "mmproj", "multimodal", "modality"))
-        if e.code in (400, 422) and parle_image and refuse:
-            raise ErreurFatale(
-                "Le modèle chargé n'accepte pas d'image (module vision absent ?). Dans LM Studio, télécharge "
-                f"aussi le fichier vision (mmproj) du modèle, ou choisis une variante « vision ». Détail : {texte}")
-        if e.code == 404 or ("model" in bas and ("not found" in bas or "not loaded" in bas or "no models" in bas)):
-            raise ErreurFatale(f"Modèle introuvable / non chargé dans LM Studio (HTTP {e.code}) : {texte}")
-        if "context" in bas and ("length" in bas or "size" in bas or "overflow" in bas):
-            raise ErreurFatale("Contexte insuffisant : recharge le modèle dans LM Studio avec un contexte d'au moins "
-                               f"32 000 tokens (image + consigne + réflexion + réponse). Détail : {texte}")
-        raise ErreurLLM(f"HTTP {e.code} : {texte}")
-    except urllib.error.URLError as e:
-        if isinstance(e.reason, (TimeoutError, socket.timeout)):
+        try:
+            conn.connect()
+        except OSError as e:
+            raise ErreurFatale(_msg_injoignable(cfg, e))
+        data = json.dumps(corps).encode("utf-8") if corps is not None else None
+        try:
+            conn.request(methode, _chemin(cfg, suite), body=data, headers=_entetes(cfg))
+            resp = conn.getresponse()
+            brut = resp.read()
+        except (socket.timeout, TimeoutError):
             raise ErreurLLM(f"délai dépassé ({timeout}s)")
-        raise ErreurFatale(f"Serveur LM Studio injoignable sur {url} ({e.reason}). Lance LM Studio, onglet "
-                           "« Developer » -> « Start Server », et charge le modèle.")
-    except (TimeoutError, socket.timeout):
-        raise ErreurLLM(f"délai dépassé ({timeout}s)")
-    except (ConnectionError, OSError) as e:
-        raise ErreurLLM(f"connexion interrompue : {e}")
+        except (OSError, http.client.HTTPException) as e:
+            raise ErreurLLM(f"connexion interrompue : {e}")
+        return resp.status, brut.decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def _json(cfg: Config, methode: str, suite: str, corps=None, timeout: float = 30) -> dict:
+    statut, texte = _requete_simple(cfg, methode, suite, corps, timeout)
+    if statut >= 400:
+        _classer_http(statut, texte)
     try:
-        return json.loads(brut)
+        return json.loads(texte)
     except ValueError:
-        raise ErreurLLM(f"réponse non-JSON du serveur : {brut[:200]!r}")
+        raise ErreurLLM(f"réponse non-JSON du serveur : {texte[:200]!r}")
 
 
-def lister_modeles(cfg: Config) -> list[str]:
-    d = _requete(cfg.url.rstrip("/") + "/models", None, 20)
-    return [m.get("id", "") for m in d.get("data", []) if m.get("id")]
+# ---------------------------------------------------------------- modèle chargé : identifiant, contexte, capacités
+
+def detecter_api(cfg: Config) -> str:
+    if cfg.api in ("natif", "openai"):
+        return cfg.api
+    statut, texte = _requete_simple(cfg, "GET", "/api/v1/models", None, 15)
+    if statut in (401, 403):
+        _classer_http(statut, texte)                  # lève ErreurFatale : inutile de se rabattre sur l'API OpenAI
+    return "natif" if statut == 200 else "openai"
 
 
-def resoudre_modele(cfg: Config) -> str:
-    """Trouve l'identifiant réel du modèle dans LM Studio (il diffère souvent du nom affiché)."""
-    ids = [i for i in lister_modeles(cfg) if "embed" not in i.lower()]
+def _info_natif(m: dict) -> InfoModele:
+    inst = (m.get("loaded_instances") or [None])[0]
+    cap = m.get("capabilities") or {}
+    raison = cap.get("reasoning") or m.get("reasoning") or {}
+    q = m.get("quantization") or {}
+    bits = q.get("bits_per_weight")
+    info = InfoModele(natif=True, cle=m.get("key", ""), charge=bool(inst), vision=cap.get("vision"),
+                      options_reflexion=[str(o) for o in (raison.get("allowed_options") or [])],
+                      quant=" ".join(x for x in (str(q.get("name") or ""), f"({bits} bits)" if bits else "") if x),
+                      taille_go=round((m.get("size_bytes") or 0) / 1e9, 1), format=m.get("format") or "")
+    if inst:
+        c = inst.get("config") or {}
+        info.id = inst.get("id") or info.cle
+        info.ctx = int(c.get("context_length") or 0)
+        info.parallel = int(c.get("parallel") or 0)
+        info.batch = int(c.get("eval_batch_size") or 0)
+        info.flash = c.get("flash_attention")
+        info.kv_gpu = c.get("offload_kv_cache_to_gpu")
+    return info
+
+
+def resoudre_modele(cfg: Config) -> InfoModele:
+    """Retrouve le modèle CHARGÉ dans LM Studio (identifiant exact, contexte, capacités). Il diffère souvent du nom
+    affiché ; la correspondance est approchée. Un modèle non chargé est une erreur fatale : l'envoyer tel quel
+    déclencherait un chargement avec les réglages par défaut (contexte minuscule)."""
+    voulu = cfg.modele.strip().lower()
+    cle = _norm_id(voulu.split("/")[-1])
+    if detecter_api(cfg) == "natif":
+        d = _json(cfg, "GET", "/api/v1/models")
+        llms = [m for m in d.get("models", []) if m.get("type", "llm") == "llm"]
+        if not llms:
+            raise ErreurFatale("LM Studio ne signale aucun modèle de langage : télécharge puis charge le modèle de vision.")
+
+        def noms(m):
+            return [m.get("key", ""), m.get("display_name", "")] + [i.get("id", "") for i in m.get("loaded_instances") or []]
+
+        exact = [m for m in llms if voulu and any(str(n).lower() == voulu for n in noms(m))]
+        flou = [m for m in llms if cle and any(cle in _norm_id(n) for n in noms(m))]
+        candidats = exact or flou
+        charges = [m for m in candidats if m.get("loaded_instances")]
+        choix = (charges or candidats or [None])[0]
+        if choix is None:
+            seuls = [m for m in llms if m.get("loaded_instances")]
+            if len(seuls) != 1:
+                raise ErreurFatale(f"Modèle « {cfg.modele} » introuvable. Disponibles : {[m.get('key') for m in llms]}. Précise --modele.")
+            choix = seuls[0]
+            log(f"modèle « {cfg.modele} » introuvable ; le seul modèle chargé est utilisé : « {choix.get('key')} »")
+        elif len(candidats) > 1:
+            log(f"plusieurs modèles correspondent à « {cfg.modele} » : {[m.get('key') for m in candidats]} -> « {choix.get('key')} » "
+                "(précise --modele pour en choisir un autre)")
+        info = _info_natif(choix)
+        if not info.charge:
+            raise ErreurFatale(f"Le modèle « {info.cle} » n'est pas chargé dans LM Studio. Charge-le avec un contexte suffisant, par exemple : "
+                               f"{commande_lms(info.cle, 16384)}")
+        if info.vision is False:
+            raise ErreurFatale(f"Le modèle « {info.cle} » ne déclare pas de vision : il ne peut pas lire d'image.")
+        return info
+    # API compatible OpenAI : pas de détails sur la configuration de chargement
+    d = _json(cfg, "GET", "/v1/models")
+    ids = [m.get("id", "") for m in d.get("data", []) if m.get("id") and "embed" not in m["id"].lower()]
     if not ids:
         raise ErreurFatale("LM Studio ne signale aucun modèle : charge le modèle de vision, puis relance.")
-    voulu = cfg.modele.strip().lower()
-    if voulu:
-        exact = [i for i in ids if i.lower() == voulu]
-        if exact:
-            return exact[0]
-        cle = re.sub(r"[^a-z0-9]", "", voulu.split("/")[-1])
-        flou = [i for i in ids if cle and cle in re.sub(r"[^a-z0-9]", "", i.lower())]
-        if flou:
-            log(f"modèle « {cfg.modele} » -> utilise « {flou[0]} »" + (f" (autres candidats : {flou[1:]})" if len(flou) > 1 else ""))
-            return flou[0]
-    if len(ids) == 1:
-        log(f"modèle « {cfg.modele} » introuvable ; le seul modèle disponible est utilisé : « {ids[0]} »")
-        return ids[0]
-    raise ErreurFatale(f"Modèle « {cfg.modele} » introuvable. Disponibles : {ids}. Précise --modele.")
+    exact = [i for i in ids if i.lower() == voulu]
+    flou = [i for i in ids if cle and cle in _norm_id(i)]
+    if exact:
+        choix = exact[0]
+    elif flou:
+        choix = flou[0]
+        log(f"modèle « {cfg.modele} » -> utilise « {choix} »" + (f" (autres candidats : {flou[1:]})" if len(flou) > 1 else ""))
+    elif len(ids) == 1:
+        choix = ids[0]
+        log(f"modèle « {cfg.modele} » introuvable ; le seul modèle disponible est utilisé : « {choix} »")
+    else:
+        raise ErreurFatale(f"Modèle « {cfg.modele} » introuvable. Disponibles : {ids}. Précise --modele.")
+    return InfoModele(id=choix, cle=choix, natif=False)
 
 
-def appeler_llm(cfg: Config, modele: str, png: bytes, prompt: str, temperature: float, max_tokens: int | None = None) -> dict:
-    b64 = base64.b64encode(png).decode("ascii")
-    corps = {
-        "model": modele,
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            {"type": "text", "text": prompt}]}],
-        "temperature": temperature,
-        "max_tokens": max_tokens or cfg.max_tokens,
-        "stream": False,
-    }
-    if cfg.top_p:
-        corps["top_p"] = cfg.top_p
+# ---------------------------------------------------------------- détection de boucle
+
+def detecter_boucle(texte: str, prose: bool = False) -> bool:
+    """Vrai si la fin du texte n'est plus qu'une répétition : un même bloc répété (≥ 120 caractères au total),
+    ou, pour de la prose (réflexion), des suites de 4 mots massivement déjà vues."""
+    if len(texte) < 400:
+        return False
+    fin = texte[-3000:]
+    m = len(fin)
+    for p in range(8, min(900, m // 3) + 1):
+        reps = max(3, -(-120 // p))
+        if m >= p * reps and fin.endswith(fin[-p:] * reps):
+            return True
+    if prose and m >= 1200:
+        mots = fin.split()[-300:]
+        total = len(mots) - 3
+        if total >= 120:
+            vus, dup = set(), 0
+            for i in range(total):
+                g = tuple(mots[i:i + 4])
+                if g in vus:
+                    dup += 1
+                else:
+                    vus.add(g)
+            if dup / total > 0.6:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------- corps des requêtes
+
+def _data_url(png: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _corps_natif(cfg, info, png, systeme, texte, temperature, top_p, max_tokens, penser, stream) -> dict:
+    entree = []
+    if png:
+        entree.append({"type": "image", "data_url": _data_url(png)})
+    entree.append({"type": "text", "content": texte})
+    corps = {"model": info.id, "input": entree, "stream": stream, "store": False, "max_output_tokens": int(max_tokens)}
+    if systeme:
+        corps["system_prompt"] = systeme
+    if temperature is not None:
+        corps["temperature"] = temperature
+    if top_p:
+        corps["top_p"] = top_p
     if cfg.top_k:
         corps["top_k"] = cfg.top_k
-    if cfg.json_schema:
-        corps["response_format"] = {"type": "json_schema", "json_schema": SCHEMA_JSON}
+    if cfg.repeat_penalty:
+        corps["repeat_penalty"] = cfg.repeat_penalty
+    if penser is False and "off" in info.options_reflexion:
+        corps["reasoning"] = "off"
+    elif penser is True and "on" in info.options_reflexion:
+        corps["reasoning"] = "on"
     corps.update(cfg.corps_extra)
-    d = _requete(cfg.url.rstrip("/") + "/chat/completions", corps, cfg.timeout)
+    return corps
+
+
+def _corps_openai(cfg, info, png, systeme, texte, temperature, top_p, max_tokens, penser, stream) -> dict:
+    contenu = []
+    if png:
+        contenu.append({"type": "image_url", "image_url": {"url": _data_url(png)}})
+    contenu.append({"type": "text", "text": texte})
+    messages = ([{"role": "system", "content": systeme}] if systeme else []) + [{"role": "user", "content": contenu}]
+    corps = {"model": info.id, "messages": messages, "max_tokens": int(max_tokens), "stream": stream}
+    if temperature is not None:
+        corps["temperature"] = temperature
+    if top_p:
+        corps["top_p"] = top_p
+    if cfg.top_k:
+        corps["top_k"] = cfg.top_k
+    if cfg.repeat_penalty:
+        corps["repeat_penalty"] = cfg.repeat_penalty
+    if stream:
+        corps["stream_options"] = {"include_usage": True}
+    if penser is False:
+        corps["chat_template_kwargs"] = {"enable_thinking": False}     # sans effet garanti : le budget de réflexion veille
+    corps.update(cfg.corps_extra)
+    return corps
+
+
+def _corps(cfg, info, *args) -> dict:
+    return (_corps_natif if info.natif else _corps_openai)(cfg, info, *args)
+
+
+# ---------------------------------------------------------------- flux SSE -> événements normalisés
+
+def _lignes_sse(resp):
+    """(événement, données) pour chaque message d'un flux Server-Sent Events."""
+    evenement, donnees = "", []
+    rebut = getattr(resp, "rebut", None)
+    while True:
+        ligne = resp.readline()
+        if not ligne:
+            if donnees:
+                yield evenement, "\n".join(donnees)
+            return
+        ligne = ligne.decode("utf-8", "replace").rstrip("\r\n")
+        if ligne == "":
+            if donnees:
+                yield evenement, "\n".join(donnees)
+            evenement, donnees = "", []
+        elif ligne.startswith(":"):
+            continue
+        elif ligne.startswith("event:"):
+            evenement = ligne[6:].strip()
+        elif ligne.startswith("data:"):
+            donnees.append(ligne[5:].lstrip())
+        elif rebut is not None and len(rebut) < 5:
+            rebut.append(ligne[:200])                # ni événement ni donnée : probablement pas du SSE
+
+
+def _flux_natif(resp):
+    """Événements de /api/v1/chat -> ('prefill', 0..1) | ('reflexion', texte) | ('reponse', texte) | ('erreur', msg) | ('fin', résultat)."""
+    for ev, data in _lignes_sse(resp):
+        try:
+            d = json.loads(data)
+        except ValueError:
+            continue
+        t = d.get("type") or ev
+        if t == "reasoning.delta":
+            yield ("reflexion", d.get("content") or "")
+        elif t == "message.delta":
+            yield ("reponse", d.get("content") or "")
+        elif t == "prompt_processing.progress":
+            yield ("prefill", float(d.get("progress") or 0))
+        elif t == "prompt_processing.start":
+            yield ("prefill", 0.0)
+        elif t == "error":
+            e = d.get("error") or {}
+            yield ("erreur", e.get("message") or str(e) or "erreur inconnue")
+        elif t == "chat.end":
+            yield ("fin", d.get("result") or {})
+
+
+class PhaseOpenAI:
+    """Sépare réflexion et réponse dans le champ « content » de l'API OpenAI, quand LM Studio ne les distingue pas :
+    balise <think> ouverte, ou ouverte implicitement par le modèle (le texte libre précède alors « </think> »)."""
+
+    def __init__(self):
+        self.etat, self.tete, self.tampon = "debut", "", ""
+
+    def _reflexion(self, t: str):
+        self.tampon += t
+        i = self.tampon.find("</think>")
+        if i < 0:
+            sortie, self.tampon = self.tampon[:-7], self.tampon[-7:]      # la balise peut être coupée entre deux deltas
+            return [("reflexion", sortie)] if sortie else []
+        avant, apres = self.tampon[:i], self.tampon[i + 8:]
+        self.tampon, self.etat = "", "reponse"
+        return ([("reflexion", avant)] if avant else []) + ([("reponse", apres)] if apres else [])
+
+    def separer(self, t: str):
+        if self.etat == "reponse":
+            return [("reponse", t)]
+        if self.etat == "reflexion":
+            return self._reflexion(t)
+        self.tete += t
+        s = self.tete.lstrip()
+        if s.startswith("<think>"):
+            self.etat, reste, self.tete = "reflexion", s[len("<think>"):], ""
+            return self._reflexion(reste) if reste else []
+        if s.startswith(("{", "```", "[")):
+            self.etat, reste, self.tete = "reponse", self.tete, ""
+            return [("reponse", reste)]
+        if len(s) >= 12:
+            self.etat, reste, self.tete = "reflexion", self.tete, ""
+            return self._reflexion(reste)
+        return []
+
+    def vider(self):
+        reste = self.tete + self.tampon
+        self.tete = self.tampon = ""
+        if not reste:
+            return []
+        return [("reflexion" if self.etat == "reflexion" else "reponse", reste)]
+
+
+def _flux_openai(resp):
+    phase, fin_raison, usage = PhaseOpenAI(), "", None
+    for _, data in _lignes_sse(resp):
+        if data.strip() == "[DONE]":
+            break
+        try:
+            d = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("error"):
+            e = d["error"]
+            yield ("erreur", e.get("message", str(e)) if isinstance(e, dict) else str(e))
+            return
+        if d.get("usage"):
+            usage = d["usage"]
+        for ch in d.get("choices") or []:
+            delta = ch.get("delta") or {}
+            r = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            if r:
+                yield ("reflexion", r)
+            c = delta.get("content") or ""
+            if c:
+                for typ, t in phase.separer(c):
+                    yield (typ, t)
+            if ch.get("finish_reason"):
+                fin_raison = ch["finish_reason"]
+    for typ, t in phase.vider():
+        yield (typ, t)
+    u = usage or {}
+    yield ("fin", {"finish": fin_raison, "stats": {"input_tokens": u.get("prompt_tokens"),
+                                                   "total_output_tokens": u.get("completion_tokens")}})
+
+
+# ---------------------------------------------------------------- une requête en streaming
+
+def _ouvrir_flux(cfg: Config, info: InfoModele, corps: dict):
+    """Ouvre la requête de chat en streaming. -> (connexion, réponse, socket). Les erreurs HTTP sont classées."""
+    conn = _connexion(cfg, cfg.attente)
     try:
-        ch = d["choices"][0]
-        msg = ch["message"]
-    except (KeyError, IndexError, TypeError):
-        raise ErreurLLM(f"réponse inattendue : {str(d)[:300]}")
-    return {"content": msg.get("content") or "",
-            "reasoning": msg.get("reasoning_content") or msg.get("reasoning") or "",
-            "finish": ch.get("finish_reason") or "",
-            "tokens": (d.get("usage") or {}).get("completion_tokens", 0)}
+        conn.connect()
+    except OSError as e:
+        conn.close()
+        raise ErreurFatale(_msg_injoignable(cfg, e))
+    sock = conn.sock
+    try:
+        suite = "/api/v1/chat" if info.natif else "/v1/chat/completions"
+        conn.request("POST", _chemin(cfg, suite), body=json.dumps(corps).encode("utf-8"), headers=_entetes(cfg))
+        resp = conn.getresponse()
+    except (socket.timeout, TimeoutError):
+        conn.close()
+        raise ErreurLLM(f"aucune réponse du serveur après {cfg.attente}s (préremplissage de l'image trop long ?)")
+    except (OSError, http.client.HTTPException) as e:
+        conn.close()
+        raise ErreurLLM(f"connexion interrompue : {e}")
+    if resp.status >= 400:
+        texte = resp.read().decode("utf-8", "replace")
+        conn.close()
+        _classer_http(resp.status, texte)
+    resp.rebut = []
+    try:
+        sock.settimeout(cfg.stall)          # désormais : silence maximal toléré entre deux jetons
+    except OSError:
+        pass
+    return conn, resp, sock
+
+
+def appeler_llm(cfg: Config, info: InfoModele, png: bytes | None, systeme: str | None, texte: str, *,
+                temperature: float | None, top_p: float | None, max_tokens: int, penser: bool, budget: int = 0,
+                stop: threading.Event | None = None, suivi=None, pas_suivi: float = 0) -> dict:
+    """Une requête en STREAMING. S'interrompt (et ferme la connexion : LM Studio abandonne la génération) dès qu'on
+    détecte une boucle, une réflexion qui dépasse `budget` jetons, un silence, un délai ou une interruption.
+    -> dict : content, reasoning, finish, abandon, erreur, tokens, tokens_reflexion, tokens_entree, ttft, tps, duree."""
+    t0 = time.time()
+    corps = _corps(cfg, info, png, systeme, texte, temperature, top_p, max_tokens, penser, True)
+    conn, resp, sock = _ouvrir_flux(cfg, info, corps)
+    contenu, pensee = [], []
+    fin_ref = fin_rep = ""
+    n_ref = n_rep = 0
+    t_premier, t_suivi, prefill = None, t0, 0.0
+    abandon, erreur, fin = "", "", {}
+    n_utiles = 0
+    try:
+        for typ, val in (_flux_natif(resp) if info.natif else _flux_openai(resp)):
+            now = time.time()
+            n_utiles += typ != "fin"
+            if stop is not None and stop.is_set():
+                abandon = "interruption"
+                break
+            if typ == "prefill":
+                prefill = val
+            elif typ in ("reflexion", "reponse"):
+                if t_premier is None:
+                    t_premier = now
+                if typ == "reflexion":
+                    pensee.append(val)
+                    n_ref += 1
+                    fin_ref = (fin_ref + val)[-4000:]
+                    if budget and n_ref > budget:
+                        abandon = "budget_reflexion"
+                    elif n_ref % 48 == 0 and detecter_boucle(fin_ref, prose=True):
+                        abandon = "boucle_reflexion"
+                else:
+                    contenu.append(val)
+                    n_rep += 1
+                    fin_rep = (fin_rep + val)[-4000:]
+                    if n_rep % 48 == 0 and detecter_boucle(fin_rep):
+                        abandon = "boucle_reponse"
+                if not abandon and n_ref + n_rep > max_tokens + 200:
+                    abandon = "longueur"
+            elif typ == "erreur":
+                erreur = val
+                break
+            elif typ == "fin":
+                fin = val
+            if not abandon and now - t0 > cfg.timeout:
+                abandon = "delai"
+            if abandon:
+                break
+            if suivi is not None and pas_suivi and now - t_suivi >= pas_suivi:
+                t_suivi = now
+                suivi({"elapsed": now - t0, "tokens": n_ref + n_rep, "tokens_reflexion": n_ref, "prefill": prefill,
+                       "tps": (n_ref + n_rep) / (now - t_premier) if t_premier and now - t_premier > 1 else 0.0})
+    except (socket.timeout, TimeoutError):
+        abandon = abandon or "silence"
+    except (OSError, http.client.HTTPException) as e:
+        if not abandon:
+            erreur = f"connexion interrompue : {e}"
+    finally:
+        for fermer in (resp.close, conn.close, sock.close):
+            try:
+                fermer()
+            except Exception:                                    # noqa: BLE001 : la fermeture ne doit jamais échouer bruyamment
+                pass
+    if not abandon and not erreur and n_utiles == 0:
+        erreur = ("réponse sans aucun événement reconnu (Content-Type : " + (resp.getheader("Content-Type") or "?") + ")"
+                  + (f" ; début de la réponse : {resp.rebut!r}" if getattr(resp, "rebut", None) else "")
+                  + ". Version de LM Studio différente ? essaie --api openai.")
+    t_fin = time.time()
+    st = fin.get("stats") or {}
+    tokens = n_ref + n_rep
+    sortie = int(st.get("total_output_tokens") or tokens)
+    tok_ref = st.get("reasoning_output_tokens")
+    tps, ttft = st.get("tokens_per_second"), st.get("time_to_first_token_seconds")
+    if tps is None and t_premier is not None and t_fin - t_premier > 0.5 and tokens > 3:
+        tps = tokens / (t_fin - t_premier)
+    if ttft is None and t_premier is not None:
+        ttft = t_premier - t0
+    if abandon:
+        finish = "abandon:" + abandon
+    elif erreur:
+        finish = "erreur"
+    elif fin.get("finish"):
+        finish = fin["finish"]
+    else:
+        finish = "length" if sortie >= max_tokens - 2 else "stop"
+    return {"content": "".join(contenu), "reasoning": "".join(pensee), "finish": finish, "abandon": abandon,
+            "erreur": erreur, "tokens": sortie, "tokens_reflexion": int(tok_ref) if tok_ref is not None else n_ref,
+            "tokens_entree": int(st.get("input_tokens") or 0), "ttft": ttft,
+            "tps": float(tps) if tps else None, "duree": t_fin - t0}
+
+
+def sonder_tokens(cfg: Config, info: InfoModele, png: bytes | None, systeme: str | None, texte: str) -> dict:
+    """Nombre de jetons d'entrée d'une requête (sans générer) : {'entree': n, 'ttft': secondes | None}."""
+    if info.natif:
+        corps = _corps_natif(cfg, info, png, systeme, texte, 0.0, None, 1, False, False)
+        st = _json(cfg, "POST", "/api/v1/chat", corps, timeout=cfg.attente).get("stats") or {}
+        return {"entree": int(st.get("input_tokens") or 0), "ttft": st.get("time_to_first_token_seconds")}
+    corps = _corps_openai(cfg, info, png, systeme, texte, 0.0, None, 1, False, False)
+    u = _json(cfg, "POST", "/v1/chat/completions", corps, timeout=cfg.attente).get("usage") or {}
+    return {"entree": int(u.get("prompt_tokens") or 0), "ttft": None}
 
 
 # ============================================================================
@@ -510,7 +1133,8 @@ def extraire_page_json(rep: dict):
     """-> (objet | None, avertissements, partiel)."""
     content, reasoning, finish = rep["content"], rep["reasoning"], rep["finish"]
     propre = retirer_reflexion(content)
-    if finish == "length":       # réponse coupée : ne jamais chercher dans la réflexion (elle cite l'exemple du prompt)
+    coupee = finish == "length" or finish.startswith("abandon")
+    if coupee:       # réponse coupée : ne jamais chercher dans la réflexion (elle cite l'exemple du prompt)
         candidats = [propre] if propre.strip() else []
     else:
         candidats = [c for c in (propre, content, reasoning) if c.strip()]
@@ -522,9 +1146,9 @@ def extraire_page_json(rep: dict):
         obj = sauver_entrees_tronquees(texte)
         if obj is not None:
             return obj, ["réponse tronquée : entrées complètes récupérées (augmente --max-tokens)"], True
-    if finish == "length":
-        return None, ["réponse coupée avant la fin (la réflexion a consommé tout le budget) : augmente --max-tokens "
-                      "(et le contexte du modèle dans LM Studio)"], False
+    if coupee:
+        return None, [f"réponse coupée avant la fin ({finish}) : réflexion trop longue ou boucle ; "
+                      "voir --reflexion, --max-tokens et le contexte du modèle dans LM Studio"], False
     return None, [f"aucun JSON exploitable (finish={finish or '?'}, {len(content)} car.)"], False
 
 
@@ -648,13 +1272,91 @@ def normaliser_page(obj) -> list[dict]:
 
 def est_exemple(entrees: list[dict]) -> bool:
     """Le modèle a-t-il renvoyé tel quel l'exemple du prompt ?"""
-    noms = {o.lower() for e in entrees for b in e["prenoms"] for o in b["orthographes"]}
-    return bool(noms) and noms <= EXEMPLE_ORTHOGRAPHES and len(noms) >= 4
+    return bool(entrees) and all(e["description"].strip() == EXEMPLE_DESC for e in entrees)
 
 
 # ============================================================================
-# 8) TRAITEMENT D'UNE PAGE + CACHE
+# 8) TRAITEMENT D'UNE PAGE : état partagé, cache, calibrage, fils d'exécution
 # ============================================================================
+
+def fmt_duree(s: float) -> str:
+    s = int(max(0, s))
+    if s >= 3600:
+        return f"{s // 3600} h {s % 3600 // 60:02d}"
+    if s >= 60:
+        return f"{s // 60} min"
+    return f"{s} s"
+
+
+class Controle:
+    """Pont entre le moteur et une interface (TUI) : arrêt demandé, activité en cours, progression, GPU."""
+
+    def __init__(self):
+        self.stop = threading.Event()
+        self.verrou = threading.Lock()
+        self.actifs: dict = {}
+        self.etat = "attente"          # attente | calibrage | en cours | termine | interrompu | erreur
+        self.total = self.fait = self.echecs = 0
+        self.debut = 0.0
+        self.reste_s: float | None = None
+        self.gpu: dict | None = None
+        self.message = ""
+
+    def maj_actif(self, ident: str, **champs) -> None:
+        with self.verrou:
+            self.actifs.setdefault(ident, {"debut": time.time()}).update(champs)
+
+    def fin_actif(self, ident: str) -> None:
+        with self.verrou:
+            self.actifs.pop(ident, None)
+
+    def instantane(self) -> dict:
+        with self.verrou:
+            return {"etat": self.etat, "total": self.total, "fait": self.fait, "echecs": self.echecs, "debut": self.debut,
+                    "reste_s": self.reste_s, "gpu": dict(self.gpu) if self.gpu else None, "message": self.message,
+                    "actifs": {k: dict(v) for k, v in self.actifs.items()}}
+
+
+class Etat:
+    """État partagé par les fils : modèle, budgets, réglage de la réflexion (appris en route), arrêt demandé."""
+
+    def __init__(self, cfg: Config, info: InfoModele, controle: Controle | None = None):
+        self.cfg, self.info = cfg, info
+        self.controle = controle
+        self.stop = controle.stop if controle is not None else threading.Event()
+        self.verrou = threading.Lock()
+        self.sortie_max = cfg.max_tokens
+        self.tokens_entree = 0
+        self.peut_couper = info.peut_couper_reflexion
+        self.penser = cfg.reflexion == "oui" or (cfg.reflexion == "auto" and not self.peut_couper)
+        self.coupures_ignorees = 0
+
+    def budget(self, penser: bool) -> int:
+        """Jetons de réflexion tolérés avant d'abandonner la requête."""
+        if not penser:
+            return 200                    # réflexion « coupée » : au-delà, LM Studio ignore le réglage
+        if self.cfg.budget_reflexion:
+            return self.cfg.budget_reflexion
+        return max(1000, self.sortie_max - 2500)
+
+    def coupure_ignoree(self) -> None:
+        """Le modèle a réfléchi malgré « reasoning: off ». Au 2e cas, on cesse d'essayer pour toute la suite."""
+        with self.verrou:
+            self.coupures_ignorees += 1
+            if self.coupures_ignorees == 2 and self.peut_couper:
+                self.peut_couper, self.penser = False, True
+                log("LM Studio ignore la désactivation de la réflexion : les pages seront traitées AVEC réflexion (bornée). "
+                    "Pour la couper, décoche « Enable Thinking » dans les réglages du modèle dans LM Studio.")
+
+    def sans_parametre_reflexion(self) -> None:
+        with self.verrou:
+            if self.peut_couper:
+                log("LM Studio refuse le réglage de réflexion pour ce modèle : il n'est plus envoyé.")
+            self.info.options_reflexion = []
+            self.peut_couper, self.penser = False, True
+
+
+# ---------------------------------------------------------------- cache
 
 def id_chunk(page: int, bande: int, nb: int) -> str:
     return f"p{page:03d}" if nb == 1 else f"p{page:03d}_b{bande}"
@@ -666,24 +1368,27 @@ def chemin_cache(cfg: Config, page: int, bande: int) -> str:
 
 def empreinte(cfg: Config) -> str:
     """Change dès que le résultat en cache ne serait plus celui que produirait cette configuration."""
-    cle = json.dumps([cfg.prompt, cfg.modele, cfg.decoupe, cfg.nettoyage, cfg.max_cote, cfg.json_schema], ensure_ascii=False)
+    cle = json.dumps([cfg.prompt, TEXTE_UTILISATEUR, cfg.modele, cfg.decoupe, cfg.nettoyage, cfg.max_cote, cfg.tokens_image],
+                     ensure_ascii=False)
     return hashlib.sha1(cle.encode("utf-8")).hexdigest()[:10]
 
 
-def charger_cache(cfg: Config, page: int, bande: int):
+def lire_cache(cfg: Config, page: int, bande: int, tolerer: bool = False):
+    """-> (résultat réutilisable | None, périmé ?). `tolerer` (--export) : un résultat périmé, calculé avec une autre
+    configuration, est rendu quand même (avec périmé = True) : mieux vaut l'exporter que le perdre."""
     p = chemin_cache(cfg, page, bande)
-    if cfg.refaire or not os.path.exists(p):
-        return None
+    if not os.path.exists(p):
+        return None, False
     try:
         with open(p, encoding="utf-8") as f:
             d = json.load(f)
     except (OSError, ValueError):
-        return None
+        return None, False
     if d.get("empreinte") != empreinte(cfg):
-        return None                                  # autre prompt / modèle / découpage / nettoyage : périmé
-    if d.get("statut") == "partiel" and cfg.max_tokens > d.get("max_tokens", 0):
-        return None                                  # on retente avec un budget plus grand
-    return d
+        return (d, True) if tolerer else (None, True)     # autre prompt / modèle / découpage / nettoyage / image : périmé
+    if d.get("statut") == "partiel" and cfg.max_tokens > d.get("max_tokens", 0) and not tolerer:
+        return None, False                           # on retente avec un budget plus grand
+    return d, False
 
 
 def ecrire_atomique(chemin: str, texte: str) -> None:
@@ -694,97 +1399,316 @@ def ecrire_atomique(chemin: str, texte: str) -> None:
     os.replace(tmp, chemin)
 
 
-def traiter_chunk(cfg: Config, modele: str, page: int, bande: int) -> dict:
+# ---------------------------------------------------------------- calibrage : jetons d'entrée, taille de l'image, budget de sortie
+
+def budgeter(cfg: Config, etat: Etat) -> None:
+    """Borne la sortie par le contexte chargé (image + consigne + sortie ≤ contexte, pour chaque requête simultanée)."""
+    ctx, entree = etat.info.ctx, etat.tokens_entree
+    if not ctx or not entree:
+        return
+    marge, voulu = 128, min(cfg.max_tokens, 3000)
+    p = max(1, cfg.paralleles)
+    while p > 1 and ctx // p - entree - marge < voulu:
+        p -= 1
+    if p != cfg.paralleles:
+        log(f"contexte chargé : {ctx} jetons. {cfg.paralleles} requêtes simultanées ({entree} jetons d'entrée chacune) n'y "
+            f"tiennent pas : {p} à la fois. Augmente le contexte pour paralléliser.")
+        cfg.paralleles = p
+    dispo = ctx // p - entree - marge
+    if dispo < 1500:
+        raise ErreurFatale(
+            f"Contexte trop court : {entree} jetons d'entrée (image + consigne) pour un contexte chargé de {ctx}. Il reste "
+            f"{max(0, dispo)} jetons pour la réponse (1 500 au minimum). Recharge le modèle avec un contexte d'au moins "
+            f"{arrondi_1024(entree + cfg.max_tokens + marge)} : {commande_lms(etat.info.cle or cfg.modele, arrondi_1024(entree + cfg.max_tokens + marge), p)} "
+            "(ou réduis l'image : --tokens-image 1500).")
+    etat.sortie_max = min(cfg.max_tokens, dispo)
+    if etat.sortie_max < cfg.max_tokens:
+        log(f"budget de sortie limité à {etat.sortie_max} jetons par le contexte chargé ({ctx}) ; "
+            f"recharge avec un contexte de {arrondi_1024(entree + cfg.max_tokens + marge)} pour le lever.")
+    if etat.penser and etat.sortie_max < 6000:
+        log("⚠ réflexion autorisée avec moins de 6 000 jetons de sortie : elle risque de ne pas laisser la place à la réponse.")
+
+
+def calibrer(cfg: Config, etat: Etat, chunk: tuple[int, int]) -> None:
+    """Mesure les jetons d'entrée (consigne seule, puis consigne + image d'une vraie page), réduit l'image si elle dépasse
+    la cible `--tokens-image`, puis borne le budget de sortie par le contexte chargé."""
+    page, bande = chunk
+    texte = TEXTE_UTILISATEUR + (NOTE_BANDE[bande] if cfg.decoupe > 1 else "")
+    cfg.max_cote_auto = 0
+    try:
+        t_txt = sonder_tokens(cfg, etat.info, None, cfg.prompt, texte)["entree"]
+        png, _ = preparer_image(cfg, page, bande)
+        mesure = sonder_tokens(cfg, etat.info, png, cfg.prompt, texte)
+    except ErreurLLM as e:
+        log(f"calibrage impossible ({e}) : l'image et le budget de sortie ne sont pas ajustés.")
+        return
+    t_tot = mesure["entree"]
+    if not t_tot:
+        log("calibrage : le serveur ne renvoie pas le nombre de jetons d'entrée ; l'image et le budget ne sont pas ajustés.")
+        return
+    t_img = max(0, t_tot - t_txt)
+    pre = f", préremplissage ≈ {t_tot / mesure['ttft']:.0f} jetons/s" if mesure.get("ttft") else ""
+    log(f"jetons d'entrée mesurés : consigne ≈ {t_txt}, image ≈ {t_img}{pre}")
+    if cfg.tokens_image and not cfg.max_cote and t_img > cfg.tokens_image * 1.15:
+        w, h = Image.open(io.BytesIO(png)).size
+        r = (cfg.tokens_image / t_img) ** 0.5
+        cfg.max_cote_auto = int(max(w, h) * r)
+        t_img2 = int(t_img * r * r)
+        log(f"image réduite : plus grand côté {max(w, h)} -> {cfg.max_cote_auto} px (≈ {t_img2} jetons au lieu de {t_img}). "
+            "`--tokens-image 0` garde l'image native.")
+        t_tot = t_txt + t_img2
+    etat.tokens_entree = t_tot
+    budgeter(cfg, etat)
+
+
+# ---------------------------------------------------------------- une page (ou demi-page)
+
+def _suivi(ident: str, etat: "Etat", cfg: Config):
+    """Rappel de progression d'une requête : alimente le registre d'activité (interface) et, tous les `cfg.suivi`
+    secondes, une ligne de journal."""
+    dernier = [time.time()]
+
+    def f(s: dict) -> None:
+        if etat.controle is not None:
+            etat.controle.maj_actif(ident, tokens=s["tokens"], tokens_reflexion=s["tokens_reflexion"], tps=s["tps"],
+                                    prefill=s["prefill"], elapsed=s["elapsed"])
+        now = time.time()
+        if cfg.suivi and now - dernier[0] >= cfg.suivi:
+            dernier[0] = now
+            pre = f", préremplissage {s['prefill'] * 100:.0f} %" if s["tokens"] == 0 and s["prefill"] else ""
+            ref = f" dont {s['tokens_reflexion']} de réflexion" if s["tokens_reflexion"] else ""
+            log(f"  {ident} en cours : {s['tokens']} jetons{ref}, {s['tps']:.1f} tok/s, {s['elapsed']:.0f}s{pre}")
+    return f
+
+
+def _journaliser_essai(ident: str, essai: int, penser: bool, temp: float, top_p, etat: "Etat", rep: dict, png: bytes) -> None:
+    tps = round(rep["tps"], 1) if rep["tps"] else None
+    ttft = round(rep["ttft"], 1) if rep["ttft"] else None
+    debug(f"[{ident}] essai {essai} : penser={penser} T={temp:.2f} top_p={top_p} budget_reflexion={etat.budget(penser)} "
+          f"max_tokens={etat.sortie_max} -> finish={rep['finish']} abandon={rep['abandon'] or '-'} jetons={rep['tokens']} "
+          f"(réflexion {rep['tokens_reflexion']}) entrée={rep['tokens_entree']} tok/s={tps} ttft={ttft} durée={rep['duree']:.1f}s")
+    if rep["abandon"] or rep["erreur"]:
+        debug(f"[{ident}] fin de la réponse reçue : {rep['content'][-300:]!r} | fin de la réflexion : "
+              f"{rep['reasoning'][-300:]!r} | erreur : {rep['erreur']!r}")
+    evenement("requete", chunk=ident, essai=essai, penser=penser, temperature=round(temp, 2), top_p=top_p,
+              budget_reflexion=etat.budget(penser), max_tokens=etat.sortie_max, finish=rep["finish"], abandon=rep["abandon"],
+              erreur=rep["erreur"], tokens=rep["tokens"], tokens_reflexion=rep["tokens_reflexion"],
+              tokens_entree=rep["tokens_entree"], tps=tps, ttft=ttft, duree=round(rep["duree"], 1), png_ko=round(len(png) / 1024))
+
+
+def _traiter_chunk(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
     t = time.time()
     ident = id_chunk(page, bande, cfg.decoupe)
     png, encre = preparer_image(cfg, page, bande)
+    base = {"page": page, "bande": bande, "decoupe": cfg.decoupe, "nettoyage": cfg.nettoyage,
+            "empreinte": empreinte(cfg), "modele": etat.info.id, "max_tokens": etat.sortie_max}
+    chemin = chemin_cache(cfg, page, bande)
     if encre < SEUIL_BLANC:                      # page blanche : inutile (et risqué : le modèle inventerait) de l'envoyer
-        res = {"page": page, "bande": bande, "decoupe": cfg.decoupe, "nettoyage": cfg.nettoyage,
-               "empreinte": empreinte(cfg), "statut": "ok", "blanche": True,
-               "avertissements": ["page blanche : aucune requête envoyée"], "modele": modele,
-               "max_tokens": cfg.max_tokens, "duree": 0.0, "tokens": 0, "entrees": []}
-        ecrire_atomique(chemin_cache(cfg, page, bande), json.dumps(res, ensure_ascii=False, indent=1))
+        res = {**base, "statut": "ok", "blanche": True, "avertissements": ["page blanche : aucune requête envoyée"],
+               "duree": 0.0, "tokens": 0, "tokens_reflexion": 0, "tokens_entree": 0, "tps": None, "ttft": None,
+               "penser": False, "entrees": []}
+        ecrire_atomique(chemin, json.dumps(res, ensure_ascii=False, indent=1))
         return res
     if cfg.sauver_images:
         os.makedirs(os.path.join(cfg.sortie, "images"), exist_ok=True)
         with open(os.path.join(cfg.sortie, "images", ident + ".png"), "wb") as f:
             f.write(png)
-    prompt = cfg.prompt + (NOTE_BANDE[bande] if cfg.decoupe > 1 else "")
-    derniere = "?"
+    texte = TEXTE_UTILISATEUR + (NOTE_BANDE[bande] if cfg.decoupe > 1 else "")
+    penser, derniere, meilleur = etat.penser, "?", None
+    pas = min([x for x in (cfg.suivi, cfg.suivi_ui) if x] or [0])
     for essai in range(1, cfg.essais + 1):
-        temp = cfg.temperature if essai == 1 else min(1.0, cfg.temperature + 0.2)   # une boucle de répétition ne se répète pas à l'identique
+        if etat.stop.is_set():
+            raise Interrompu()
+        temp = cfg.temperature if cfg.temperature is not None else (0.6 if penser else 0.3)
+        temp = min(1.0, temp + 0.15 * (essai - 1))                   # une boucle ne se répète pas à l'identique
+        top_p = cfg.top_p if cfg.top_p is not None else (0.95 if penser else 0.8)
+        debut_essai = time.time()
         try:
-            rep = appeler_llm(cfg, modele, png, prompt, temp)
+            rep = appeler_llm(cfg, etat.info, png, cfg.prompt, texte, temperature=temp, top_p=top_p,
+                              max_tokens=etat.sortie_max, penser=penser, budget=etat.budget(penser),
+                              stop=etat.stop, suivi=_suivi(ident, etat, cfg), pas_suivi=pas)
+        except ErreurReflexion as e:
+            derniere = str(e)
+            log(f"  {ident} essai {essai}/{cfg.essais} : {derniere}", "WARN")
+            etat.sans_parametre_reflexion()
+            penser = True
+            continue
         except ErreurLLM as e:
             derniere = str(e)
+            log(f"  {ident} essai {essai}/{cfg.essais} : {derniere}", "WARN")
+            evenement("requete_erreur", chunk=ident, essai=essai, message=derniere, duree=round(time.time() - debut_essai, 1))
+            continue
+        _journaliser_essai(ident, essai, penser, temp, top_p, etat, rep, png)
+        if rep["abandon"] == "interruption":
+            raise Interrompu()
+        if rep["erreur"]:
+            derniere = rep["erreur"]
+            log(f"  {ident} essai {essai}/{cfg.essais} : erreur du serveur : {derniere}", "WARN")
+            try:
+                _classer_http(400, rep["erreur"])                        # lève ErreurFatale si l'erreur est sans issue
+            except ErreurReflexion:
+                etat.sans_parametre_reflexion()
+                penser = True
+            except ErreurLLM:
+                pass
             continue
         obj, avert, partiel = extraire_page_json(rep)
         if obj is None:
-            derniere = avert[0]
-            ecrire_atomique(os.path.join(cfg.sortie, "cache", "brut", ident + f"_essai{essai}.txt"),
-                            rep["content"] + "\n\n=== RÉFLEXION ===\n" + rep["reasoning"])
+            derniere = (f"{rep['abandon'] or rep['finish']} après {rep['tokens']} jetons"
+                        + (f" dont {rep['tokens_reflexion']} de réflexion" if rep["tokens_reflexion"] else ""))
+            ecrire_atomique(os.path.join(cfg.sortie, "cache", "brut", f"{ident}_essai{essai}.txt"),
+                            f"abandon={rep['abandon']} finish={rep['finish']} penser={penser}\n--- RÉPONSE ---\n{rep['content']}\n\n"
+                            f"--- RÉFLEXION (fin) ---\n{rep['reasoning'][-4000:]}")
+            log(f"  {ident} essai {essai}/{cfg.essais} sans résultat : {derniere} (sortie brute : cache/brut/{ident}_essai{essai}.txt)", "WARN")
+            if not penser and rep["abandon"] == "budget_reflexion":      # il réfléchit malgré « off » -> on le laisse réfléchir
+                etat.coupure_ignoree()
+                penser = True
+            elif penser and rep["abandon"] in ("budget_reflexion", "boucle_reflexion") and etat.peut_couper:
+                penser = False                                          # la réflexion s'emballe -> sans réflexion
             continue
         entrees = normaliser_page(obj)
         if est_exemple(entrees):
             derniere = "le modèle a recopié l'exemple du prompt"
+            log(f"  {ident} essai {essai}/{cfg.essais} : {derniere}", "WARN")
             continue
-        res = {"page": page, "bande": bande, "decoupe": cfg.decoupe, "nettoyage": cfg.nettoyage,
-               "empreinte": empreinte(cfg), "statut": "partiel" if partiel else "ok", "avertissements": avert,
-               "modele": modele,
-               "max_tokens": cfg.max_tokens, "duree": round(time.time() - t, 1), "tokens": rep["tokens"],
-               "entrees": entrees}
-        ecrire_atomique(chemin_cache(cfg, page, bande), json.dumps(res, ensure_ascii=False, indent=1))
+        if rep["abandon"]:
+            avert = avert + [f"génération interrompue : {rep['abandon']}"]
+        if not entrees and encre > 0.4:
+            avert = avert + ["aucune entrée détectée sur une page non blanche"]
+        res = {**base, "statut": "partiel" if partiel else "ok", "avertissements": avert,
+               "duree": round(time.time() - t, 1), "tokens": rep["tokens"], "tokens_reflexion": rep["tokens_reflexion"],
+               "tokens_entree": rep["tokens_entree"] or etat.tokens_entree,
+               "tps": round(rep["tps"], 1) if rep["tps"] else None, "ttft": round(rep["ttft"], 1) if rep["ttft"] else None,
+               "penser": penser, "entrees": entrees}
+        if (partiel or (not entrees and encre > 0.4)) and essai < cfg.essais:
+            if meilleur is None or len(entrees) > len(meilleur["entrees"]):
+                meilleur = res                                          # on garde le meilleur résultat incomplet
+            derniere = "réponse partielle" if partiel else "aucune entrée sur une page non blanche"
+            log(f"  {ident} essai {essai}/{cfg.essais} : {derniere} ({len(entrees)} entrées conservées si rien de mieux)", "WARN")
+            continue
+        if meilleur is not None and len(meilleur["entrees"]) > len(entrees):
+            res = meilleur
+        res["duree"] = round(time.time() - t, 1)
+        ecrire_atomique(chemin, json.dumps(res, ensure_ascii=False, indent=1))
         ecrire_atomique(os.path.join(cfg.sortie, "cache", "brut", ident + ".txt"), rep["content"])
         return res
+    if meilleur is not None:
+        meilleur["duree"] = round(time.time() - t, 1)
+        ecrire_atomique(chemin, json.dumps(meilleur, ensure_ascii=False, indent=1))
+        return meilleur
     raise ErreurLLM(derniere)
 
 
-def executer(cfg: Config, modele: str, chunks: list[tuple[int, int]]) -> dict:
-    """Lance les requêtes (en parallèle si demandé). -> {(page, bande): message d'erreur}."""
+def traiter_chunk(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
+    """Une page (ou demi-page) : enregistrement dans le registre d'activité, journal de l'issue, relance des exceptions."""
+    ident = id_chunk(page, bande, cfg.decoupe)
+    if etat.controle is not None:
+        etat.controle.maj_actif(ident, page=page, debut=time.time(), tokens=0, tokens_reflexion=0, tps=0.0, prefill=0.0, elapsed=0.0)
+    try:
+        res = _traiter_chunk(cfg, etat, page, bande)
+        evenement("page", chunk=ident, statut=res["statut"], entrees=len(res["entrees"]), duree=res["duree"], tokens=res["tokens"],
+                  tokens_reflexion=res.get("tokens_reflexion"), tokens_entree=res.get("tokens_entree"), tps=res.get("tps"),
+                  ttft=res.get("ttft"), blanche=bool(res.get("blanche")), penser=res.get("penser"))
+        return res
+    except Interrompu:
+        evenement("page_annulee", chunk=ident)
+        raise
+    except ErreurFatale as e:
+        log(f"{ident} : erreur fatale : {e}", "ERROR")
+        evenement("fatal", chunk=ident, message=str(e))
+        raise
+    except Exception as e:                                       # noqa: BLE001 : journalisé avec sa trace, puis relancé
+        log_exception(f"{ident} : échec de la page", e)
+        raise
+    finally:
+        if etat.controle is not None:
+            etat.controle.fin_actif(ident)
+
+
+# ---------------------------------------------------------------- fils d'exécution
+
+def executer(cfg: Config, etat: Etat, chunks: list, resultats: dict, apres_page) -> dict:
+    """Traite les chunks avec `cfg.paralleles` fils (daemon). Le fil principal ne fait que surveiller, par pas de 0,5 s :
+    Ctrl+C reste interrompable, y compris sous Windows où un verrou bloquant ne l'est pas. -> {chunk: erreur}."""
     echecs: dict = {}
     if not chunks:
         return echecs
-    stop = threading.Event()
-    durees: list[float] = []
+    taches, sorties = queue.Queue(), queue.Queue()
+    for ch in chunks:
+        taches.put(ch)
 
-    def tache(ch):
-        if stop.is_set():
-            return ch, None, "annulé"
-        try:
-            return ch, traiter_chunk(cfg, modele, *ch), None
-        except ErreurFatale as e:
-            stop.set()
-            return ch, None, "FATAL: " + str(e)
-        except Exception as e:                                    # noqa: BLE001 : une page ne doit pas tuer le lot
-            return ch, None, f"{type(e).__name__}: {e}"
+    def travailleur():
+        while not etat.stop.is_set():
+            try:
+                ch = taches.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                sorties.put((ch, traiter_chunk(cfg, etat, *ch), None))
+            except Interrompu:
+                sorties.put((ch, None, "annulé"))
+                return
+            except ErreurFatale as e:
+                etat.stop.set()
+                sorties.put((ch, None, "FATAL: " + str(e)))
+            except Exception as e:                                    # noqa: BLE001 : une page ne doit pas tuer le lot
+                sorties.put((ch, None, f"{type(e).__name__}: {e}"))
 
-    ex = ThreadPoolExecutor(max_workers=max(1, cfg.paralleles))
-    futs = [ex.submit(tache, ch) for ch in chunks]
-    fait = 0
+    n = max(1, min(cfg.paralleles, len(chunks)))
+    fils = [threading.Thread(target=travailleur, daemon=True) for _ in range(n)]
+    for f in fils:
+        f.start()
+    fait, durees, debut = 0, [], time.time()
+    ctrl, arret_vu = etat.controle, None
+    if ctrl is not None:
+        ctrl.debut, ctrl.total, ctrl.fait, ctrl.echecs = debut, len(chunks), 0, 0
     try:
-        for fut in as_completed(futs):
-            ch, res, err = fut.result()
+        while True:
+            if etat.stop.is_set():                              # arrêt demandé (interface ou erreur fatale) : 3 s aux fils
+                arret_vu = arret_vu or time.time()
+                if time.time() - arret_vu > 3:
+                    break
+            try:
+                ch, res, err = sorties.get(timeout=0.5)
+            except queue.Empty:
+                if not any(f.is_alive() for f in fils) and sorties.empty():
+                    break
+                continue
             fait += 1
             nom = id_chunk(ch[0], ch[1], cfg.decoupe)
+            if ctrl is not None:
+                ctrl.fait = fait
             if err:
                 echecs[ch] = err
+                if ctrl is not None:
+                    ctrl.echecs = len(echecs)
                 if err.startswith("FATAL"):
                     log(f"ARRÊT : {err[7:]}")
                 elif err != "annulé":
                     log(f"[{fait}/{len(chunks)}] {nom} ÉCHEC : {err}")
                 continue
+            resultats[ch] = res
             if not res.get("blanche"):
                 durees.append(res["duree"])
             moy = sum(durees) / len(durees) if durees else 0.0
-            reste = (len(chunks) - fait) * moy / max(1, cfg.paralleles)
-            log(f"[{fait}/{len(chunks)}] {nom} : {len(res['entrees'])} entrées, {res['duree']:.0f}s, "
-                f"{res['tokens']} tokens{' (PARTIEL)' if res['statut'] == 'partiel' else ''}{' (page blanche)' if res.get('blanche') else ''} "
-                f"— reste ≈ {reste / 60:.0f} min")
+            reste = (len(chunks) - fait) * moy / n
+            if ctrl is not None:
+                ctrl.reste_s = reste
+            ref = f" dont {res['tokens_reflexion']} de réflexion" if res.get("tokens_reflexion") else ""
+            vitesse = f", {res['tps']:.1f} tok/s" if res.get("tps") else ""
+            log(f"[{fait}/{len(chunks)}] {nom} : {len(res['entrees'])} entrées, {res['duree']:.0f}s, {res['tokens']} jetons{ref}{vitesse}"
+                f"{' (PARTIEL)' if res['statut'] == 'partiel' else ''}{' (page blanche)' if res.get('blanche') else ''}"
+                f" — {fait / max(1e-9, (time.time() - debut) / 60):.2f} page/min, reste ≈ {fmt_duree(reste)}")
+            apres_page(fait)
     except KeyboardInterrupt:
-        stop.set()
-        ex.shutdown(wait=False, cancel_futures=True)
+        etat.stop.set()
+        limite = time.time() + 3
+        while time.time() < limite and any(f.is_alive() for f in fils):
+            time.sleep(0.1)
         raise
-    ex.shutdown(wait=True)
+    for ch in chunks:
+        if ch not in resultats and ch not in echecs:
+            echecs[ch] = "non traité"
     return echecs
 
 
@@ -956,7 +1880,8 @@ def exporter(rows: list[dict], infos_pages: list[dict], dossier: str, nom: str =
     ws.title = "Prénoms"
     feuille(ws, rows, COLS, surligner=True)
     feuille(wb.create_sheet("À vérifier"), [r for r in rows if a_verifier(r)], COLS)
-    colp = ["page_pdf", "page_imprimée", "statut", "entrées", "lignes", "durée_s", "tokens", "remarque"]
+    colp = ["page_pdf", "page_imprimée", "statut", "entrées", "lignes", "durée_s", "tokens_entrée", "tokens_sortie",
+            "tokens_réflexion", "tok_s", "remarque"]
     wp = wb.create_sheet("Pages")
     wp.append(colp)
     for c in wp[1]:
@@ -964,7 +1889,7 @@ def exporter(rows: list[dict], infos_pages: list[dict], dossier: str, nom: str =
     for p in infos_pages:
         wp.append([_propre(p.get(c, "")) for c in colp])
     for k in range(1, len(colp) + 1):
-        wp.column_dimensions[get_column_letter(k)].width = 14 if k < 8 else 70
+        wp.column_dimensions[get_column_letter(k)].width = 14 if k < 11 else 70
     chemins["xlsx"] = os.path.join(dossier, nom + ".xlsx")
     wb.save(chemins["xlsx"])
     return chemins
@@ -1009,7 +1934,7 @@ def comparer_ancien(rows: list[dict], chemin_ancien: str, pages: list[int], doss
 
 
 # ============================================================================
-# 11) PIPELINE, DIAGNOSTIC, AUTOTEST
+# 11) PIPELINE, STATUT, DIAGNOSTIC, AUTOTEST
 # ============================================================================
 
 def parse_pages(spec: str) -> list[int]:
@@ -1026,58 +1951,141 @@ def parse_pages(spec: str) -> list[int]:
     return sorted(set(out))
 
 
-def run_pipeline(cfg: Config) -> tuple[list[dict], list[dict], list[str]]:
+def construire(cfg: Config, resultats: dict, echecs: dict | None = None, interrompu: bool = False):
+    """Résultats en mémoire -> (lignes finales, état par page, avertissements)."""
+    echecs = echecs or {}
+    bandes = range(1, cfg.decoupe + 1)
+    entrees, avert = assembler(resultats, cfg.decoupe)
+    rows = exploser(entrees)
+    par_page: dict[int, int] = {}
+    for r in rows:
+        par_page[r["page_pdf"]] = par_page.get(r["page_pdf"], 0) + 1
+    infos = []
+    for p in cfg.pages:
+        cs = [resultats.get((p, b)) for b in bandes]
+        manque = [b for b in bandes if resultats.get((p, b)) is None]
+        errs = [echecs[(p, b)] for b in manque if echecs.get((p, b)) and echecs[(p, b)] not in ("non traité", "annulé")]
+        if manque:
+            statut = "à faire" if not errs else ("échec" if len(manque) == len(cs) else "incomplet")
+        else:
+            statut = "partiel" if any(c["statut"] == "partiel" for c in cs) else "ok"
+        faits = [c for c in cs if c]
+        tps = [c["tps"] for c in faits if c.get("tps")]
+        remarque = "; ".join(errs) or ("interrompu" if manque and interrompu else "")
+        if faits and not manque and all(c.get("blanche") for c in faits):
+            remarque = "page blanche (aucune requête envoyée)"
+        infos.append({"page_pdf": p, "page_imprimée": p - PAGE_OFFSET, "statut": statut,
+                      "entrées": sum(len(c["entrees"]) for c in faits), "lignes": par_page.get(p, 0),
+                      "durée_s": round(sum(c["duree"] for c in faits), 1),
+                      "tokens_entrée": sum(c.get("tokens_entree") or 0 for c in faits),
+                      "tokens_sortie": sum(c.get("tokens") or 0 for c in faits),
+                      "tokens_réflexion": sum(c.get("tokens_reflexion") or 0 for c in faits),
+                      "tok_s": round(sum(tps) / len(tps), 1) if tps else "", "remarque": remarque})
+    return rows, infos, avert
+
+
+def _oui_non(v) -> str:
+    return "?" if v is None else ("oui" if v else "non")
+
+
+def afficher_info(info: InfoModele, cfg: Config) -> None:
+    log(f"modèle : {info.id} — API {'native /api/v1' if info.natif else 'compatible OpenAI (LM Studio < 0.4 ?)'} — {cfg.url}")
+    if info.natif:
+        det = ", ".join(x for x in (info.quant, f"{info.taille_go} Go" if info.taille_go else "", info.format) if x)
+        if det:
+            log(f"  {det}")
+        log(f"  contexte chargé {info.ctx or '?'} ; requêtes simultanées {info.parallel or '?'} ; taille de lot {info.batch or '?'} ; "
+            f"Flash Attention {_oui_non(info.flash)} ; KV sur GPU {_oui_non(info.kv_gpu)}")
+        log(f"  vision {_oui_non(info.vision)} ; réglage de réflexion : {info.options_reflexion or 'non exposé par LM Studio'}")
+
+
+def _rappel_gpu(controle: Controle | None):
+    derniere = [0.0]
+
+    def f(m: dict) -> None:
+        if controle is not None:
+            controle.gpu = m
+        evenement("gpu", **m)
+        if time.time() - derniere[0] >= 60:
+            derniere[0] = time.time()
+            debug(f"GPU : utilisation {m.get('util')} %, VRAM {m.get('mem')}/{m.get('mem_tot')} Mo, {m.get('pw')} W "
+                  f"(limite {m.get('pw_lim')}), {m.get('clk')} MHz, {m.get('temp')} °C")
+    return f
+
+
+def _run_pipeline(cfg: Config, controle: Controle | None = None):
     pages = cfg.pages
     bandes = range(1, cfg.decoupe + 1)
     chunks = [(p, b) for p in pages for b in bandes]
-    resultats, a_faire, perimes = {}, [], 0
+    resultats, a_faire, perimes, gardes = {}, [], 0, 0
     for ch in chunks:
-        d = charger_cache(cfg, *ch)
+        d, perime = (None, False) if (cfg.refaire and not cfg.sans_llm) else lire_cache(cfg, *ch, tolerer=cfg.sans_llm)
         if d is not None:
             resultats[ch] = d
+            gardes += int(perime)
         else:
             a_faire.append(ch)
-            if not cfg.refaire and os.path.exists(chemin_cache(cfg, *ch)):
-                perimes += 1
+            perimes += int(perime)
+    log(f"cache : {os.path.abspath(os.path.join(cfg.sortie, 'cache'))}")
     log(f"{len(pages)} page(s) demandée(s) : {len(resultats)} déjà en cache, {len(a_faire)} à traiter"
         f" (découpe {cfg.decoupe}, nettoyage {'oui' if cfg.nettoyage else 'non'}, parallèle {cfg.paralleles}).")
     if perimes:
-        log(f"  dont {perimes} en cache mais périmés (prompt, modèle, découpage ou nettoyage différents) : recalculés.")
+        log(f"  dont {perimes} en cache mais périmés (prompt, modèle, découpage, nettoyage ou image différents) : recalculés.")
+    if gardes:
+        log(f"  dont {gardes} calculées avec une autre configuration (prompt, modèle, image...) : conservées par --export.")
+    evenement("cache", pages=len(pages), en_cache=len(resultats), a_traiter=len(a_faire), perimes=perimes, gardes=gardes,
+              dossier=os.path.abspath(cfg.sortie))
     echecs: dict = {}
-    interrompu = False
-    if a_faire:
-        modele = resoudre_modele(cfg)
-        log(f"modèle : {modele} — {cfg.url}")
+    cfg.interrompu, cfg.fatal = False, ""
+    if a_faire and cfg.sans_llm:
+        log("--export : LM Studio n'est pas contacté ; les pages absentes du cache restent « à faire ».")
+    elif a_faire:
+        info = resoudre_modele(cfg)
+        afficher_info(info, cfg)
+        evenement("modele", **asdict(info))
+        etat = Etat(cfg, info, controle)
+        calibrer(cfg, etat, a_faire[0])
+        evenement("calibrage", tokens_entree=etat.tokens_entree, sortie_max=etat.sortie_max, max_cote_auto=cfg.max_cote_auto,
+                  paralleles=cfg.paralleles, penser=etat.penser, contexte=info.ctx)
+        log(f"mode : {'AVEC' if etat.penser else 'SANS'} réflexion ; sortie max {etat.sortie_max} jetons ; "
+            f"{cfg.paralleles} requête(s) à la fois ; abandon si la réflexion dépasse {etat.budget(etat.penser)} jetons ou boucle.")
+
+        def apres_page(n: int) -> None:
+            if cfg.export_tous and n % cfg.export_tous == 0:
+                r, i, _ = construire(cfg, resultats, {}, False)
+                ch = exporter(r, i, cfg.sortie)
+                log(f"export intermédiaire : {len(r)} lignes -> {ch.get('csv')}")
+                evenement("export", intermediaire=True, lignes=len(r), **ch)
+
+        if controle is not None:
+            controle.etat = "en cours"
         try:
-            echecs = executer(cfg, modele, a_faire)
+            with EchantillonGPU(5.0, rappel=_rappel_gpu(controle)):
+                echecs = executer(cfg, etat, a_faire, resultats, apres_page)
         except KeyboardInterrupt:
-            interrompu = True
+            cfg.interrompu = True
             log("interruption : export de ce qui est déjà calculé (relance la même commande pour reprendre).")
-        for ch in a_faire:
-            d = charger_cache(cfg, *ch)
-            if d is not None:
-                resultats[ch] = d
         cfg.fatal = next((v[7:] for v in echecs.values() if v.startswith("FATAL")), "")
-    entrees, avert = assembler(resultats, cfg.decoupe)
-    rows = exploser(entrees)
-    infos = []
-    for p in pages:
-        cs = [resultats.get((p, b)) for b in bandes]
-        manque = [b for b in bandes if resultats.get((p, b)) is None]
-        errs = [echecs.get((p, b)) for b in manque if echecs.get((p, b))]
-        statut = "échec" if manque and len(manque) == len(cs) else ("incomplet" if manque else
-                 ("partiel" if any(c["statut"] == "partiel" for c in cs) else "ok"))
-        n_ent = sum(len(c["entrees"]) for c in cs if c)
-        remarque = "; ".join(errs) if errs else ("interrompu" if interrompu and manque else "")
-        if not manque and all(c.get("blanche") for c in cs):
-            remarque = "page blanche (aucune requête envoyée)"
-        infos.append({"page_pdf": p, "page_imprimée": p - PAGE_OFFSET, "statut": statut, "entrées": n_ent,
-                      "lignes": sum(1 for r in rows if r["page_pdf"] == p),
-                      "durée_s": round(sum(c["duree"] for c in cs if c), 1),
-                      "tokens": sum(c["tokens"] for c in cs if c),
-                      "remarque": remarque})
-    cfg.interrompu = interrompu
-    return rows, infos, avert
+        if etat.stop.is_set() and not cfg.fatal and not cfg.interrompu:
+            cfg.interrompu = True
+            log("arrêt demandé : export de ce qui est déjà calculé (relance la même commande pour reprendre).")
+    return construire(cfg, resultats, echecs, cfg.interrompu)
+
+
+def run_pipeline(cfg: Config, controle: Controle | None = None):
+    """Cache -> (calibrage -> requêtes) -> lignes finales. `controle` : pont avec une interface (arrêt, activité, progression)."""
+    if controle is not None:
+        controle.etat, controle.message = "calibrage", ""
+    try:
+        r = _run_pipeline(cfg, controle)
+    except BaseException as e:
+        if controle is not None:
+            controle.etat, controle.message = "erreur", str(e)
+        raise
+    if controle is not None:
+        controle.etat = "erreur" if cfg.fatal else ("interrompu" if cfg.interrompu else "termine")
+        controle.message = cfg.fatal
+    return r
 
 
 def resume(rows: list[dict], infos: list[dict], avert: list[str]) -> None:
@@ -1086,14 +2094,23 @@ def resume(rows: list[dict], infos: list[dict], avert: list[str]) -> None:
         f"{sum(r['genre'] == 'MASCULIN' for r in rows)} masculins, {sum(r['genre'] == 'FEMININ' for r in rows)} féminins.")
     log(f"  arabe rempli : {sum(bool(r['prénom_arab_diacritiques']) for r in rows)}/{len(rows)} ; "
         f"lignes « à vérifier » : {sum(a_verifier(r) for r in rows)}.")
+    faites = [p for p in infos if p["statut"] in ("ok", "partiel") and p["durée_s"]]
+    if faites:
+        vit = [p["tok_s"] for p in faites if p["tok_s"] != ""]
+        log(f"  {sum(p['durée_s'] for p in faites) / len(faites):.0f} s par page en moyenne"
+            + (f", {sum(vit) / len(vit):.1f} tok/s" if vit else "")
+            + f", {sum(p['tokens_réflexion'] for p in faites)} jetons de réflexion au total.")
     mauvais = [p["page_pdf"] for p in infos if p["statut"] in ("échec", "incomplet")]
+    afaire = [p["page_pdf"] for p in infos if p["statut"] == "à faire"]
     partiels = [p["page_pdf"] for p in infos if p["statut"] == "partiel"]
     vides = [p["page_pdf"] for p in infos if p["statut"] == "ok" and p["entrées"] < 3
              and not str(p["remarque"]).startswith("page blanche") and DICT_START + 2 <= p["page_pdf"] <= DICT_END]
     if mauvais:
         log(f"  PAGES EN ÉCHEC ({len(mauvais)}) : {mauvais[:40]}{' …' if len(mauvais) > 40 else ''} -> relance la même commande.")
+    if afaire:
+        log(f"  PAGES PAS ENCORE TRAITÉES ({len(afaire)}) : {afaire[:40]}{' …' if len(afaire) > 40 else ''} -> relance la même commande.")
     if partiels:
-        log(f"  pages tronquées ({len(partiels)}) : {partiels[:40]} -> relance avec un --max-tokens plus grand.")
+        log(f"  pages partielles ({len(partiels)}) : {partiels[:40]} -> relance avec un --max-tokens plus grand (et un contexte suffisant).")
     if vides:
         log(f"  pages suspectes (moins de 3 entrées) : {vides[:40]}{' …' if len(vides) > 40 else ''}")
     for a in avert[:15]:
@@ -1102,28 +2119,236 @@ def resume(rows: list[dict], infos: list[dict], avert: list[str]) -> None:
         log(f"  … et {len(avert) - 15} autre(s) avertissement(s).")
 
 
+def resultats_du_cache(cfg: Config, tolerer: bool = True) -> dict:
+    """{(page, bande): résultat} lus dans le cache, sans rien journaliser (utilisé par la TUI)."""
+    out = {}
+    for p in cfg.pages:
+        for b in range(1, cfg.decoupe + 1):
+            d, _ = lire_cache(cfg, p, b, tolerer=tolerer)
+            if d is not None:
+                out[(p, b)] = d
+    return out
+
+
+def etat_cache(cfg: Config) -> dict:
+    """Où en est-on ? Lit uniquement le cache. -> {'cats': {statut: [pages]}, 'reste': n, 'moyenne': s/page | None, 'reste_s': s | None}."""
+    cats: dict[str, list] = {"ok": [], "partiel": [], "blanche": [], "périmé": [], "à faire": []}
+    durees = []
+    for p in cfg.pages:
+        for b in range(1, cfg.decoupe + 1):
+            d, perime = lire_cache(cfg, p, b)
+            if d is None:
+                cats["périmé" if perime else "à faire"].append(p)
+            elif d.get("blanche"):
+                cats["blanche"].append(p)
+            else:
+                cats["partiel" if d.get("statut") == "partiel" else "ok"].append(p)
+                durees.append(d.get("duree") or 0)
+    reste = len(cats["à faire"]) + len(cats["périmé"]) + len(cats["partiel"])
+    moy = sum(durees) / len(durees) if durees else None
+    return {"cats": cats, "reste": reste, "moyenne": moy,
+            "reste_s": reste * moy / max(1, cfg.paralleles) if (moy and reste) else None}
+
+
+def afficher_statut(cfg: Config) -> None:
+    """Où en est-on ? Lit uniquement le cache : LM Studio n'est pas nécessaire."""
+    e = etat_cache(cfg)
+    log(f"cache : {os.path.abspath(os.path.join(cfg.sortie, 'cache'))}")
+    log(f"{len(cfg.pages)} page(s) concernée(s) (découpe {cfg.decoupe}) :")
+    for k, v in e["cats"].items():
+        if v:
+            log(f"  {k:8s} : {len(v):4d}" + (f"   {v[:25]}{' …' if len(v) > 25 else ''}" if k != "ok" else ""))
+    if e["cats"]["périmé"]:
+        log("  (périmé = calculé avec un autre prompt, modèle, découpage, nettoyage ou taille d'image ; --refaire ou relance pour recalculer)")
+    if e["moyenne"] and e["reste"]:
+        log(f"durée moyenne mesurée : {e['moyenne']:.0f} s par page -> reste ≈ {fmt_duree(e['reste_s'])} (parallèle {cfg.paralleles}).")
+
+
+# ---------------------------------------------------------------- mesure GPU (nvidia-smi)
+
+class EchantillonGPU:
+    """Échantillonne nvidia-smi (s'il existe) pendant un bloc `with` : utilisation, VRAM, puissance, fréquence."""
+    CMD = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,clocks.sm,temperature.gpu,name",
+           "--format=csv,noheader,nounits"]
+
+    def __init__(self, intervalle: float = 1.0, rappel=None):
+        self.intervalle = intervalle
+        self.rappel = rappel
+        self.mesures: list[dict] = []
+        self.disponible = shutil.which("nvidia-smi") is not None
+        self._stop = threading.Event()
+        self._fil = None
+
+    @staticmethod
+    def _nombre(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    def instantane(self):
+        if not self.disponible:
+            return None
+        try:
+            r = subprocess.run(self.CMD, capture_output=True, text=True, timeout=8,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            c = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+            n = self._nombre
+            return {"util": n(c[0]), "mem": n(c[1]), "mem_tot": n(c[2]), "pw": n(c[3]), "pw_lim": n(c[4]),
+                    "clk": n(c[5]), "temp": n(c[6]), "nom": c[7] if len(c) > 7 else ""}
+        except (OSError, IndexError, subprocess.SubprocessError):
+            self.disponible = False
+            return None
+
+    def _boucle(self):
+        while not self._stop.wait(self.intervalle):
+            m = self.instantane()
+            if m:
+                self.mesures.append(m)
+                if self.rappel is not None:
+                    try:
+                        self.rappel(m)
+                    except Exception:                            # noqa: BLE001
+                        pass
+
+    def __enter__(self):
+        if self.disponible:
+            self._stop.clear()
+            self._fil = threading.Thread(target=self._boucle, daemon=True)
+            self._fil.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._fil is not None:
+            self._fil.join(timeout=10)
+        return False
+
+    def resume(self):
+        m = self.mesures
+        if not m:
+            return None
+
+        def moy(k):
+            v = [x[k] for x in m if x.get(k) is not None]
+            return sum(v) / len(v) if v else None
+
+        def maxi(k):
+            v = [x[k] for x in m if x.get(k) is not None]
+            return max(v) if v else None
+        return {"n": len(m), "util_moy": moy("util"), "mem_max": maxi("mem"), "mem_tot": m[0].get("mem_tot"),
+                "pw_moy": moy("pw"), "pw_lim": m[0].get("pw_lim"), "clk_moy": moy("clk"), "temp_max": maxi("temp"),
+                "nom": m[0].get("nom", "")}
+
+
+# ---------------------------------------------------------------- diagnostic
+
 def diagnostic(cfg: Config) -> None:
     from PIL import ImageDraw
-    log(f"1/2  serveur {cfg.url} …")
-    ids = lister_modeles(cfg)
-    log(f"     modèles vus par LM Studio : {ids}")
-    modele = resoudre_modele(cfg)
-    log(f"     modèle retenu : {modele}")
-    log("2/2  test de vision (lecture d'une image contenant « ADAM 123 ») …")
+    log(f"1/5  serveur {cfg.url} …")
+    info = resoudre_modele(cfg)
+    afficher_info(info, cfg)
+    gpu = EchantillonGPU(1.0)
+    base = gpu.instantane()
+    if base:
+        log(f"     GPU {base['nom']} : VRAM {base['mem']:.0f}/{base['mem_tot']:.0f} Mo occupés au repos, utilisation {base['util']:.0f} %")
+    else:
+        log("     nvidia-smi introuvable : pas de mesure GPU.")
+
+    log("2/5  vitesse de génération (texte seul, réflexion coupée si possible) …")
+    with gpu:
+        rep = appeler_llm(cfg, info, None, None, "Compte de 1 à 120 en chiffres, séparés par des virgules, sans rien d'autre.",
+                          temperature=0.0, top_p=None, max_tokens=300, penser=False, budget=0)
+    tps = rep["tps"]
+    g = gpu.resume()
+    log(f"     {rep['tokens']} jetons en {rep['duree']:.1f}s -> " + (f"{tps:.1f} tok/s" if tps else "vitesse non mesurable")
+        + (f" (premier jeton après {rep['ttft']:.1f}s)" if rep["ttft"] else ""))
+    if rep["tokens_reflexion"]:
+        log(f"     {rep['tokens_reflexion']} jetons de réflexion malgré la demande de la couper.")
+    if g:
+        log(f"     GPU pendant la génération : utilisation moyenne {g['util_moy']:.0f} %, VRAM max {g['mem_max']:.0f}/{g['mem_tot']:.0f} Mo"
+            + (f", puissance moyenne {g['pw_moy']:.0f} W (limite {g['pw_lim']:.0f} W)" if g["pw_moy"] and g["pw_lim"] else "")
+            + (f", {g['clk_moy']:.0f} MHz, {g['temp_max']:.0f} °C max" if g["clk_moy"] and g["temp_max"] else ""))
+
+    log("3/5  vision (lecture d'une image contenant « ADAM 123 ») …")
     petit = Image.new("RGB", (100, 30), "white")
     ImageDraw.Draw(petit).text((8, 9), "ADAM 123", fill="black")
-    grand = petit.resize((700, 210), Image.NEAREST)
     buf = io.BytesIO()
-    grand.save(buf, "PNG")
-    t = time.time()
-    rep = appeler_llm(cfg, modele, buf.getvalue(),
-                      "Quel texte est écrit dans l'image ? Réponds uniquement par ce texte.", 0.0, max_tokens=4000)
-    ok = "ADAM" in retirer_reflexion(rep["content"]).upper() or "ADAM" in rep["content"].upper()
-    log(f"     réponse en {time.time() - t:.0f}s : {retirer_reflexion(rep['content']).strip()[:80]!r} -> "
-        f"{'VISION OK' if ok else 'réponse inattendue : la vision ne semble pas fonctionner'}")
-    log("     réflexion : " + ("séparée dans reasoning_content" if rep["reasoning"] else
-                               ("balises <think> dans le contenu (le script les retire)" if "<think>" in rep["content"].lower()
-                                else "aucune trace")) + f" ; {rep['tokens']} tokens générés.")
+    petit.resize((700, 210), Image.NEAREST).save(buf, "PNG")
+    rv = appeler_llm(cfg, info, buf.getvalue(), None, "Quel texte est écrit dans l'image ? Réponds uniquement par ce texte.",
+                     temperature=0.0, top_p=None, max_tokens=600, penser=False, budget=300)
+    vu = "ADAM" in (rv["content"] + rv["reasoning"]).upper()
+    if vu:
+        verdict = "VISION OK"
+    elif rv["abandon"] == "budget_reflexion":
+        verdict = "test non concluant : le modèle réfléchit malgré la demande de couper la réflexion (voir le bilan)"
+    else:
+        verdict = "réponse inattendue : la vision ne semble pas fonctionner"
+    log(f"     réponse en {rv['duree']:.1f}s : {rv['content'].strip()[:60]!r} -> {verdict}")
+
+    log("4/5  jetons d'entrée d'une vraie page …")
+    entree_cible, t_txt, t_img, vitesse_prefill = 0, 0, 0, None
+    if cfg.pdf and os.path.exists(cfg.pdf):
+        page = cfg.pages[0] if cfg.pages and cfg.pages[0] != DICT_START else 55      # 55 : page type du dictionnaire
+        cfg.max_cote_auto = 0
+        try:
+            t_txt = sonder_tokens(cfg, info, None, cfg.prompt, TEXTE_UTILISATEUR)["entree"]
+            png, _ = preparer_image(cfg, page, 1)
+            m = sonder_tokens(cfg, info, png, cfg.prompt, TEXTE_UTILISATEUR)
+            t_img = max(0, m["entree"] - t_txt)
+            vitesse_prefill = m["entree"] / m["ttft"] if m.get("ttft") else None
+            pre = f" ; préremplissage ≈ {vitesse_prefill:.0f} jetons/s" if vitesse_prefill else ""
+            log(f"     page {page} : consigne ≈ {t_txt} jetons, image ≈ {t_img} jetons{pre}")
+            entree_cible = t_txt + (min(t_img, cfg.tokens_image) if cfg.tokens_image else t_img)
+            if cfg.tokens_image and t_img > cfg.tokens_image * 1.15:
+                log(f"     -> l'image sera réduite à ≈ {cfg.tokens_image} jetons (--tokens-image) ; entrée visée ≈ {entree_cible}")
+        except ErreurLLM as e:
+            log(f"     mesure impossible : {e}")
+    else:
+        log("     (ajoute le chemin du PDF à la commande pour mesurer une vraie page)")
+
+    log("5/5  bilan")
+    ctx_reco = arrondi_1024((entree_cible or 4000) + cfg.max_tokens + 256) * max(1, cfg.paralleles)
+    constats: list[str] = []
+    if tps is not None and tps < 15:
+        constats.append(f"Génération lente : {tps:.1f} tok/s. Un modèle de ce poids entièrement sur une carte récente tient bien plus que 15 tok/s : "
+                        "la limite vient de là où le calcul se fait, pas du script.")
+    if vitesse_prefill is not None and vitesse_prefill < 150:
+        constats.append(f"Préremplissage très lent ({vitesse_prefill:.0f} jetons/s) : typique d'un calcul sur le CPU (un GPU récent traite "
+                        "plusieurs centaines de jetons/s). Vérifie « GPU Offload » et la version du runtime llama.cpp CUDA.")
+    if g and g["util_moy"] is not None and g["util_moy"] < 35 and (tps or 0) < 25:
+        constats.append(f"GPU peu sollicité pendant la génération ({g['util_moy']:.0f} %) : le calcul se fait probablement sur le CPU "
+                        "(« GPU Offload » incomplet dans LM Studio, ou runtime llama.cpp sans noyau CUDA pour ce format de modèle).")
+    if g and g["mem_tot"] and g["mem_max"] / g["mem_tot"] > 0.92:
+        constats.append(f"VRAM presque pleine ({g['mem_max']:.0f}/{g['mem_tot']:.0f} Mo) : sous Windows, le pilote peut déborder en silence vers la RAM "
+                        "système, ce qui écroule la vitesse. Réduis le contexte et l'image, ou ferme les applications qui utilisent le GPU.")
+    if g and g["pw_moy"] and g["pw_lim"] and g["util_moy"] and g["util_moy"] > 70 and g["pw_moy"] < 0.5 * g["pw_lim"]:
+        constats.append("Le GPU est occupé mais consomme peu par rapport à sa limite : vérifie le mode d'alimentation (Silencieux/Éco bride le GPU) "
+                        "et le branchement secteur.")
+    if info.ctx and entree_cible and info.ctx < (entree_cible + 3000) * max(1, cfg.paralleles):
+        constats.append(f"Contexte chargé trop juste ({info.ctx}) pour {max(1, cfg.paralleles)} requête(s) de ≈ {entree_cible} jetons d'entrée + sortie.")
+    if info.parallel and info.parallel > max(1, cfg.paralleles):
+        constats.append(f"« Max Concurrent Predictions » = {info.parallel} alors que le script envoie {max(1, cfg.paralleles)} requête(s) à la fois : "
+                        f"mets-le à {max(1, cfg.paralleles)} (moins de mémoire réservée).")
+    if info.flash is False:
+        constats.append("Flash Attention est désactivé : active-le au chargement du modèle.")
+    if info.batch and info.batch < 1024:
+        constats.append(f"Taille de lot d'évaluation = {info.batch} : 1024 accélère le préremplissage de l'image.")
+    if info.kv_gpu is False:
+        constats.append("Le cache KV n'est pas sur le GPU : active « Offload KV Cache to GPU Memory ».")
+    if info.natif and not info.peut_couper_reflexion and info.options_reflexion == []:
+        constats.append("LM Studio n'expose pas de réglage de réflexion pour ce modèle : le script la bornera, mais la couper "
+                        "(« Enable Thinking » dans les réglages du modèle) fera gagner l'essentiel du temps.")
+    if not constats:
+        constats.append("Aucun problème évident détecté.")
+    evenement("diagnostic", tps=tps, gpu=g, info=asdict(info), jetons_consigne=t_txt, jetons_image=t_img,
+              prefill_tps=vitesse_prefill, contexte_conseille=ctx_reco, constats=constats)
+    for c in constats:
+        log("  • " + c)
+    log("Réglages conseillés dans LM Studio (fenêtre de chargement, « Manually choose model load parameters ») :")
+    log(f"  contexte {ctx_reco} ; GPU Offload au maximum ; Flash Attention activé ; taille de lot 1024 ; Max Concurrent Predictions {max(1, cfg.paralleles)}.")
+    log("  Ou en ligne de commande (décharge d'abord le modèle : bouton « Eject » ou `lms unload --all`) :")
+    log("  " + commande_lms(info.cle or cfg.modele, ctx_reco, cfg.paralleles))
 
 
 def autotest(cfg: Config) -> None:
@@ -1139,78 +2364,330 @@ def autotest(cfg: Config) -> None:
     for k, v in s.items():
         log(f"   {k:14s} {v}")
     log("   Repère : 'vedettes' proche du total, 'parasites' 0, 'genre' et 'arabe_exact' élevés = bonne configuration.")
+    faites = [p for p in infos if p["durée_s"]]
+    if faites:
+        moy = sum(p["durée_s"] for p in faites) / len(faites)
+        log(f"   durée moyenne : {moy:.0f} s par page -> ≈ {fmt_duree(moy * (DICT_END - DICT_START + 1) / max(1, cfg.paralleles))} "
+            f"pour les {DICT_END - DICT_START + 1} pages du dictionnaire (parallèle {cfg.paralleles}).")
 
 
-def main(argv: list[str] | None = None) -> None:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    ap = argparse.ArgumentParser(description="Extraction du Livre des prénoms arabes avec un modèle de vision (LM Studio).")
+# ============================================================================
+# 12) CONFIGURATION, RAPPORT DE DEBUG, LIGNE DE COMMANDE
+# ============================================================================
+
+CONFIG_DEFAUT = os.environ.get("PRENOMS_CONFIG") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "prenoms_config.json")
+
+# réglages enregistrés dans le fichier de configuration (et modifiables dans la TUI) : noms = destinations argparse
+CLES_CONFIG = ("pdf", "url", "modele", "api", "cle_api", "sortie", "pages", "debut", "fin", "paralleles", "decoupe", "nettoyage",
+               "tokens_image", "max_cote", "reflexion", "budget_reflexion", "temperature", "top_p", "top_k", "repeat_penalty",
+               "max_tokens", "timeout", "stall", "attente", "suivi", "essais", "export_tous", "corps_extra", "prompt_fichier",
+               "ancien", "log_niveau")
+
+
+def creer_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Extraction du Livre des prénoms arabes avec un modèle de vision (LM Studio). "
+                                 "Sans argument, dans un terminal : interface TUI.")
     ap.add_argument("pdf", nargs="?", default="", help="chemin du PDF")
-    ap.add_argument("--url", default="http://localhost:1234/v1", help="serveur LM Studio (défaut http://localhost:1234/v1)")
-    ap.add_argument("--modele", default="prism-ml/bonsai-27b", help="nom du modèle (l'identifiant exact est retrouvé automatiquement)")
+    ap.add_argument("--url", default="http://localhost:1234", help="serveur LM Studio (défaut http://localhost:1234 ; « …/v1 » accepté)")
+    ap.add_argument("--modele", default="prism-ml/bonsai-27b", help="nom du modèle CHARGÉ (l'identifiant exact est retrouvé automatiquement)")
+    ap.add_argument("--api", choices=("auto", "natif", "openai"), default="auto", help="auto = API native /api/v1 si disponible (LM Studio ≥ 0.4)")
+    ap.add_argument("--cle-api", default="", help="jeton d'API LM Studio si l'authentification est activée (ou variable LM_API_TOKEN)")
     ap.add_argument("--debut", type=int, default=DICT_START, help=f"première page PDF (défaut {DICT_START})")
     ap.add_argument("--fin", type=int, default=DICT_END, help=f"dernière page PDF (défaut {DICT_END})")
     ap.add_argument("--pages", default="", help="liste explicite, ex. 55,56,100-104 (remplace --debut/--fin)")
-    ap.add_argument("--sortie", default="sortie_llm", help="dossier de sortie")
-    ap.add_argument("--paralleles", type=int, default=1, help="requêtes simultanées (2-4 si LM Studio et la VRAM suivent)")
+    ap.add_argument("--sortie", default="", help="dossier de sortie (défaut : sortie_llm à côté du script)")
+    ap.add_argument("--paralleles", type=int, default=1, help="requêtes simultanées (voir README : Max Concurrent Predictions et contexte)")
     ap.add_argument("--decoupe", type=int, choices=(1, 2), default=1, help="2 = chaque page en deux moitiés (plus de détail par requête)")
     ap.add_argument("--nettoyage", choices=("oui", "non"), default="oui", help="efface le texte fantôme du verso (défaut oui)")
-    ap.add_argument("--max-cote", type=int, default=0, help="réduit l'image si son plus grand côté dépasse N px (0 = image native)")
-    ap.add_argument("--temperature", type=float, default=0.6, help="0.6 = réglage conseillé pour les modèles Qwen en mode réflexion (éviter 0 : boucles de répétition)")
-    ap.add_argument("--top-p", type=float, default=0.95, help="0 = ne pas envoyer")
+    ap.add_argument("--tokens-image", type=int, default=2500, help="cible de jetons d'image par requête ; l'image est réduite en conséquence (0 = image native)")
+    ap.add_argument("--max-cote", type=int, default=0, help="plafond manuel du plus grand côté de l'image, en px (remplace --tokens-image)")
+    ap.add_argument("--reflexion", choices=("auto", "non", "oui"), default="auto",
+                    help="auto = coupée si LM Studio le permet ; oui = autorisée, mais bornée (--budget-reflexion)")
+    ap.add_argument("--budget-reflexion", type=int, default=0, help="jetons de réflexion tolérés avant abandon (0 = automatique)")
+    ap.add_argument("--temperature", type=float, default=None, help="défaut : 0,3 sans réflexion, 0,6 avec")
+    ap.add_argument("--top-p", type=float, default=None, help="défaut : 0,8 sans réflexion, 0,95 avec")
     ap.add_argument("--top-k", type=int, default=20, help="0 = ne pas envoyer")
-    ap.add_argument("--max-tokens", type=int, default=16000, help="budget de génération par requête, réflexion comprise")
-    ap.add_argument("--timeout", type=int, default=1800, help="délai maximal par requête, en secondes")
-    ap.add_argument("--essais", type=int, default=2, help="tentatives par page")
-    ap.add_argument("--json-schema", action="store_true", help="impose le format via response_format (peut réduire la réflexion)")
-    ap.add_argument("--corps-extra", default="", help="JSON fusionné dans la requête, ex. '{\"top_p\": 0.9}'")
+    ap.add_argument("--repeat-penalty", type=float, default=0.0, help="0 = ne pas envoyer")
+    ap.add_argument("--max-tokens", type=int, default=8000, help="jetons de sortie max par requête, réflexion comprise (borné par le contexte chargé)")
+    ap.add_argument("--timeout", type=int, default=1200, help="durée totale max d'une requête, en secondes")
+    ap.add_argument("--stall", type=int, default=300, help="silence max entre deux jetons, en secondes")
+    ap.add_argument("--attente", type=int, default=900, help="attente max du premier octet (préremplissage de l'image), en secondes")
+    ap.add_argument("--suivi", type=int, default=20, help="secondes entre deux lignes de progression pendant une requête (0 = aucune)")
+    ap.add_argument("--essais", type=int, default=3, help="tentatives par page")
+    ap.add_argument("--export-tous", type=int, default=10, help="export intermédiaire tous les N pages terminées (0 = seulement à la fin)")
+    ap.add_argument("--corps-extra", default="", help="JSON fusionné dans la requête, ex. '{\"min_p\": 0.05}'")
     ap.add_argument("--prompt-fichier", default="", help="remplace le prompt par défaut par le contenu de ce fichier")
     ap.add_argument("--refaire", action="store_true", help="ignore le cache et recalcule les pages demandées")
     ap.add_argument("--sauver-images", action="store_true", help="garde dans sortie/images les PNG envoyés au modèle")
     ap.add_argument("--ancien", default="", help="CSV de l'ancienne extraction OCR : produit comparaison_ancien.csv")
-    ap.add_argument("--diagnostic", action="store_true", help="teste LM Studio et la vision, puis quitte")
+    ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
     ap.add_argument("--autotest", action="store_true", help="traite 4 pages et compare à la vérité terrain")
-    a = ap.parse_args(argv)
+    ap.add_argument("--statut", action="store_true", help="état du cache (pages faites / à faire / périmées), sans LM Studio")
+    ap.add_argument("--export", action="store_true", help="régénère CSV/JSON/Excel depuis le cache, sans LM Studio")
+    ap.add_argument("--rapport", action="store_true", help="crée un zip de debug (logs récents, configuration sans secrets, résumé du cache, sorties brutes) à m'envoyer")
+    ap.add_argument("--tui", action="store_true", help="ouvre l'interface plein écran (par défaut quand on lance le script sans argument)")
+    ap.add_argument("--cli", action="store_true", help="ne pas ouvrir la TUI quand on lance le script sans argument : affiche l'aide")
+    ap.add_argument("--config", default="", help="fichier de configuration JSON (défaut : prenoms_config.json à côté du script, ou variable PRENOMS_CONFIG)")
+    ap.add_argument("--ecrire-config", action="store_true", help="enregistre les options données dans le fichier de configuration, puis quitte")
+    ap.add_argument("--log-niveau", type=str.upper, choices=("DEBUG", "INFO"), default="DEBUG", help="niveau écrit dans le fichier de log (défaut DEBUG : tout)")
+    ap.add_argument("--version", action="version", version=f"extraire_prenoms_llm {VERSION}")
+    return ap
 
-    cfg = Config(pdf=a.pdf, url=a.url, modele=a.modele, sortie=a.sortie, paralleles=a.paralleles, decoupe=a.decoupe,
-                 nettoyage=a.nettoyage == "oui", max_cote=a.max_cote, temperature=a.temperature, top_p=a.top_p, top_k=a.top_k,
-                 max_tokens=a.max_tokens, timeout=a.timeout, essais=max(1, a.essais), json_schema=a.json_schema,
-                 refaire=a.refaire, sauver_images=a.sauver_images, ancien=a.ancien)
+
+def charger_config(chemin: str) -> dict:
+    if not chemin or not os.path.exists(chemin):
+        return {}
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        log(f"configuration illisible ({chemin}) : {e}", "WARN")
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def ecrire_config(chemin: str, valeurs: dict) -> None:
+    ecrire_atomique(chemin, json.dumps({k: valeurs[k] for k in CLES_CONFIG if k in valeurs}, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def valeurs_effectives(chemin: str | None = None) -> dict:
+    """Valeurs par défaut des options, surchargées par le fichier de configuration (c'est ce que voit la TUI)."""
+    ap = creer_parser()
+    valides = {x.dest for x in ap._actions}
+    ap.set_defaults(**{k: v for k, v in charger_config(chemin or CONFIG_DEFAUT).items() if k in valides})
+    return vars(ap.parse_args([]))
+
+
+def pages_depuis(a) -> list[int]:
+    return parse_pages(a.pages) if a.pages else list(range(a.debut, a.fin + 1))
+
+
+def construire_cfg(a) -> Config:
+    """Options (argparse ou dictionnaire de la TUI) -> Config. Lève ValueError si une option est invalide."""
+    sortie = a.sortie or os.path.join(os.path.dirname(os.path.abspath(__file__)), "sortie_llm")
+    cfg = Config(pdf=a.pdf, url=a.url, modele=a.modele, sortie=sortie, paralleles=max(1, int(a.paralleles)), decoupe=int(a.decoupe),
+                 nettoyage=a.nettoyage == "oui", max_cote=int(a.max_cote), tokens_image=int(a.tokens_image), api=a.api,
+                 reflexion=a.reflexion, budget_reflexion=int(a.budget_reflexion), temperature=a.temperature, top_p=a.top_p,
+                 top_k=int(a.top_k), repeat_penalty=float(a.repeat_penalty), max_tokens=int(a.max_tokens), timeout=int(a.timeout),
+                 stall=int(a.stall), attente=int(a.attente), suivi=int(a.suivi), essais=max(1, int(a.essais)), refaire=bool(a.refaire),
+                 sauver_images=bool(a.sauver_images), ancien=a.ancien, export_tous=int(a.export_tous), sans_llm=bool(a.export),
+                 cle_api=a.cle_api, log_niveau=a.log_niveau)
     if a.corps_extra:
         try:
-            cfg.corps_extra = json.loads(a.corps_extra)
+            cfg.corps_extra = json.loads(a.corps_extra) if isinstance(a.corps_extra, str) else dict(a.corps_extra)
         except ValueError:
-            ap.error("--corps-extra doit être du JSON valide")
+            raise ValueError("--corps-extra doit être du JSON valide")
+        if not isinstance(cfg.corps_extra, dict):
+            raise ValueError("--corps-extra doit être un objet JSON : {...}")
     if a.prompt_fichier:
         with open(a.prompt_fichier, encoding="utf-8") as f:
             cfg.prompt = f.read()
+    cfg.pages = pages_depuis(a)
+    SECRETS.update(x for x in (cfg.cle_api, os.environ.get("LM_API_TOKEN", "")) if x)
+    return cfg
+
+
+def cfg_pour_log(cfg: Config) -> dict:
+    d = asdict(cfg)
+    d["prompt"] = f"sha1:{hashlib.sha1(cfg.prompt.encode('utf-8')).hexdigest()[:10]} ({len(cfg.prompt)} caractères)"
+    d["cle_api"] = "***" if cfg.cle_api else ""
+    d["pages"] = f"{len(cfg.pages)} pages ({cfg.pages[0]}-{cfg.pages[-1]})" if cfg.pages else "aucune"
+    return d
+
+
+def _queue_fichier(chemin: str, max_octets: int) -> bytes:
+    try:
+        with open(chemin, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            taille = f.tell()
+            f.seek(max(0, taille - max_octets))
+            data = f.read()
+    except OSError:
+        return b""
+    return (b"[... debut tronque ...]\n" if taille > max_octets else b"") + data
+
+
+def resume_cache_csv(cfg: Config) -> str:
+    tampon = io.StringIO()
+    w = csv.writer(tampon, lineterminator="\n")
+    w.writerow(["page_pdf", "bande", "statut", "perime", "blanche", "entrees", "duree_s", "tokens", "tokens_reflexion",
+                "tokens_entree", "tok_s", "ttft_s", "penser", "avertissements"])
+    for p in cfg.pages:
+        for b in range(1, cfg.decoupe + 1):
+            d, perime = lire_cache(cfg, p, b, tolerer=True)
+            if d is None:
+                w.writerow([p, b, "a_faire"] + [""] * 11)
+                continue
+            w.writerow([p, b, d.get("statut"), perime, bool(d.get("blanche")), len(d.get("entrees") or []), d.get("duree"),
+                        d.get("tokens"), d.get("tokens_reflexion"), d.get("tokens_entree"), d.get("tps"), d.get("ttft"),
+                        d.get("penser"), " | ".join(d.get("avertissements") or [])])
+    return tampon.getvalue()
+
+
+def creer_rapport(cfg: Config, chemin_config: str = "", brut_max: int = 25) -> str:
+    """Zip de debug prêt à envoyer : logs récents, environnement, configuration SANS secrets, résumé du cache, sorties brutes
+    récentes. Ni PDF, ni images."""
+    dossier = os.path.join(cfg.sortie, "rapports")
+    os.makedirs(dossier, exist_ok=True)
+    chemin = os.path.join(dossier, "rapport_debug_" + time.strftime("%Y%m%d_%H%M%S") + ".zip")
+    dossier_logs = os.path.join(cfg.sortie, "logs")
+    logs = sorted(n for n in os.listdir(dossier_logs) if n.endswith(".log")) if os.path.isdir(dossier_logs) else []
+    brut = os.path.join(cfg.sortie, "cache", "brut")
+    dumps = []
+    if os.path.isdir(brut):
+        dumps = sorted((os.path.join(brut, n) for n in os.listdir(brut) if "_essai" in n), key=os.path.getmtime, reverse=True)[:brut_max]
+    with zipfile.ZipFile(chemin, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in logs[-3:]:
+            z.writestr("logs/" + n, masquer(_queue_fichier(os.path.join(dossier_logs, n), 2_000_000).decode("utf-8", "replace")))
+        if logs and os.path.exists(os.path.join(dossier_logs, logs[-1][:-4] + ".jsonl")):
+            z.writestr("logs/" + logs[-1][:-4] + ".jsonl",
+                       masquer(_queue_fichier(os.path.join(dossier_logs, logs[-1][:-4] + ".jsonl"), 2_000_000).decode("utf-8", "replace")))
+        z.writestr("environnement.json", masquer(json.dumps(infos_environnement(), ensure_ascii=False, indent=2, default=str)))
+        z.writestr("configuration.json", masquer(json.dumps(cfg_pour_log(cfg), ensure_ascii=False, indent=2, default=str)))
+        if chemin_config and os.path.exists(chemin_config):
+            z.writestr("prenoms_config.json", masquer(_queue_fichier(chemin_config, 100_000).decode("utf-8", "replace")))
+        z.writestr("pages.csv", resume_cache_csv(cfg))
+        for f in dumps:
+            z.writestr("brut/" + os.path.basename(f), masquer(_queue_fichier(f, 20_000).decode("utf-8", "replace")))
+        z.writestr("LISEZMOI.txt", (
+            f"Rapport de debug généré le {time.strftime('%Y-%m-%d %H:%M:%S')} (extraire_prenoms_llm {VERSION}).\n\n"
+            "logs/*.log      journal lisible des dernières sessions (heure, niveau, fil, message)\n"
+            "logs/*.jsonl    événements structurés de la dernière session (requêtes, pages, GPU, erreurs)\n"
+            "environnement.json   Python, système, versions des paquets, GPU (nvidia-smi)\n"
+            "configuration.json   réglages utilisés (prompt résumé par son empreinte, jeton d'API masqué)\n"
+            "pages.csv       état de chaque page dans le cache (statut, durée, jetons, tok/s, avertissements)\n"
+            "brut/           dernières sorties brutes des essais ratés (fin des réponses et des réflexions)\n\n"
+            "Le zip ne contient ni le PDF, ni les images des pages, ni de secret.\n"))
+    return chemin
+
+
+def installer_hooks() -> None:
+    """Toute exception non rattrapée (fil principal ou secondaire) finit, avec sa trace, dans le fichier de log."""
+    if getattr(sys.excepthook, "_prenoms", False):
+        return
+
+    def hook(type_, valeur, tb):
+        if not issubclass(type_, KeyboardInterrupt):
+            log_exception("exception non rattrapée", valeur)
+        sys.__excepthook__(type_, valeur, tb)
+
+    def hook_fil(args):
+        if args.exc_type is not SystemExit and args.exc_value is not None:
+            log_exception(f"exception non rattrapée dans le fil {args.thread.name if args.thread else '?'}", args.exc_value)
+
+    hook._prenoms = True
+    sys.excepthook = hook
+    threading.excepthook = hook_fil
+
+
+def journaliser_demarrage(mode: str, argv, cfg: Config) -> None:
+    """En-tête du journal : version, arguments (secrets masqués), environnement, configuration. Le texte aide à la lecture,
+    l'événement JSONL aux analyses automatiques."""
+    env = infos_environnement()
+    cmd = masquer(" ".join(str(x) for x in argv))
+    debug(f"version {VERSION} — mode {mode}")
+    debug(f"arguments : {cmd}")
+    debug("environnement : " + json.dumps(env, ensure_ascii=False, default=str))
+    debug("configuration : " + json.dumps(cfg_pour_log(cfg), ensure_ascii=False, default=str))
+    evenement("demarrage", version=VERSION, mode=mode, argv=cmd, config=cfg_pour_log(cfg), environnement=env)
+
+
+def lancer_tui(chemin_config: str) -> int:
+    sys.modules.setdefault("extraire_prenoms_llm", sys.modules[__name__])      # même instance du moteur si lancé en script
+    try:
+        import prenoms_tui
+    except ImportError as e:
+        if getattr(e, "name", "") in ("textual", "rich") or "textual" in str(e):
+            print("L'interface TUI nécessite le paquet « textual » :  pip install textual\n"
+                  "Sans lui, utilise les options en ligne de commande (python extraire_prenoms_llm.py --help).")
+        else:
+            print(f"Impossible de charger prenoms_tui.py ({e}). Il doit se trouver à côté de ce script.")
+        return 2
+    return prenoms_tui.lancer(chemin_config)
+
+
+def _terminal_interactif() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default="")
+    chemin_cfg = pre.parse_known_args(argv)[0].config or CONFIG_DEFAUT
+    ap = creer_parser()
+    valides = {x.dest for x in ap._actions}
+    ap.set_defaults(**{k: v for k, v in charger_config(chemin_cfg).items() if k in valides})
+    a = ap.parse_args(argv)
+    installer_hooks()
+    if a.tui or (not argv and not a.cli and _terminal_interactif()):
+        return lancer_tui(chemin_cfg)
+    if not argv or argv == ["--cli"]:
+        ap.print_help()                                        # rien à faire : l'aide plutôt qu'une erreur d'usage
+        return 0
+    try:
+        cfg = construire_cfg(a)
+    except (ValueError, OSError) as e:
+        ap.error(str(e))
+    if a.ecrire_config:
+        ecrire_config(chemin_cfg, {k: getattr(a, k) for k in CLES_CONFIG})
+        log(f"configuration enregistrée : {chemin_cfg}")
+        return 0
+    if a.rapport:
+        log(f"rapport de debug : {creer_rapport(cfg, chemin_cfg)}")
+        return 0
+    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "statut" if a.statut else "export" if a.export else "extraction"
+    JOURNAL.ouvrir(os.path.join(cfg.sortie, "logs"), mode, cfg.log_niveau)
+    log(f"journal : {JOURNAL.chemin}")
+    journaliser_demarrage(mode, argv, cfg)
     try:
         if a.diagnostic:
             diagnostic(cfg)
-            return
-        if not a.pdf or not os.path.exists(a.pdf):
+            return 0
+        if a.statut:
+            afficher_statut(cfg)
+            return 0
+        if not a.export and (not a.pdf or not os.path.exists(a.pdf)):
             ap.error("indique le chemin du PDF (fichier introuvable)")
         if a.autotest:
             autotest(cfg)
-            return
-        cfg.pages = parse_pages(a.pages) if a.pages else list(range(a.debut, a.fin + 1))
+            return 0
         rows, infos, avert = run_pipeline(cfg)
-    except ErreurFatale as e:
-        log(f"ERREUR : {e}")
+        if cfg.fatal and not rows:
+            sys.exit(2)                                        # rien à exporter
+        ch = exporter(rows, infos, cfg.sortie)
+        evenement("export", intermediaire=False, lignes=len(rows), **ch)
+        resume(rows, infos, avert)
+        if cfg.ancien:
+            comparer_ancien(rows, cfg.ancien, cfg.pages, cfg.sortie)
+        log("Fichiers : " + " | ".join(ch.values()))
+        log(f"Journal complet : {JOURNAL.chemin}  (en cas de problème, `--rapport` crée un zip à m'envoyer)")
+        if cfg.fatal:
+            sys.exit(2)
+        return 130 if cfg.interrompu else 0
+    except (ErreurFatale, ErreurLLM) as e:
+        log(f"ERREUR : {e}", "ERROR")
+        evenement("fatal", message=str(e))
         sys.exit(2)
-    if cfg.fatal and not rows:
-        sys.exit(2)                                            # rien à exporter
-    ch = exporter(rows, infos, cfg.sortie)
-    resume(rows, infos, avert)
-    if cfg.ancien:
-        comparer_ancien(rows, cfg.ancien, cfg.pages, cfg.sortie)
-    log("Fichiers : " + " | ".join(ch.values()))
-    if cfg.fatal:
-        sys.exit(2)
-    if cfg.interrompu:
-        sys.stdout.flush()
-        os._exit(130)          # les requêtes encore en vol n'empêchent pas la sortie
+    except KeyboardInterrupt:
+        log("interruption.")
+        return 130
+    except Exception as e:                                     # noqa: BLE001 : trace complète dans le journal
+        log_exception("erreur inattendue", e)
+        log(f"Le détail est dans le fichier de log : {JOURNAL.chemin} ; `--rapport` crée un zip à m'envoyer.", "ERROR")
+        sys.exit(1)
+    finally:
+        JOURNAL.fermer()
 
 
 if __name__ == "__main__":
-    main()
+    code = main()
+    sys.stdout.flush()
+    if code == 130:
+        os._exit(130)          # les requêtes encore en vol ne doivent pas retarder la sortie
+    sys.exit(code)
