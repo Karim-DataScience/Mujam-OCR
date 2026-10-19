@@ -1,4 +1,4 @@
-# Extraction du « Livre des prénoms arabes » — v4.1 (LM Studio, streaming, TUI, journaux)
+# Extraction du « Livre des prénoms arabes » — v4.2 (lecture hybride, LM Studio, streaming, TUI, journaux)
 
 Chaque page du PDF scanné est envoyée à un modèle de vision servi par LM Studio (ex. `prism-ml/bonsai-27b`), qui renvoie du
 JSON. Sortie : **une ligne par prénom** (« Youssouf / Youssef » → deux lignes), en CSV, JSON et Excel.
@@ -25,6 +25,30 @@ python extraire_prenoms_llm.py --rapport                  # zip de debug à m'en
 python extraire_prenoms_llm.py --cli                      # aide, sans ouvrir la TUI
 ```
 LM Studio ≥ 0.4.0 (API native : réflexion pilotable, statistiques). Une version plus ancienne fonctionne en repli sur l'API OpenAI.
+
+## Lecture hybride (nouveau en v4.2) : le bon outil pour chaque zone
+
+Le modèle de vision lisant la page entière se trompait surtout sur la **structure** (orthographes empilées prises pour des prénoms
+distincts, genre inversé), sur l'**arabe** (lettres confondues, voyelles perdues) et sur les **accents** des définitions. La lecture
+hybride découpe donc le travail (`--methode auto`, défaut : hybride si Tesseract est installé, sinon modèle seul) :
+
+| Zone | Outil | Coût |
+|---|---|---|
+| structure, **genre (couleur)**, orthographes empilées, définitions, légende, notes de bas de page | traitement d'image classique (`mise_en_page.py`) | ≈ 0,6 s / page, CPU |
+| noms français, corps des définitions (césures recollées, « Il » lu « 11 » corrigé) | **Tesseract** `fra` (`lecture_hybride.py`) | ≈ 2-8 s / page, CPU |
+| arabe voyellé de chaque bloc + « tête » de chaque définition (translittération avec ses â î û ḥ ṣ ḍ ṭ ẓ) | **modèle de vision**, sur UNE petite feuille de recadrages numérotés par page | ≈ 200 jetons de sortie au lieu de ≈ 2 000 |
+| page dont la mise en page n'est pas comprise, ou feuille illisible, ou Tesseract en panne | **repli automatique** sur la lecture de la page entière par le modèle de vision | comme avant |
+| pages de texte courant (introductions de chapitre) | rien : aucune requête | 0 |
+
+La mise en page a été validée sur les 286 pages du dictionnaire : 271 pages d'entrées sans anomalie, 15 pages de texte, 0 échec ; 1 708 entrées,
+2 253 blocs de prénoms (la couverture annonce « plus de 2 200 prénoms »), 939 orthographes empilées.
+
+Installation de Tesseract : Windows → installateur « UB Mannheim » en cochant **French** ; puis `pip install pytesseract opencv-python-headless`.
+Pour un meilleur français, mets `fra.traineddata` du dépôt `tessdata_best` dans un dossier et donne `--tessdata ce\dossier`.
+Options : `--methode auto|hybride|vlm`, `--tesseract chemin\tesseract.exe`, `--tessdata dossier`, `--tess-lang fra`. La méthode fait partie de l'empreinte du
+cache (changer de méthode recalcule). `--decoupe 2` est incompatible (la lecture hybride analyse la page entière). Pour répartir la charge,
+`--paralleles 2` ou `3` fait tourner Tesseract (CPU) sur une page pendant que le GPU lit la feuille d'une autre.
+Ce qui n'est **pas** encore vérifié : la qualité de l'arabe et des têtes lues par TON modèle sur les feuilles (lance `--autotest --methode hybride`).
 
 ## Interface TUI
 
@@ -165,7 +189,7 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 
 ## Ce qui est testé, et ce qui ne l'est pas
 
-- **Testé** (`python test_extraire_prenoms_llm.py`, 112 tests, ≈ 2 min ; `python test_prenoms_tui.py`, 23 tests, ≈ 2 min) : le moteur face à un **faux serveur LM Studio**
+- **Testé** (`python test_extraire_prenoms_llm.py`, 129 tests, ≈ 3 min ; `python test_prenoms_tui.py`, 23 tests, ≈ 2 min) : le moteur face à un **faux serveur LM Studio**
   (API native et OpenAI, streaming chunké ou non, pannes : boucle de réflexion, budget dépassé, réglage « off » ignoré ou refusé, silence, absence de
   réponse, erreurs HTTP, authentification, modèle sans vision, contexte trop court, Ctrl+C) ; les journaux (écriture, masquage des secrets, traces,
   purge), la configuration, le rapport de debug ; et la **TUI** en mode « sans écran » (Textual `run_test`) : onglets, réglages, test de LM Studio,
@@ -179,6 +203,9 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 
 - `extraire_prenoms_llm.py` — moteur, ligne de commande, journaux, configuration, rapport
 - `prenoms_tui.py` — interface plein écran (Textual)
+- `mise_en_page.py` — analyse de la page par traitement d'image (zones, genre, entrées)
+- `lecture_hybride.py` — Tesseract, feuille de recadrages pour le modèle de vision, fusion
+- `REPRISE.md` — document de reprise du projet (contexte, état, constats, prochaines étapes)
 - `lancer.bat` — lanceur Windows (double-clic)
 - `verite_terrain.py` — pages 55, 56, 100, 150 lues à l'œil, utilisées par `--autotest`
 - `test_extraire_prenoms_llm.py`, `test_prenoms_tui.py` — tests, sans LM Studio ni GPU

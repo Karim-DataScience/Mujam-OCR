@@ -1,7 +1,10 @@
-pillow>=10.0.0
+pillow>=10.1.0
 numpy>=1.24.0
 openpyxl>=3.1.0
 # Lecture de l image d origine de chaque page du PDF (aucun executable externe a installer)
 pymupdf>=1.24.0
 # Interface plein ecran (TUI) ; sans elle, la ligne de commande reste entierement utilisable
 textual>=1.0
+# Lecture hybride (mise en page + Tesseract) ; sans elle, le modele de vision lit les pages entieres
+opencv-python-headless>=4.8
+pytesseract>=0.3.10

@@ -54,7 +54,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -343,6 +343,10 @@ class Config:
     max_cote_auto: int = 0         # calculé au démarrage d'après le nombre de jetons d'image mesuré
     tokens_image: int = 2500       # cible de jetons d'image par requête ; 0 = image native
     api: str = "auto"              # auto | natif (/api/v1/chat) | openai (/v1/chat/completions)
+    methode: str = "auto"          # auto | hybride | vlm : hybride = mise en page + Tesseract + feuille de recadrages lue par le modèle
+    tesseract: str = ""            # chemin de tesseract(.exe) ; vide = automatique
+    tessdata: str = ""             # dossier des modèles Tesseract (ex. tessdata_best) ; vide = installation par défaut
+    tess_lang: str = "fra"
     reflexion: str = "auto"        # auto | non | oui
     budget_reflexion: int = 0      # jetons de réflexion tolérés ; 0 = automatique
     temperature: float | None = None   # None = 0,3 sans réflexion, 0,6 avec
@@ -1330,6 +1334,7 @@ class Etat:
         self.peut_couper = info.peut_couper_reflexion
         self.penser = cfg.reflexion == "oui" or (cfg.reflexion == "auto" and not self.peut_couper)
         self.coupures_ignorees = 0
+        self.hybride = False                 # lecture hybride (mise en page + Tesseract) disponible et demandée
 
     def budget(self, penser: bool) -> int:
         """Jetons de réflexion tolérés avant d'abandonner la requête."""
@@ -1368,7 +1373,7 @@ def chemin_cache(cfg: Config, page: int, bande: int) -> str:
 
 def empreinte(cfg: Config) -> str:
     """Change dès que le résultat en cache ne serait plus celui que produirait cette configuration."""
-    cle = json.dumps([cfg.prompt, TEXTE_UTILISATEUR, cfg.modele, cfg.decoupe, cfg.nettoyage, cfg.max_cote, cfg.tokens_image],
+    cle = json.dumps([cfg.prompt, TEXTE_UTILISATEUR, cfg.modele, cfg.decoupe, cfg.nettoyage, cfg.max_cote, cfg.tokens_image, cfg.methode],
                      ensure_ascii=False)
     return hashlib.sha1(cle.encode("utf-8")).hexdigest()[:10]
 
@@ -1599,14 +1604,143 @@ def _traiter_chunk(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
     raise ErreurLLM(derniere)
 
 
+def preparer_hybride(cfg: Config) -> bool:
+    """La lecture hybride (mise en page + Tesseract + feuille de recadrages) est-elle demandée ET possible ?"""
+    if cfg.methode == "vlm":
+        return False
+    if cfg.decoupe != 1:
+        if cfg.methode == "hybride":
+            log("--decoupe 2 est incompatible avec la lecture hybride (qui analyse la page entière) : lecture par le modèle seul.", "WARN")
+        return False
+    try:
+        import lecture_hybride as LH
+        LH.configurer(cfg.tesseract, cfg.tessdata, cfg.tess_lang)
+        ok, msg = LH.disponible()
+    except ImportError as e:
+        ok, msg = False, f"module manquant ({e})"
+    if ok:
+        log(f"lecture hybride : {msg}")
+        return True
+    if cfg.methode == "hybride":
+        raise ErreurFatale(f"--methode hybride impossible : {msg}")
+    log(f"lecture hybride indisponible ({msg}) : lecture par le modèle de vision seul.", "WARN")
+    return False
+
+
+def _traiter_page_hybride(cfg: Config, etat: Etat, page: int) -> dict | None:
+    """Page entière : structure par traitement d'image, textes latins par Tesseract, arabe et têtes de définition lus par le
+    modèle de vision sur UNE petite feuille de recadrages. Rend None pour demander le repli sur la lecture par le modèle seul."""
+    import lecture_hybride as LH
+    t = time.time()
+    ident = id_chunk(page, 1, 1)
+    net = nettoyer_page(image_native(cfg.pdf, page))
+    encre = float((np.asarray(net.convert("L")) < 128).mean() * 100)
+    base = {"page": page, "bande": 1, "decoupe": 1, "nettoyage": cfg.nettoyage, "empreinte": empreinte(cfg), "modele": etat.info.id,
+            "max_tokens": etat.sortie_max, "methode": "hybride"}
+    vide = {"tokens": 0, "tokens_reflexion": 0, "tokens_entree": 0, "tps": None, "ttft": None, "penser": False}
+    chemin = chemin_cache(cfg, page, 1)
+    if encre < SEUIL_BLANC:
+        res = {**base, **vide, "statut": "ok", "blanche": True, "avertissements": ["page blanche : aucune requête envoyée"], "duree": 0.0, "entrees": []}
+        ecrire_atomique(chemin, json.dumps(res, ensure_ascii=False, indent=1))
+        return res
+    try:
+        lec = LH.lire_page(net)
+    except Exception as e:                                       # noqa: BLE001 : Tesseract absent/planté : on se rabat sur le modèle de vision
+        log_exception(f"{ident} : lecture locale (Tesseract) impossible", e)
+        return None
+    debug(f"[{ident}] lecture locale : {len(lec.entrees)} entrées, {lec.textes_libres} textes libres, problèmes={lec.problemes}, {time.time() - t:.1f}s")
+    if lec.page_texte:
+        res = {**base, **vide, "statut": "ok", "avertissements": ["page de texte courant (sans entrée) : aucune requête envoyée"],
+               "duree": round(time.time() - t, 1), "entrees": []}
+        ecrire_atomique(chemin, json.dumps(res, ensure_ascii=False, indent=1))
+        return res
+    if lec.problemes:
+        log(f"  {ident} : mise en page non comprise ({lec.problemes[0]}{' …' if len(lec.problemes) > 1 else ''})", "WARN")
+        evenement("hybride_repli", chunk=ident, problemes=lec.problemes)
+        return None
+    feuille, texte, reperes = LH.construire_feuille(lec, net.convert("L"))
+    rep, dico, penser, derniere = None, {}, etat.penser, "?"
+    if feuille is not None:
+        tampon = io.BytesIO()
+        feuille.save(tampon, "PNG")
+        png = tampon.getvalue()
+        if cfg.sauver_images:                                    # la feuille réellement envoyée au modèle (pour juger la lisibilité de l'arabe)
+            os.makedirs(os.path.join(cfg.sortie, "images"), exist_ok=True)
+            with open(os.path.join(cfg.sortie, "images", ident + "_feuille.png"), "wb") as f:
+                f.write(png)
+        pas = min([x for x in (cfg.suivi, cfg.suivi_ui) if x] or [0])
+        for essai in range(1, cfg.essais + 1):
+            if etat.stop.is_set():
+                raise Interrompu()
+            temp = min(1.0, (cfg.temperature if cfg.temperature is not None else (0.6 if penser else 0.3)) + 0.15 * (essai - 1))
+            top_p = cfg.top_p if cfg.top_p is not None else (0.95 if penser else 0.8)
+            try:
+                rep = appeler_llm(cfg, etat.info, png, LH.PROMPT_FEUILLE, texte, temperature=temp, top_p=top_p,
+                                  max_tokens=min(etat.sortie_max, 500 + 70 * len(reperes)), penser=penser, budget=etat.budget(penser),
+                                  stop=etat.stop, suivi=_suivi(ident, etat, cfg), pas_suivi=pas)
+            except ErreurReflexion as e:
+                derniere = str(e)
+                etat.sans_parametre_reflexion()
+                penser = True
+                continue
+            except ErreurLLM as e:
+                derniere = str(e)
+                log(f"  {ident} feuille, essai {essai}/{cfg.essais} : {derniere}", "WARN")
+                continue
+            if rep["abandon"] == "interruption":
+                raise Interrompu()
+            _journaliser_essai(ident + "-feuille", essai, penser, temp, top_p, etat, rep, png)
+            if rep["erreur"]:
+                derniere = rep["erreur"]
+                try:
+                    _classer_http(400, rep["erreur"])
+                except ErreurReflexion:
+                    etat.sans_parametre_reflexion()
+                    penser = True
+                except ErreurLLM:
+                    pass
+                continue
+            dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
+            if len([k for k in reperes if k in dico]) >= max(1, len(reperes) // 2):
+                break
+            derniere = f"{rep['abandon'] or rep['finish']} : {len(dico)} lecture(s) exploitable(s) sur {len(reperes)}"
+            log(f"  {ident} feuille, essai {essai}/{cfg.essais} sans résultat : {derniere}", "WARN")
+            if not penser and rep["abandon"] == "budget_reflexion":
+                etat.coupure_ignoree()
+                penser = True
+            elif penser and rep["abandon"] in ("budget_reflexion", "boucle_reflexion") and etat.peut_couper:
+                penser = False
+            dico = {}
+        if not dico:
+            log(f"  {ident} : la feuille de recadrages n'a pas pu être lue ({derniere})", "WARN")
+            return None
+    brutes, avert = LH.appliquer_feuille(lec, reperes, dico)
+    entrees = normaliser_page({"entrees": brutes})
+    res = {**base, "statut": "ok", "avertissements": avert, "duree": round(time.time() - t, 1), "tokens": rep["tokens"] if rep else 0,
+           "tokens_reflexion": rep["tokens_reflexion"] if rep else 0, "tokens_entree": rep["tokens_entree"] if rep else 0,
+           "tps": round(rep["tps"], 1) if rep and rep["tps"] else None, "ttft": round(rep["ttft"], 1) if rep and rep["ttft"] else None,
+           "penser": penser, "entrees": entrees}
+    ecrire_atomique(chemin, json.dumps(res, ensure_ascii=False, indent=1))
+    return res
+
+
+def _traiter_dispatch(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
+    if etat.hybride and cfg.decoupe == 1:
+        res = _traiter_page_hybride(cfg, etat, page)
+        if res is not None:
+            return res
+        log(f"  {id_chunk(page, bande, cfg.decoupe)} : repli sur la lecture de la page entière par le modèle de vision", "WARN")
+    return _traiter_chunk(cfg, etat, page, bande)
+
+
 def traiter_chunk(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
     """Une page (ou demi-page) : enregistrement dans le registre d'activité, journal de l'issue, relance des exceptions."""
     ident = id_chunk(page, bande, cfg.decoupe)
     if etat.controle is not None:
         etat.controle.maj_actif(ident, page=page, debut=time.time(), tokens=0, tokens_reflexion=0, tps=0.0, prefill=0.0, elapsed=0.0)
     try:
-        res = _traiter_chunk(cfg, etat, page, bande)
-        evenement("page", chunk=ident, statut=res["statut"], entrees=len(res["entrees"]), duree=res["duree"], tokens=res["tokens"],
+        res = _traiter_dispatch(cfg, etat, page, bande)
+        evenement("page", chunk=ident, methode=res.get("methode", "vlm"), statut=res["statut"], entrees=len(res["entrees"]), duree=res["duree"], tokens=res["tokens"],
                   tokens_reflexion=res.get("tokens_reflexion"), tokens_entree=res.get("tokens_entree"), tps=res.get("tps"),
                   ttft=res.get("ttft"), blanche=bool(res.get("blanche")), penser=res.get("penser"))
         return res
@@ -2044,10 +2178,12 @@ def _run_pipeline(cfg: Config, controle: Controle | None = None):
         afficher_info(info, cfg)
         evenement("modele", **asdict(info))
         etat = Etat(cfg, info, controle)
+        etat.hybride = preparer_hybride(cfg)
         calibrer(cfg, etat, a_faire[0])
         evenement("calibrage", tokens_entree=etat.tokens_entree, sortie_max=etat.sortie_max, max_cote_auto=cfg.max_cote_auto,
                   paralleles=cfg.paralleles, penser=etat.penser, contexte=info.ctx)
-        log(f"mode : {'AVEC' if etat.penser else 'SANS'} réflexion ; sortie max {etat.sortie_max} jetons ; "
+        log(f"méthode : {'HYBRIDE (mise en page + Tesseract + feuille de recadrages)' if etat.hybride else 'modèle de vision seul'} ; "
+            f"mode : {'AVEC' if etat.penser else 'SANS'} réflexion ; sortie max {etat.sortie_max} jetons ; "
             f"{cfg.paralleles} requête(s) à la fois ; abandon si la réflexion dépasse {etat.budget(etat.penser)} jetons ou boucle.")
 
         def apres_page(n: int) -> None:
@@ -2381,7 +2517,7 @@ CONFIG_DEFAUT = os.environ.get("PRENOMS_CONFIG") or os.path.join(os.path.dirname
 CLES_CONFIG = ("pdf", "url", "modele", "api", "cle_api", "sortie", "pages", "debut", "fin", "paralleles", "decoupe", "nettoyage",
                "tokens_image", "max_cote", "reflexion", "budget_reflexion", "temperature", "top_p", "top_k", "repeat_penalty",
                "max_tokens", "timeout", "stall", "attente", "suivi", "essais", "export_tous", "corps_extra", "prompt_fichier",
-               "ancien", "log_niveau")
+               "ancien", "log_niveau", "methode", "tesseract", "tessdata", "tess_lang")
 
 
 def creer_parser() -> argparse.ArgumentParser:
@@ -2424,6 +2560,11 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--autotest", action="store_true", help="traite 4 pages et compare à la vérité terrain")
     ap.add_argument("--statut", action="store_true", help="état du cache (pages faites / à faire / périmées), sans LM Studio")
     ap.add_argument("--export", action="store_true", help="régénère CSV/JSON/Excel depuis le cache, sans LM Studio")
+    ap.add_argument("--methode", choices=("auto", "hybride", "vlm"), default="auto",
+                    help="auto = hybride (mise en page + Tesseract + feuille de recadrages) si Tesseract est installé, sinon modèle de vision seul")
+    ap.add_argument("--tesseract", default="", help="chemin de tesseract(.exe) (défaut : automatique)")
+    ap.add_argument("--tessdata", default="", help="dossier des modèles Tesseract, ex. tessdata_best (défaut : installation par défaut)")
+    ap.add_argument("--tess-lang", default="fra", help="langue de Tesseract (défaut fra)")
     ap.add_argument("--rapport", action="store_true", help="crée un zip de debug (logs récents, configuration sans secrets, résumé du cache, sorties brutes) à m'envoyer")
     ap.add_argument("--tui", action="store_true", help="ouvre l'interface plein écran (par défaut quand on lance le script sans argument)")
     ap.add_argument("--cli", action="store_true", help="ne pas ouvrir la TUI quand on lance le script sans argument : affiche l'aide")
@@ -2471,7 +2612,8 @@ def construire_cfg(a) -> Config:
                  top_k=int(a.top_k), repeat_penalty=float(a.repeat_penalty), max_tokens=int(a.max_tokens), timeout=int(a.timeout),
                  stall=int(a.stall), attente=int(a.attente), suivi=int(a.suivi), essais=max(1, int(a.essais)), refaire=bool(a.refaire),
                  sauver_images=bool(a.sauver_images), ancien=a.ancien, export_tous=int(a.export_tous), sans_llm=bool(a.export),
-                 cle_api=a.cle_api, log_niveau=a.log_niveau)
+                 cle_api=a.cle_api, log_niveau=a.log_niveau, methode=a.methode, tesseract=a.tesseract,
+                 tessdata=a.tessdata, tess_lang=a.tess_lang)
     if a.corps_extra:
         try:
             cfg.corps_extra = json.loads(a.corps_extra) if isinstance(a.corps_extra, str) else dict(a.corps_extra)

@@ -68,7 +68,7 @@ class TestTUI(unittest.IsolatedAsyncioTestCase):
         FauxLMStudio.reset()
         self.chemin_cfg = os.path.join(self.tmp, "cfg.json")
         base = X.valeurs_effectives(self.chemin_cfg)
-        base.update({"pdf": PDF, "url": self.url, "sortie": self.tmp, "pages": "55,150", "tokens_image": 0, "suivi": 0})
+        base.update({"pdf": PDF, "url": self.url, "sortie": self.tmp, "pages": "55,150", "tokens_image": 0, "suivi": 0, "methode": "vlm"})
         X.ecrire_config(self.chemin_cfg, base)
 
     def tearDown(self):

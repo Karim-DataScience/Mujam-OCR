@@ -19,6 +19,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import tempfile
 import threading
@@ -35,6 +36,8 @@ from PIL import Image
 os.environ["PRENOMS_CONFIG"] = os.path.join(tempfile.gettempdir(), "prenoms_config_tests_absent.json")
 
 import extraire_prenoms_llm as X
+import lecture_hybride as LH
+import mise_en_page as MP
 import verite_terrain as VT
 
 EXEMPLE_PROMPT = {"entrees": [
@@ -795,6 +798,105 @@ class TestControle(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- mise en page, lecture hybride
+
+class TestLectureHybrideUnitaires(unittest.TestCase):
+    def test_recoller_les_cesures(self):
+        L = LH.LigneOCR
+        self.assertEqual(LH.recoller([L("La tradition islami-", 90), L("que lui attribue", 90)]), "La tradition islamique lui attribue")
+        self.assertEqual(LH.recoller([L("de ‘Abd al-", 90), L("Qâdir al-Jîlânî", 90)]), "de ‘Abd al- Qâdir al-Jîlânî")      # majuscule : trait conservé
+        self.assertEqual(LH.recoller([L("* Nâḍil : qui l'emporte", 90)]), "Nâḍil : qui l'emporte")
+
+    def test_corrections_ocr(self):
+        self.assertEqual(LH.corriger_ocr_fr("Signifie : cadeau. 11 fut le don"), "Signifie : cadeau. Il fut le don")
+        self.assertEqual(LH.corriger_ocr_fr("Haybân : craint, respecté, vénéré. y )"), "Haybân : craint, respecté, vénéré.")
+        self.assertEqual(LH.corriger_ocr_fr("(Coran 19, 57)"), "(Coran 19, 57)")
+
+    def test_fusion_de_la_tete(self):
+        d, w = LH.fusionner_tete("Hawä' (Eve) : épouse d'Adam.", "Ḥawâ' (Ève)")
+        self.assertEqual((d, w), ("Ḥawâ' (Ève) : épouse d'Adam.", ""))
+        d, w = LH.fusionner_tete("Hawä' (Eve) : épouse d'Adam.", "Zubayr (Zubayr)")
+        self.assertTrue(d.startswith("Hawä'"))
+        self.assertIn("divergente", w)
+        self.assertEqual(LH.fusionner_tete("Sans tete", "Âdam"), ("Sans tete", ""))
+
+    def test_propagation_des_diacritiques_dans_le_corps(self):
+        self.assertEqual(LH.propager_diacritiques("Âdam (Adam) : père d'Adam et d'Ève."), "Âdam (Adam) : père d'Âdam et d'Ève.")
+        self.assertEqual(LH.propager_diacritiques("Karim : généreux."), "Karim : généreux.")
+
+    def test_lecture_de_la_reponse_du_modele(self):
+        self.assertEqual(LH.extraire_feuille_json('```json\n{"A1": "آدَم", "T1": "Âdam (Adam)"}\n```'), {"A1": "آدَم", "T1": "Âdam (Adam)"})
+        self.assertEqual(LH.extraire_feuille_json('<think>essai {"A1": "x"}</think>{"A1": "y"}'), {"A1": "y"})
+        self.assertEqual(LH.extraire_feuille_json('{"A1": "آدَم", "A2": "حَوَّ'), {"A1": "آدَم"})                           # tronquée
+        self.assertIsNone(LH.extraire_feuille_json("je ne sais pas"))
+
+    def test_tete_de_la_definition(self):
+        L = LH.LigneOCR
+        mots = [("Hawä'", 90, (10, 5, 80, 30)), ("(Eve)", 90, (90, 5, 150, 30)), (":", 90, (155, 5, 160, 30)), ("épouse", 90, (170, 5, 240, 30))]
+        self.assertEqual(LH.trouver_tete([L("Hawä' (Eve) : épouse", 90, mots)]), ("Hawä' (Eve)", (10, 5, 150, 30)))
+        mots2 = [("Darqâwî:", 90, (10, 5, 100, 30)), ("Ad-Darqâwî", 90, (110, 5, 200, 30))]
+        self.assertEqual(LH.trouver_tete([L("Darqâwî: Ad-Darqâwî", 90, mots2)])[0], "Darqâwî")
+        self.assertEqual(LH.trouver_tete([]), ("", None))
+
+
+@unittest.skipUnless(PDF, "PDF du livre introuvable (variable PDF_LIVRE)")
+class TestMiseEnPage(unittest.TestCase):
+    """Structure lue par traitement d'image sur de vraies pages (comptes vérifiés à l'œil sur les scans)."""
+
+    @staticmethod
+    def analyser(page):
+        return MP.analyser(X.nettoyer_page(X.image_native(PDF, page)))
+
+    def test_page_55_prophetes(self):
+        m = self.analyser(55)
+        self.assertEqual((len(m.entrees), m.problemes), (4, []))
+        self.assertEqual([[b.genre[0] for b in e.blocs] for e in m.entrees], [["M"], ["F"], ["M"], ["M"]])
+        self.assertEqual([len(e.blocs[0].orthographes) for e in m.entrees], [1, 1, 0, 0])               # Adame, Haoua empilés
+        self.assertTrue(all(b.arabe for e in m.entrees for b in e.blocs))
+
+    def test_page_150_couples_masculin_feminin(self):
+        m = self.analyser(150)
+        self.assertEqual((len(m.entrees), sum(len(e.blocs) for e in m.entrees), m.problemes), (8, 12, []))
+        self.assertEqual([len(e.blocs) for e in m.entrees], [2, 1, 2, 1, 1, 2, 1, 2])
+
+    def test_pages_100_300_107(self):
+        self.assertEqual(len(self.analyser(100).entrees), 8)
+        self.assertEqual(len(self.analyser(300).entrees), 8)
+        m = self.analyser(107)
+        self.assertEqual((len(m.entrees), m.problemes), (5, []))                                         # le filet de notes est ignoré
+
+    def test_page_de_suite_sans_legende(self):
+        m = self.analyser(66)
+        self.assertEqual((len(m.entrees), m.sans_legende, m.problemes), (7, True, []))      # 7 entrées visibles sur le scan
+
+    def test_pages_de_texte(self):
+        for p in (54, 62):
+            m = self.analyser(p)
+            self.assertTrue(m.page_texte, p)
+            self.assertEqual(m.entrees, [])
+
+
+def _tesseract_ok() -> bool:
+    LH.configurer()
+    return LH.disponible()[0]
+
+
+@unittest.skipUnless(PDF and _tesseract_ok(), "PDF ou Tesseract (avec la langue française) introuvable")
+class TestLecturePageHybride(unittest.TestCase):
+    def test_page_55(self):
+        net = X.nettoyer_page(X.image_native(PDF, 55))
+        page = LH.lire_page(net)
+        self.assertEqual(page.problemes, [])
+        noms = [[x.lower() for x in b.orthographes] for e in page.entrees for b in e.blocs]
+        self.assertEqual(noms, [["adam", "adame"], ["hawa", "haoua"], ["chisse"], ["idris"]])
+        self.assertIn("premier homme", page.entrees[0].description)
+        self.assertTrue(page.entrees[0].tete_texte.lower().startswith("adam"))
+        feuille, texte, reperes = LH.construire_feuille(page, net.convert("L"))
+        self.assertEqual(sorted(reperes), ["A1", "A2", "A3", "A4", "T1", "T2", "T3", "T4"])
+        self.assertIn("8 extraits à lire", texte)
+        self.assertLess(feuille.height, 1400)
+
+
 # ---------------------------------------------------------------- bout en bout avec un FAUX serveur LM Studio
 
 MODEL_ID = "prism-ml/ternary-bonsai-27b"
@@ -835,6 +937,7 @@ class FauxLMStudio(BaseHTTPRequestHandler):
         cls.tokens_texte = 900
         cls.chunked = True             # False : flux délimité par la fermeture de la connexion (HTTP/1.0)
         cls.jeton = ""                 # non vide : l'API exige « Authorization: Bearer <jeton> »
+        cls.feuille_invalide = False   # True : répond n'importe quoi à la feuille de recadrages
 
     def log_message(self, *a):
         pass
@@ -877,6 +980,29 @@ class FauxLMStudio(BaseHTTPRequestHandler):
             return self._json(200, {"data": [{"id": "text-embedding-nomic-embed-text-v1.5"}, {"id": MODEL_ID}]})
         self._json(404, {"error": {"message": "unknown"}})
 
+    ARABE = (("adam", "آدَم"), ("hawa", "حَوَّاء"), ("haoua", "حَوَّاء"), ("chisse", "شِيث"), ("idris", "إِدْرِيس"))
+    TETES = (("adam (", "Âdam (Adam)"), ("haw", "Ḥawâ' (Ève)"), ("sh", "Shîth (Seth)"), ("idr", "Idrîs (Enoch)"))
+
+    def _feuille(self, corps, natif):
+        """Si la requête est une feuille de recadrages (hybride), répond au JSON {« A1 »: arabe, « T1 »: tête} d'après les indices."""
+        if natif:
+            texte = " ".join(i.get("content", "") for i in corps.get("input") or [] if isinstance(i, dict) and i.get("type") == "text")
+        else:
+            texte = " ".join(p.get("text", "") for m in corps.get("messages") or [] if isinstance(m.get("content"), list)
+                             for p in m["content"] if p.get("type") == "text")
+        if "extraits à lire" not in texte:
+            return None
+        if FauxLMStudio.feuille_invalide:
+            return "je ne sais pas lire cette feuille"
+        rep = {}
+        for m in re.finditer(r"^(A\d+) : prénom « (.*?) »$", texte, re.M):
+            bas = m.group(2).lower()
+            rep[m.group(1)] = next((v for k, v in self.ARABE if k in bas), "")
+        for m in re.finditer(r"^(T\d+) : lecture automatique approximative « (.*?) »$", texte, re.M):
+            bas = m.group(2).lower()
+            rep[m.group(1)] = next((v for k, v in self.TETES if bas.startswith(k)), m.group(2))
+        return json.dumps(rep, ensure_ascii=False)
+
     @staticmethod
     def _png(corps, natif):
         if natif:
@@ -913,6 +1039,7 @@ class FauxLMStudio(BaseHTTPRequestHandler):
         if cle in c.erreurs:
             return self._json(500, {"error": {"message": "boom"}})
         entree = c.tokens_texte + (taille[0] * taille[1] // 1024 if taille else 0)
+        self.contenu_force = self._feuille(corps, natif)
         if not stream:
             stats = {"input_tokens": entree, "total_output_tokens": 1, "reasoning_output_tokens": 0,
                      "tokens_per_second": c.tps, "time_to_first_token_seconds": 0.5}
@@ -952,6 +1079,8 @@ class FauxLMStudio(BaseHTTPRequestHandler):
     def _stream(self, natif, corps, cle, mode, entree):
         c = FauxLMStudio
         contenu, raison = c.reponses.get(cle) or c.defaut or ('{"entrees": []}', "")
+        if self.contenu_force is not None:
+            contenu = self.contenu_force
         if natif:
             off = corps.get("reasoning") == "off"
         else:
@@ -1052,7 +1181,7 @@ class TestBoutEnBout(unittest.TestCase):
 
     # --- outils
     def lancer(self, *args, pdf=True):
-        base = ([PDF] if pdf else []) + ["--url", self.url, "--sortie", self.tmp, "--tokens-image", "0", "--suivi", "0"]
+        base = ([PDF] if pdf else []) + ["--url", self.url, "--sortie", self.tmp, "--tokens-image", "0", "--suivi", "0", "--methode", "vlm"]
         tampon = io.StringIO()
         try:
             with contextlib.redirect_stdout(tampon):
@@ -1381,7 +1510,7 @@ class TestBoutEnBout(unittest.TestCase):
         self.reponses_p55_p150()
         FauxLMStudio.sequence = ["lent", "lent"]
         ctrl = X.Controle()
-        cfg = X.Config(pdf=PDF, url=self.url, sortie=self.tmp, pages=[55, 150], tokens_image=0, suivi=0, suivi_ui=0.1)
+        cfg = X.Config(pdf=PDF, url=self.url, sortie=self.tmp, pages=[55, 150], tokens_image=0, suivi=0, suivi_ui=0.1, methode="vlm")
         instantanes = []
 
         def surveiller():
@@ -1405,7 +1534,7 @@ class TestBoutEnBout(unittest.TestCase):
     def test_arret_demande_par_le_controle(self):
         FauxLMStudio.sequence = ["silence_long"]
         ctrl = X.Controle()
-        cfg = X.Config(pdf=PDF, url=self.url, sortie=self.tmp, pages=[55], tokens_image=0, suivi=0, stall=30, essais=1)
+        cfg = X.Config(pdf=PDF, url=self.url, sortie=self.tmp, pages=[55], tokens_image=0, suivi=0, stall=30, essais=1, methode="vlm")
 
         def travail():
             X.run_pipeline(cfg, ctrl)
@@ -1432,6 +1561,68 @@ class TestBoutEnBout(unittest.TestCase):
         self.lancer("--diagnostic", "--pages", "150")
         self.assertIn("page 150", self.out)
         self.assertIn("préremplissage", self.out)
+
+    @unittest.skipUnless(_tesseract_ok(), "Tesseract (langue française) introuvable")
+    def test_hybride_une_seule_requete_par_page(self):
+        self.lancer("--pages", "55", "--methode", "hybride", "--sauver-images")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "images", "p055_feuille.png")))
+        gen = self.generations()
+        self.assertEqual(len(gen), 1)                                                   # une feuille, pas la page entière
+        self.assertEqual(gen[0]["corps"]["system_prompt"], LH.PROMPT_FEUILLE)
+        self.assertEqual([i["type"] for i in gen[0]["corps"]["input"]], ["image", "text"])
+        par = {r["prénom_fr"]: r for r in self.lire()}
+        self.assertEqual(sorted(k.lower() for k in par), ["adam", "adame", "chisse", "haoua", "hawa", "idris"])
+        self.assertEqual(par["Adame"]["prénom_arab_diacritiques"], "آدَم")              # une graphie empilée reprend l'arabe de son bloc
+        self.assertEqual(par["Haoua"]["prénom_arab_diacritiques"], "حَوَّاء")
+        self.assertEqual((par["Adam"]["genre"], par["Hawa"]["genre"], par["Idris"]["genre"]), ("MASCULIN", "FEMININ", "MASCULIN"))
+        self.assertTrue(par["Adam"]["description_en_français"].startswith("Âdam (Adam) : premier homme"))
+        self.assertTrue(par["Hawa"]["description_en_français"].startswith("Ḥawâ' (Ève) :"))
+        c = self.cache(55)
+        self.assertEqual(c["methode"], "hybride")
+        self.assertLess(c["tokens"], 400)
+        self.assertEqual(self.pages_sheet()[1][2], "ok")
+        self.assertIn("méthode : HYBRIDE", self.out)
+
+    @unittest.skipUnless(_tesseract_ok(), "Tesseract (langue française) introuvable")
+    def test_hybride_repli_si_la_feuille_est_illisible(self):
+        self.reponses_p55_p150()
+        FauxLMStudio.feuille_invalide = True
+        self.lancer("--pages", "55", "--methode", "hybride", "--essais", "2")
+        self.assertEqual(len(self.generations()), 3)                                    # 2 essais sur la feuille + la page entière
+        self.assertIn("repli sur la lecture de la page entière", self.out)
+        self.assertEqual(len(self.lire()), 6)
+        self.assertNotEqual(self.cache(55).get("methode"), "hybride")
+
+    @unittest.skipUnless(_tesseract_ok(), "Tesseract (langue française) introuvable")
+    def test_hybride_page_de_texte_sans_requete(self):
+        self.lancer("--pages", "62", "--methode", "hybride")
+        self.assertEqual(self.generations(), [])
+        self.assertEqual(self.lire(), [])
+        self.assertIn("texte courant", " ".join(self.cache(62)["avertissements"]))
+
+    def test_methode_hybride_sans_tesseract_est_fatale_et_auto_se_replie(self):
+        with mock.patch.object(LH, "disponible", return_value=(False, "Tesseract est introuvable")):
+            with self.assertRaises(SystemExit) as cm:
+                self.lancer("--pages", "55", "--methode", "hybride")
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("Tesseract est introuvable", self.out)
+            self.out = ""
+            self.reponses_p55_p150()
+            self.lancer("--pages", "55", "--methode", "auto")
+            self.assertIn("lecture par le modèle de vision seul", self.out)
+            self.assertEqual(len(self.lire()), 6)
+
+    def test_hybride_erreur_de_tesseract_repli_sur_le_modele(self):
+        self.reponses_p55_p150()
+        with mock.patch.object(LH, "disponible", return_value=(True, "Tesseract simulé")), \
+                mock.patch.object(LH, "lire_page", side_effect=RuntimeError("tesseract a planté")):
+            self.lancer("--pages", "55", "--methode", "hybride")
+        self.assertEqual(len(self.generations()), 1)                                    # la page entière, lue par le modèle
+        self.assertIn("repli sur la lecture de la page entière", self.out)
+        self.assertEqual(len(self.lire()), 6)
+        logs = glob.glob(os.path.join(self.tmp, "logs", "*.log"))
+        with open(logs[0], encoding="utf-8") as f:
+            self.assertIn("tesseract a planté", f.read())
 
     def test_flux_non_chunke_termine_par_la_fermeture(self):
         self.reponses_p55_p150()
@@ -1535,7 +1726,7 @@ class TestBoutEnBout(unittest.TestCase):
         self.assertEqual(len(FauxLMStudio.requetes), n)                    # LM Studio n'a pas été contacté
         tampon = io.StringIO()
         with contextlib.redirect_stdout(tampon):
-            X.main(["--statut", "--pages", "55,150,200", "--sortie", self.tmp, "--tokens-image", "0"])
+            X.main(["--statut", "--pages", "55,150,200", "--sortie", self.tmp, "--tokens-image", "0", "--methode", "vlm"])
         self.assertRegex(tampon.getvalue(), r"ok\s+:\s+2")
         self.assertRegex(tampon.getvalue(), r"à faire\s+:\s+1")
 
