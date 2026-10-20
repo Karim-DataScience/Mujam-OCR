@@ -50,6 +50,27 @@ def rep(content="", reasoning="", finish="stop"):
     return {"content": content, "reasoning": reasoning, "finish": finish, "tokens": 10}
 
 
+class TestTetePlausible(unittest.TestCase):
+    """v4.2.1 : le bruit d'OCR sur la « tête » ne doit plus provoquer de repli sur la page entière (journal du 20 oct. 2026)."""
+
+    def test_cas_du_journal(self):
+        for d in ["Nüûh (Noé) :'de l’hébreu : repos.", "Dhüûün-n-nûn :lhomnie au grand poisson ;", "# Shâfiq : compalissant.",
+                  "*Abd-Alâh : le serviteur de Dieu", "Al-*Arabi : l'Arabe par excellence.", "# Wäsil: qui umt;",
+                  "Al-Yasa® (Elisée) : prophète", "Shaymâ” : sœur de lait du Prophète.", "“Abd-Allâh : le serviteur de Dieu", "“Azîz : cher.", "Adam : premier homme."]:
+            self.assertTrue(LH.tete_plausible(d), d)
+
+    def test_vrai_texte_libre_reste_refuse(self):
+        for d in ["“ Mouhammad n'est le père d'aucun homme parmi vous ; mais il est l'envoyé de Dieu",
+                  "Peu avant sa mort, le Prophète (#) répéta par trois fois", "Les noms des prophètes que l'on trouve ici sont cités"]:
+            self.assertFalse(LH.tete_plausible(d), d)
+
+    def test_nettoyer_debut(self):
+        self.assertEqual(LH.nettoyer_debut("# Shâfiq : x"), "Shâfiq : x")
+        self.assertEqual(LH.nettoyer_debut("Al-*Arabi : x"), "Al-ʿArabi : x")
+        self.assertEqual(LH.nettoyer_debut("mot* : x"), "mot* : x")
+        self.assertEqual(LH.nettoyer_debut("“Azîz : cher"), "ʿAzîz : cher")
+
+
 class TestJSON(unittest.TestCase):
     def test_apres_think_et_bloc_markdown(self):
         vrai = {"entrees": [{"prenoms": [{"genre": "MASCULIN", "orthographes": ["Adam"], "arabe": "آدَم"}],

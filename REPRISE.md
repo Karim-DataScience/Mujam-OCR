@@ -1,4 +1,4 @@
-# REPRISE — Extraction du « Livre des prénoms arabes » (état au 14 oct. 2026, version 4.2.0)
+# REPRISE — Extraction du « Livre des prénoms arabes » (état au 20 oct. 2026, version 4.2.1)
 
 > À donner tel quel dans une nouvelle discussion, avec `extraction_prenoms_llm_v4_2.zip` (tout le code), le PDF du livre et, si tu en as,
 > le dernier **rapport de debug** (`python extraire_prenoms_llm.py --rapport`). Le bas du document contient un prompt prêt à coller.
@@ -93,3 +93,19 @@ Prochaine étape : <ex. « voici le rapport de debug de mon --autotest --methode
 Le bac à sable peut être réinitialisé : travaille depuis le zip, relance les tests (python test_extraire_prenoms_llm.py, python test_prenoms_tui.py)
 et re-livre un zip complet à la fin.
 ```
+
+## 8. Journal du 20 oct. 2026 (premier vrai run de la v4.2 sur la machine de l'utilisateur) — analyse et correctifs v4.2.1
+
+Constats (journal TUI `20261020_100209_tui`, p053-p071, bonsai-27b, Tesseract 5.5.3, sans réflexion) :
+- **Le moteur hybride fonctionne** : lecture locale 1-3 s/page, feuille de recadrages = 1 requête de 100-200 jetons (≈ 25 s/page) contre ≈ 70 s pour la page entière ; **17 tok/s** (contre ~8 avant).
+- **6 pages sur 18 sont retombées sur la page entière à tort** : le contrôle « la définition commence par Tête : » était trop strict face au bruit d'OCR (`Nüûh (Noé) :'de`, `Dhüûün-n-nûn :lhomnie`,
+  puce rouge lue `#`, ʿayn lu `*`, `Al-Yasa®`, `Shaymâ”`). Corrigé : `tete_plausible()` + `nettoyer_debut()` dans `lecture_hybride.py` (3 tests ajoutés). Rejoué sur p55-75 : 0 repli injustifié (21 pages).
+- p053 = page de titre de section (« 1. LES PROPHÈTES », avec transparence du verso) : la mise en page y voit de fausses entrées → repli → le modèle répond `[]` (correct) ; coût ≈ 10 s, sans conséquence.
+- **GPU** : le diagnostic a relevé contexte chargé 120 839, « Max Concurrent Predictions » 4, lot 512, VRAM 11,8/12,2 Go (presque pleine) → à corriger dans LM Studio (contexte 12288, parallèle 1, lot 1024) ;
+  préremplissage lent (≈ 140 jetons/s sur la feuille) = symptôme de VRAM saturée. Non encore appliqué au moment du run.
+- Le journal s'arrête à p071 (interrompu par l'utilisateur) : aucun export complet n'a été produit.
+
+Suite (même jour) : banc de lecture locale rejoué sur 240 des 286 pages (Tesseract 5.3) : 25 pages signalées (≈ 10 %, contre 6/18 = 33 % avant correctif) ; les restes sont surtout
+des pages d'ouverture de section avec citation « “ … » (repli normal, le modèle répond `[]`) et quelques têtes à formes multiples. Affinements : `tete_plausible` accepte `, ; /` et chiffres dans la tête,
+refuse un guillemet initial suivi d'une espace (citation) ; un `“`/`"` collé à une lettre = ʿayn mal lu (« “Abd » -> « ʿAbd »). Rejoué sur p56/60/61/66/67/71/73 : 0 repli. Tests : 132 (moteur) + 23 (TUI) OK.
+À faire côté utilisateur : recharger le modèle dans LM Studio (contexte 12288, parallèle 1, lot 1024), relancer `--autotest --methode hybride`, puis envoyer le `--rapport`.

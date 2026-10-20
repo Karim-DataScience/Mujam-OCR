@@ -143,7 +143,21 @@ class PageLue:
     mise: object = None
 
 
-MOTIF_TETE = re.compile(r"^[‘’'ʿʾA-Za-zÀ-ÿḥṣḍṭẓḤṢḌṬẒ\-\s/.]{2,70}?(\([^)]{1,70}\))?\s?:\s")
+MOTIF_TETE = re.compile(r"^(?![“\"«]\s)[‘’'ʿʾ*®©”“\"™°`´,;0-9A-Za-zÀ-ÿḥṣḍṭẓḤṢḌṬẒ\-\s/.]{2,70}?(\([^)]{1,70}\))?\s?:")
+_PARASITES_DEBUT = re.compile(r"^[\s#*•·|\[\]]+")      # puce rouge / guillemet lus comme du texte par Tesseract
+_ASTERISQUE_AYN = re.compile(r"(?<![A-Za-zÀ-ÿ])\*(?=[A-Za-zÀ-ÿ])")  # « *Abd », « Al-*Arabi » : le ʿayn est lu « * »
+
+
+def nettoyer_debut(description: str) -> str:
+    """Retire les parasites de début de définition (puce lue « # »…) et rétablit le ʿayn lu « * »."""
+    d = re.sub(r"^[\s#•·|]+", "", description)
+    d = re.sub(r"^[“”\"](?=[A-Za-zÀ-ÿ])", "ʿ", d)                 # « “Abd » : le ʿayn lu comme un guillemet
+    return _ASTERISQUE_AYN.sub("ʿ", d)
+
+
+def tete_plausible(description: str) -> bool:
+    """La définition commence-t-elle par « Tête : » ? Tolère le bruit d'OCR (puce, « : » collé au mot suivant, ʿayn lu « * »)."""
+    return bool(MOTIF_TETE.match(_PARASITES_DEBUT.sub("", description)))
 
 
 def trouver_tete(lignes: list[LigneOCR]):
@@ -180,14 +194,14 @@ def lire_page(net: Image.Image) -> PageLue:
         lu = EntreeLue(blocs, suite_page_precedente=e.suite_page_precedente)
         if e.definition:
             lignes = lire_definition(gris, *e.definition)
-            lu.description = corriger_ocr_fr(recoller(lignes))
+            lu.description = nettoyer_debut(corriger_ocr_fr(recoller(lignes)))
             lu.confiance = sum(l.conf for l in lignes) / len(lignes) if lignes else 0.0
             lu.tete_texte, lu.tete_box = trouver_tete(lignes) if not e.suite_page_precedente else ("", None)
         else:
             lu.description_incomplete = True
         entrees.append(lu)
     for i, e in enumerate(entrees, 1):
-        if e.description and not e.suite_page_precedente and not MOTIF_TETE.match(e.description):
+        if e.description and not e.suite_page_precedente and not tete_plausible(e.description):
             problemes.append(f"entrée {i} : la définition ne commence pas par « Tête : » (« {e.description[:40]} »)")
         for b in e.blocs:
             for n in b.orthographes:
