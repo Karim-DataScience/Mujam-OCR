@@ -215,7 +215,7 @@ def lire_page(net: Image.Image) -> PageLue:
 # ---------------------------------------------------------------- feuille de recadrages pour le modèle de vision
 
 PROMPT_FEUILLE = """Tu lis des extraits d'un livre de prénoms arabes. Chaque ligne de l'image porte un repère à gauche (A1, A2… = un mot arabe ; T1, T2… = un texte latin) suivi de l'extrait.
-- Repère A… : recopie le mot arabe avec TOUTES ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, tanwin, madda, hamza), sans les barres d'allongement (tatwil « ـ »). Ne complète rien : un signe absent de l'image reste absent. Illisible : "".
+- Repère A… : recopie le mot arabe avec TOUTES ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans les barres d'allongement (tatwil « ـ ») et SANS tanwin final (ً ٌ ٍ) : le mot est donné sous sa forme de dictionnaire. Ne complète rien : un signe absent de l'image reste absent. Illisible : "".
 - Repère T… : recopie exactement le texte latin avec ses accents (â î û ê é è), ses points souscrits (ḥ ṣ ḍ ṭ ẓ), ses apostrophes (ʿ ʾ ’ ‘), ses tirets et ses parenthèses. Une lecture automatique approximative est donnée : corrige-la d'après l'image.
 Réponds UNIQUEMENT par un objet JSON de la forme {"A1": "…", "T1": "…"}, sans texte autour."""
 
@@ -236,7 +236,11 @@ def construire_feuille(page: PageLue, gris: Image.Image):
             if b.arabe:
                 n_a += 1
                 reperes[f"A{n_a}"] = ("A", i, j)
-                lignes.append((f"A{n_a}", _recadrer(gris, *b.arabe, 12), 150, f"prénom « {' / '.join(b.orthographes)} »"))
+                indice = f"prénom « {' / '.join(b.orthographes)} »"
+                tete = re.sub(r"\([^)]*\)", "", e.tete_texte or "").strip()
+                if tete and len(tete) <= 40:
+                    indice += f", translittération approximative « {tete} » (aide pour les lettres de base ; l'image fait foi)"
+                lignes.append((f"A{n_a}", _recadrer(gris, *b.arabe, 12), 150, indice))
         if e.tete_box:
             n_t += 1
             reperes[f"T{n_t}"] = ("T", i, 0)

@@ -1,4 +1,4 @@
-# REPRISE — Extraction du « Livre des prénoms arabes » (état au 20 oct. 2026, version 4.2.1)
+# REPRISE — Extraction du « Livre des prénoms arabes » (état au 20 oct. 2026, version 4.3.0)
 
 > À donner tel quel dans une nouvelle discussion, avec `extraction_prenoms_llm_v4_2.zip` (tout le code), le PDF du livre et, si tu en as,
 > le dernier **rapport de debug** (`python extraire_prenoms_llm.py --rapport`). Le bas du document contient un prompt prêt à coller.
@@ -109,3 +109,15 @@ Suite (même jour) : banc de lecture locale rejoué sur 240 des 286 pages (Tesse
 des pages d'ouverture de section avec citation « “ … » (repli normal, le modèle répond `[]`) et quelques têtes à formes multiples. Affinements : `tete_plausible` accepte `, ; /` et chiffres dans la tête,
 refuse un guillemet initial suivi d'une espace (citation) ; un `“`/`"` collé à une lettre = ʿayn mal lu (« “Abd » -> « ʿAbd »). Rejoué sur p56/60/61/66/67/71/73 : 0 repli. Tests : 132 (moteur) + 23 (TUI) OK.
 À faire côté utilisateur : recharger le modèle dans LM Studio (contexte 12288, parallèle 1, lot 1024), relancer `--autotest --methode hybride`, puis envoyer le `--rapport`.
+
+## 9. v4.3.0 — vérification de l'arabe par la translittération (20 oct. 2026)
+
+Constat sur tes sorties : 4.2 = run **hybride** (154 p., 1 878 lignes ; orthographes empilées bien groupées, mais 402 lignes sans voyelle, 21 avec lettres latines/cyrilliques, erreurs de lettres, tanwins parasites) ;
+4.2.1 = run **modèle seul** (≈ 600 jetons/page, 10 p.) : orthographes empilées mal rattachées (genre FEMININ + arabe vide), lettres confondues (Yaqoub يَقُوب, Youssef يُسُوف…).
+Ajouts : `verif_arabe.py` — squelette attendu d'après la translittération de la tête (ambiguïtés admises : s=س/ص, t=ت/ط, d=د/ض, h=ه/ح, sh=ش ou س+ح, ʿ/’, article assimilé, variantes « Fâdil / Fâdila »),
+alignement pondéré avec le squelette lu, drapeau **`arabe_incoherent_translit`** (seuil 0,5) avec indice (« lu … ; attendu ≈ … »), retrait du **tanwin final** (hallucination du modèle), indice de translittération
+ajouté à chaque recadrage arabe de la feuille. Mesure sur les 1 116 lectures du run 4.2 évaluables : 24 % signalées ; l'échantillon relu à la main est en grande majorité de vraies erreurs
+(Mukhtâr→زُبَيْدَة, ʿImâd ad-Dîn→فَيْصَل, Manşûr→مَنسُور avec س au lieu de ص, Mundhir→مُنْدِر avec د au lieu de ذ…), quelques faux positifs (translittération du livre mal lue par Tesseract : « Ghivâth », « Mazâvà »).
+**Limites** : une confusion entre deux lettres admises par la table (ش lu pour س+ح) ou un و mal placé (Yúsuf→يُسُوف, coût 0,4) passe sous le seuil ; le drapeau ne corrige rien.
+**Pas encore fait (prochaine étape)** : relecture ciblée — renvoyer au modèle uniquement les recadrages signalés, avec « lecture précédente incohérente, attendu ≈ … », réflexion activée ; vote entre deux modèles (bonsai + gemma-4-12b-qat) ; test de gemma sur les 4 pages de vérité terrain.
+Tests : 137 (moteur) + 23 (TUI).

@@ -54,7 +54,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.2.1"
+VERSION = "4.3.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -1165,6 +1165,12 @@ FORMES_PRESENTATION = re.compile(r"[\uFB50-\uFDFF\uFE70-\uFEFF]")
 HARAKAT = "\u064B-\u065F\u0670"
 
 
+try:
+    import verif_arabe as VA
+except ImportError:                                   # module facultatif
+    VA = None
+
+
 def nettoyer_arabe(s) -> str:
     s = str(s or "")
     if FORMES_PRESENTATION.search(s):
@@ -1888,6 +1894,10 @@ LATIN_OK = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿŒœ'’ʿʾ‘`\- .]+$")
 INFO_FLAGS = {"arabe_sans_voyelles"}
 
 
+def translit_de(row: dict) -> str:
+    return row.get("translittération") or ""
+
+
 def drapeaux(row: dict, e: dict) -> list[str]:
     f = []
     ar, d, s = row["prénom_arab_diacritiques"], row["description_en_français"], row["prénom_fr"]
@@ -1898,6 +1908,10 @@ def drapeaux(row: dict, e: dict) -> list[str]:
             f.append("arabe_non_arabe")
         if not re.search(f"[{HARAKAT}]", ar):
             f.append("arabe_sans_voyelles")
+    if ar and VA is not None and translit_de(row):
+        ko, indice = VA.incoherent(translit_de(row), ar)
+        if ko:
+            f.append("arabe_incoherent_translit")
     if not d:
         f.append("description_vide")
     else:
@@ -1936,7 +1950,7 @@ def exploser(entrees: list[dict]) -> list[dict]:
             autre = " / ".join(s for j, x in enumerate(blocs) if j != i for s in x["orthographes"])
             for s in b["orthographes"]:
                 row = {"prénom_fr": s,
-                       "prénom_arab_diacritiques": b["arabe"],
+                       "prénom_arab_diacritiques": (VA.retirer_tanwin_final(b["arabe"]) if VA is not None else b["arabe"]),
                        "genre": b["genre"],
                        "description_en_français": e["description"],
                        "prénoms_équivalents": " / ".join(x for x in b["orthographes"] if x != s),

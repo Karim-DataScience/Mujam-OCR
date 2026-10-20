@@ -50,6 +50,45 @@ def rep(content="", reasoning="", finish="stop"):
     return {"content": content, "reasoning": reasoning, "finish": finish, "tokens": 10}
 
 
+class TestVerifArabe(unittest.TestCase):
+    """v4.3 : contrôle de l'arabe lu par le modèle à l'aide de la translittération de la tête."""
+
+    def test_lectures_correctes_non_signalees(self):
+        import verif_arabe as VA
+        for tr, ar in [("Ya'qūb", "يَعْقُوب"), ("Ayyûb", "أَيُّوب"), ("Yúsuf", "يُوسُف"), ("Lût", "لُوط"), ("Hud", "هود"), ("Sayyid / Sayyida", "سَيِّد"),
+                       ("Fâdil / Fâdila", "فَاضِلَة"), ("Sayf ad-Dîn", "سَيْف الدين"), ("Mishkât", "مَشْكَاة"), ("Âşım", "عَاصِم"), ("Ishâq", "إِسْحَاق")]:
+            self.assertFalse(VA.incoherent(tr, ar)[0], (tr, ar))
+
+    def test_lectures_fausses_signalees(self):
+        import verif_arabe as VA
+        for tr, ar in [("Ya'qūb", "يَقُوب"), ("Ayyûb", "أُوُوب"), ("Lût", "لوك"), ("Âdām", "آد"), ("Mukhtâr", "زُبَيْدَة")]:
+            ko, indice = VA.incoherent(tr, ar)
+            self.assertTrue(ko, (tr, ar))
+            self.assertIn("attendu", indice)
+
+    def test_non_evaluable(self):
+        import verif_arabe as VA
+        self.assertEqual(VA.coherence("", "يُوسُف")[0], -1.0)
+        self.assertEqual(VA.coherence("Yûsuf", "")[0], -1.0)
+
+    def test_tanwin_final_retire_seulement_en_fin_de_mot(self):
+        import verif_arabe as VA
+        self.assertEqual(VA.retirer_tanwin_final("يُوسُفٌ"), "يُوسُف")
+        self.assertEqual(VA.retirer_tanwin_final("مَدْيَانٍ / زُلَيْخَةً"), "مَدْيَان / زُلَيْخَة")
+        self.assertEqual(VA.retirer_tanwin_final("دُعَاءً"), "دُعَاء")
+        self.assertEqual(VA.retirer_tanwin_final("مُحَمَّد"), "مُحَمَّد")
+
+    def test_exploser_pose_le_drapeau_et_retire_le_tanwin(self):
+        e = {"id": 1, "page": 58, "description": "Ya'qūb (Jacob) : fils d'Ishâq, petit-fils d'Ibrâhîm.", "description_incomplete": False, "partiel": False,
+             "prenoms": [{"genre": "MASCULIN", "orthographes": ["Yaqoub"], "arabe": "يَقُوب"}]}
+        r = X.exploser([e])[0]
+        self.assertIn("arabe_incoherent_translit", r["à_vérifier"])
+        e["prenoms"][0]["arabe"] = "يَعْقُوبٌ"
+        r = X.exploser([e])[0]
+        self.assertNotIn("arabe_incoherent_translit", r["à_vérifier"])
+        self.assertEqual(r["prénom_arab_diacritiques"], "يَعْقُوب")
+
+
 class TestTetePlausible(unittest.TestCase):
     """v4.2.1 : le bruit d'OCR sur la « tête » ne doit plus provoquer de repli sur la page entière (journal du 20 oct. 2026)."""
 
