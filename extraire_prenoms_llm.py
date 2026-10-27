@@ -34,6 +34,7 @@ import hashlib
 import http.client
 import importlib.metadata
 import difflib
+import glob
 import io
 import json
 import os
@@ -55,7 +56,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.3.1"
+VERSION = "4.3.2"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -529,6 +530,24 @@ def arrondi_1024(n: int) -> int:
 
 def _norm_id(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def trouver_pdf(chemin: str) -> str:
+    """Le PDF donné n'existe pas (ex. « livre.pdf » alors que le fichier s'appelle lelivredesprenom0000geof.pdf) : on cherche un
+    PDF dans le dossier courant puis dans celui du script, en préférant un nom contenant « prenom » ou « livre »."""
+    if chemin and os.path.isfile(chemin):
+        return chemin
+    trouves: list = []
+    for dossier in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        for f in sorted(glob.glob(os.path.join(dossier, "*.pdf"))):
+            if f not in trouves:
+                trouves.append(f)
+    preferes = [f for f in trouves if re.search(r"prenom|livre", os.path.basename(f), re.I)]
+    choix = preferes if len(preferes) == 1 else trouves if len(trouves) == 1 else []
+    if choix:
+        log(f"PDF « {chemin or '(non précisé)'} » introuvable : utilisation de « {choix[0]} »", "WARN")
+        return choix[0]
+    return chemin
 
 
 def commande_lms(cle: str, ctx: int, parallel: int = 1) -> str:
@@ -2569,7 +2588,8 @@ def relire_arabe(cfg: Config) -> dict:
     ok, msg = LH.disponible()
     if not ok:
         raise ErreurFatale(f"--relire-arabe a besoin de Tesseract (mise en page) : {msg}")
-    stats = {"pages": 0, "cibles": 0, "corrigees": 0, "restantes": 0, "non_alignees": 0}
+    stats = {"pages": 0, "cibles": 0, "corrigees": 0, "restantes": 0, "non_alignees": 0, "requetes": 0, "jetons_reflexion": 0, "duree_s": 0.0}
+    t_debut = time.time()
     a_relire = []
     for p in cfg.pages:
         d, _ = lire_cache(cfg, p, 1, tolerer=True)
@@ -2641,6 +2661,8 @@ def relire_arabe(cfg: Config) -> dict:
             if rep["abandon"] == "interruption":
                 raise Interrompu()
             _journaliser_essai(ident + "-relecture", essai, True, temp, 0.95, etat, rep, tampon.getvalue())
+            stats["requetes"] += 1
+            stats["jetons_reflexion"] += int(rep.get("tokens_reflexion") or 0)
             dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
             for rp, (_k, i, j) in reperes.items():
                 v = VA.retirer_tanwin_final(nettoyer_arabe(dico.get(rp, "")))
@@ -2664,6 +2686,7 @@ def relire_arabe(cfg: Config) -> dict:
             ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
         evenement("relecture", chunk=ident, cibles=len(cibles), corrigees=len(journal), restantes=len(restant))
         log(f"  {ident} : {len(cibles)} suspect(s), {len(journal)} corrigé(s), {len(restant)} encore incohérent(s)")
+    stats["duree_s"] = round(time.time() - t_debut, 1)
     log(f"RELECTURE : {stats['corrigees']} mot(s) corrigé(s) sur {stats['cibles']} suspect(s) ; {stats['restantes']} restent signalés "
         f"« arabe_incoherent_translit » ; {stats['non_alignees']} non relu(s) (mise en page différente du cache).")
     return stats
@@ -2684,6 +2707,11 @@ def autotest(cfg: Config) -> None:
         log(f"   {k:14s} {v}")
     log("   Repère : 'vedettes' proche du total, 'parasites' 0, 'genre' et 'arabe_exact' élevés = bonne configuration.")
     faites = [p for p in infos if p["durée_s"]]
+    ecrire_atomique(os.path.join(cfg.sortie, "score.json"), json.dumps(
+        {"modele": cfg.modele, "methode": cfg.methode, "score": s, "pages": list(cfg.pages),
+         "duree_moy_s": round(sum(p["durée_s"] for p in faites) / len(faites), 1) if faites else None,
+         "tok_s_moy": next(iter([round(sum(v) / len(v), 1) for v in [[p["tok_s"] for p in faites if p["tok_s"] != ""]] if v]), None)},
+        ensure_ascii=False, indent=1))
     if faites:
         moy = sum(p["durée_s"] for p in faites) / len(faites)
         log(f"   durée moyenne : {moy:.0f} s par page -> ≈ {fmt_duree(moy * (DICT_END - DICT_START + 1) / max(1, cfg.paralleles))} "
@@ -2960,6 +2988,8 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv == ["--cli"]:
         ap.print_help()                                        # rien à faire : l'aide plutôt qu'une erreur d'usage
         return 0
+    if not (a.export or a.statut or a.diagnostic or a.rapport or a.ecrire_config):
+        a.pdf = trouver_pdf(a.pdf)
     try:
         cfg = construire_cfg(a)
     except (ValueError, OSError) as e:
@@ -2988,7 +3018,8 @@ def main(argv: list[str] | None = None) -> int:
             autotest(cfg)
             return 0
         if a.relire_arabe:
-            relire_arabe(cfg)
+            st_rel = relire_arabe(cfg)
+            ecrire_atomique(os.path.join(cfg.sortie, "relecture_stats.json"), json.dumps({"modele": cfg.modele, **st_rel}, ensure_ascii=False, indent=1))
             cfg.sans_llm = True                                # ré-export depuis le cache (relectures comprises)
         rows, infos, avert = run_pipeline(cfg)
         if cfg.fatal and not rows:

@@ -221,3 +221,17 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
   Exemple : `python extraire_prenoms_llm.py livre.pdf --relire-arabe --essais 3 --budget-reflexion 3000`. Nécessite Tesseract (mise en page) et un modèle chargé dans LM Studio.
 - **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
 - Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).
+
+## Comparer et combiner plusieurs modèles automatiquement (v4.3.2) : `comparer_modeles.py`
+
+Charge chaque modèle avec le bon contexte via la CLI `lms` de LM Studio (Settings > Developer > « Install the lms CLI »), lance les tâches, décharge, et écrit `comparaison/comparaison_modeles.md`.
+**Attention : chaque chargement est précédé de `lms unload --all`** (les modèles déjà chargés sont déchargés).
+
+```powershell
+# autotest (4 pages à vérité terrain) + relecture ciblée du cache existant, pour chaque modèle, puis chaîne (modèles enchaînés)
+python comparer_modeles.py lelivredesprenom0000geof.pdf --modeles "prism-ml/bonsai-27b,google/gemma-4-12b-qat,ornith-1.0-9b@8192" --cache sortie_llm --chainer
+# voir les commandes sans rien exécuter
+python comparer_modeles.py livre.pdf --simuler
+```
+Syntaxe d'un modèle : `nom[@contexte][#gpu]` (contexte par défaut 16384 ; gpu = `max`, `off` ou une fraction 0-1 pour un gros modèle partiellement déchargé sur la RAM).
+Le PDF est retrouvé automatiquement s'il est dans le dossier (même pour `extraire_prenoms_llm.py`). La relecture travaille sur une COPIE du cache : l'original n'est jamais modifié.

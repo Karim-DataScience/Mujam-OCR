@@ -132,3 +132,7 @@ Reste : bouton TUI pour `--relire-arabe` ; vote bonsai / gemma-4-12b-qat ; relec
 Tests : 142 (moteur) + 23 (TUI).
 
 Note de livraison : le premier zip « v4_3_0 » (sans `--relire-arabe`) et le second portaient le même nom ; la version **4.3.1** (zip `extraction_prenoms_llm_v4_3_1.zip`) contient `--relire-arabe` et `AUDIT.md`. Vérification : `python extraire_prenoms_llm.py --version` doit afficher 4.3.1.
+
+## 11. v4.3.2 — comparaison automatique de modèles (27 oct. 2026)
+`comparer_modeles.py` (charge/décharge via `lms`, autotest + relecture ciblée par modèle, chaîne, rapport md/json) ; `trouver_pdf` (le PDF du dossier est retrouvé si le nom donné n'existe pas — erreur rencontrée avec « livre.pdf ») ;
+l'autotest écrit `score.json`, la relecture `relecture_stats.json`. Tests : `test_comparer_modeles.py` (5) en plus de 142 + 23. Jamais testé sur un vrai LM Studio.
