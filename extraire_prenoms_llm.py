@@ -33,6 +33,7 @@ import csv
 import hashlib
 import http.client
 import importlib.metadata
+import difflib
 import io
 import json
 import os
@@ -54,7 +55,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.3.0"
+VERSION = "4.3.1"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -207,7 +208,7 @@ def infos_environnement() -> dict:
             paquets[nom] = None
     try:
         with open(os.path.abspath(__file__), "rb") as f:
-            sha = hashlib.sha1(f.read()).hexdigest()[:10]
+            sha = hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:10]
     except OSError:
         sha = ""
     try:
@@ -713,14 +714,29 @@ def resoudre_modele(cfg: Config) -> InfoModele:
 
 # ---------------------------------------------------------------- détection de boucle
 
+_NOM_JSON = re.compile(r'"orthographes"\s*:\s*\[\s*"([^"]{2,})"')
+
+
+def detecter_boucle_entrees(texte: str) -> bool:
+    """Vrai si un même prénom revient 3 fois dans la réponse JSON : jamais légitime sur une page, toujours une boucle
+    (p. 98 du run du 20 oct. 2026 : 6 noms répétés pendant 8 000 jetons / 550 s, 86 entrées fantômes)."""
+    comptes: dict = {}
+    for n in _NOM_JSON.findall(texte):
+        n = n.strip().lower()
+        comptes[n] = comptes.get(n, 0) + 1
+        if comptes[n] >= 3:
+            return True
+    return False
+
+
 def detecter_boucle(texte: str, prose: bool = False) -> bool:
     """Vrai si la fin du texte n'est plus qu'une répétition : un même bloc répété (≥ 120 caractères au total),
     ou, pour de la prose (réflexion), des suites de 4 mots massivement déjà vues."""
     if len(texte) < 400:
         return False
-    fin = texte[-3000:]
+    fin = texte[-9000:]
     m = len(fin)
-    for p in range(8, min(900, m // 3) + 1):
+    for p in range(8, min(3000, m // 3) + 1):               # un cycle de plusieurs entrées JSON fait 1 000-2 500 caractères
         reps = max(3, -(-120 // p))
         if m >= p * reps and fin.endswith(fin[-p:] * reps):
             return True
@@ -994,8 +1010,8 @@ def appeler_llm(cfg: Config, info: InfoModele, png: bytes | None, systeme: str |
                 else:
                     contenu.append(val)
                     n_rep += 1
-                    fin_rep = (fin_rep + val)[-4000:]
-                    if n_rep % 48 == 0 and detecter_boucle(fin_rep):
+                    fin_rep = (fin_rep + val)[-9000:]
+                    if n_rep % 48 == 0 and (detecter_boucle(fin_rep) or detecter_boucle_entrees(fin_rep)):
                         abandon = "boucle_reponse"
                 if not abandon and n_ref + n_rep > max_tokens + 200:
                     abandon = "longueur"
@@ -1277,7 +1293,19 @@ def normaliser_page(obj) -> list[dict]:
             brut = [obj] if "prenoms" in obj else []
     else:
         brut = []
-    return [n for n in (normaliser_entree(x) for x in brut) if n]
+    return dedoublonner([n for n in (normaliser_entree(x) for x in brut) if n])
+
+
+def dedoublonner(entrees: list[dict]) -> list[dict]:
+    """Retire les entrées strictement répétées sur une page (mêmes graphies, même début de définition) : artefact de boucle."""
+    vus, sortie = set(), []
+    for e in entrees:
+        cle = (tuple(o.lower() for b in e["prenoms"] for o in b["orthographes"]), re.sub(r"\W+", "", e["description"].lower())[:60])
+        if cle in vus:
+            continue
+        vus.add(cle)
+        sortie.append(e)
+    return sortie
 
 
 def est_exemple(entrees: list[dict]) -> bool:
@@ -1340,6 +1368,7 @@ class Etat:
         self.peut_couper = info.peut_couper_reflexion
         self.penser = cfg.reflexion == "oui" or (cfg.reflexion == "auto" and not self.peut_couper)
         self.coupures_ignorees = 0
+        self.attendus: dict = {}             # page -> nombre d'entrées vu par la mise en page (contrôle de complétude)
         self.hybride = False                 # lecture hybride (mise en page + Tesseract) disponible et demandée
 
     def budget(self, penser: bool) -> int:
@@ -1381,7 +1410,7 @@ def empreinte(cfg: Config) -> str:
     """Change dès que le résultat en cache ne serait plus celui que produirait cette configuration."""
     cle = json.dumps([cfg.prompt, TEXTE_UTILISATEUR, cfg.modele, cfg.decoupe, cfg.nettoyage, cfg.max_cote, cfg.tokens_image, cfg.methode],
                      ensure_ascii=False)
-    return hashlib.sha1(cle.encode("utf-8")).hexdigest()[:10]
+    return hashlib.sha1(cle.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
 
 
 def lire_cache(cfg: Config, page: int, bande: int, tolerer: bool = False):
@@ -1633,7 +1662,7 @@ def preparer_hybride(cfg: Config) -> bool:
     return False
 
 
-def _traiter_page_hybride(cfg: Config, etat: Etat, page: int) -> dict | None:
+def _traiter_page_hybride(cfg: Config, etat: Etat, page: int, local_seul: bool = False) -> dict | None:
     """Page entière : structure par traitement d'image, textes latins par Tesseract, arabe et têtes de définition lus par le
     modèle de vision sur UNE petite feuille de recadrages. Rend None pour demander le repli sur la lecture par le modèle seul."""
     import lecture_hybride as LH
@@ -1660,11 +1689,13 @@ def _traiter_page_hybride(cfg: Config, etat: Etat, page: int) -> dict | None:
                "duree": round(time.time() - t, 1), "entrees": []}
         ecrire_atomique(chemin, json.dumps(res, ensure_ascii=False, indent=1))
         return res
-    if lec.problemes:
+    if not lec.page_texte:
+        etat.attendus[page] = len(lec.entrees)
+    if lec.problemes and not local_seul:
         log(f"  {ident} : mise en page non comprise ({lec.problemes[0]}{' …' if len(lec.problemes) > 1 else ''})", "WARN")
         evenement("hybride_repli", chunk=ident, problemes=lec.problemes)
         return None
-    feuille, texte, reperes = LH.construire_feuille(lec, net.convert("L"))
+    feuille, texte, reperes = LH.construire_feuille(lec, net.convert("L")) if not local_seul else (None, "", {})
     rep, dico, penser, derniere = None, {}, etat.penser, "?"
     if feuille is not None:
         tampon = io.BytesIO()
@@ -1721,6 +1752,9 @@ def _traiter_page_hybride(cfg: Config, etat: Etat, page: int) -> dict | None:
             log(f"  {ident} : la feuille de recadrages n'a pas pu être lue ({derniere})", "WARN")
             return None
     brutes, avert = LH.appliquer_feuille(lec, reperes, dico)
+    if local_seul:
+        avert = [f"lecture locale seule : le modèle n'a rien rendu d'utilisable, arabe non lu ({len(lec.problemes)} problème(s) de mise en page)"] + avert
+        base = {**base, "methode": "local"}
     entrees = normaliser_page({"entrees": brutes})
     res = {**base, "statut": "ok", "avertissements": avert, "duree": round(time.time() - t, 1), "tokens": rep["tokens"] if rep else 0,
            "tokens_reflexion": rep["tokens_reflexion"] if rep else 0, "tokens_entree": rep["tokens_entree"] if rep else 0,
@@ -1736,7 +1770,21 @@ def _traiter_dispatch(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
         if res is not None:
             return res
         log(f"  {id_chunk(page, bande, cfg.decoupe)} : repli sur la lecture de la page entière par le modèle de vision", "WARN")
-    return _traiter_chunk(cfg, etat, page, bande)
+    res = _traiter_chunk(cfg, etat, page, bande)
+    attendu = etat.attendus.get(page) if etat.hybride and cfg.decoupe == 1 else None
+    if attendu:
+        n = len(res["entrees"])
+        if n == 0 or n > 2 * attendu + 2 or res.get("statut") == "partiel" and n > attendu + 3:
+            log(f"  p{page:03d} : le modèle rend {n} entrée(s) pour {attendu} vue(s) par la mise en page : lecture locale seule (arabe à relire)", "WARN")
+            evenement("rescue_local", page=page, rendues=n, attendues=attendu)
+            sauve = _traiter_page_hybride(cfg, etat, page, local_seul=True)
+            if sauve is not None and sauve["entrees"]:
+                return sauve
+        elif abs(n - attendu) >= 2:
+            res.setdefault("avertissements", []).append(f"écart avec la mise en page : {n} entrée(s) lue(s), {attendu} attendue(s)")
+            res["attendu"] = attendu
+            ecrire_atomique(chemin_cache(cfg, page, bande), json.dumps(res, ensure_ascii=False, indent=1))
+    return res
 
 
 def traiter_chunk(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
@@ -1869,7 +1917,10 @@ def assembler(resultats: dict, nb_bandes: int) -> tuple[list[dict], list[str]]:
         if prec is not None and idx != prec + 1:
             derniere = None                       # trou (page manquante) : on ne rattache rien à l'aveugle
         prec = idx
-        for raw in res["entrees"]:
+        brutes = dedoublonner(res["entrees"])                 # caches écrits avant la v4.3 : entrées fantômes d'une boucle
+        if len(brutes) < len(res["entrees"]):
+            avert.append(f"p.{page} : {len(res['entrees']) - len(brutes)} entrée(s) en double ignorée(s) (boucle du modèle)")
+        for raw in brutes:
             e = {"prenoms": raw["prenoms"], "description": raw["description"],
                  "description_incomplete": raw["description_incomplete"], "page": page,
                  "partiel": res.get("statut") == "partiel"}
@@ -2501,6 +2552,124 @@ def diagnostic(cfg: Config) -> None:
     log("  " + commande_lms(info.cle or cfg.modele, ctx_reco, cfg.paralleles))
 
 
+# ============================================================================
+# 11 bis) RELECTURE CIBLÉE DE L'ARABE (v4.3) : le modèle propose, le vérificateur tranche
+# ============================================================================
+
+def relire_arabe(cfg: Config) -> dict:
+    """Relit, AVEC réflexion, uniquement les mots arabes dont la lecture est incohérente avec la translittération de la tête.
+    Pour chaque page du cache : mise en page recalculée (CPU), feuille réduite aux recadrages suspects, indice « première lecture
+    incohérente ; lettres attendues ≈ … ». Une nouvelle lecture n'est ADOPTÉE que si le vérificateur (verif_arabe) la juge nettement
+    plus cohérente (gain ≥ 0,25) : sinon l'ancienne reste, drapeau compris. Les corrections sont écrites dans le cache de la page
+    (champ `relectures`), donc conservées par --export. -> statistiques."""
+    import lecture_hybride as LH
+    if VA is None:
+        raise ErreurFatale("verif_arabe.py introuvable : la relecture ciblée a besoin du vérificateur.")
+    LH.configurer(cfg.tesseract, cfg.tessdata, cfg.tess_lang)
+    ok, msg = LH.disponible()
+    if not ok:
+        raise ErreurFatale(f"--relire-arabe a besoin de Tesseract (mise en page) : {msg}")
+    stats = {"pages": 0, "cibles": 0, "corrigees": 0, "restantes": 0, "non_alignees": 0}
+    a_relire = []
+    for p in cfg.pages:
+        d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        if not d or d.get("blanche") or not d.get("entrees"):
+            continue
+        cibles = {}
+        for i, e in enumerate(d["entrees"]):
+            translit, _equiv = parse_description(e["description"])
+            if not translit:
+                continue
+            for j, b in enumerate(e["prenoms"]):
+                c, indice = VA.coherence(translit, b["arabe"]) if b["arabe"] else (9.0, f"aucune lecture ; translittération « {translit} »")
+                if c >= VA.SEUIL:
+                    cibles[(i, j)] = {"translit": translit, "avant": b["arabe"], "cout": c, "indice": indice}
+        if cibles:
+            a_relire.append((p, d, cibles))
+    log(f"relecture ciblée : {sum(len(c) for _, _, c in a_relire)} mot(s) arabe(s) incohérent(s) sur {len(a_relire)} page(s) du cache.")
+    if not a_relire:
+        return stats
+    info = resoudre_modele(cfg)
+    afficher_info(info, cfg)
+    etat = Etat(cfg, info, None)
+    budget = cfg.budget_reflexion or 3000
+    for p, d, cibles in a_relire:
+        if etat.stop.is_set():
+            break
+        ident = id_chunk(p, 1, 1)
+        net = nettoyer_page(image_native(cfg.pdf, p))
+        lec = LH.lire_page(net)
+        entrees = d["entrees"]
+        alignee = (not lec.page_texte and len(lec.entrees) == len(entrees)
+                   and all(len(le.blocs) == len(e["prenoms"]) for le, e in zip(lec.entrees, entrees, strict=True)))
+        if not alignee:
+            stats["non_alignees"] += len(cibles)
+            log(f"  {ident} : la mise en page ne correspond pas au cache ({len(lec.entrees)} vs {len(entrees)} entrées) : {len(cibles)} mot(s) laissé(s) tel(s) quel(s)", "WARN")
+            continue
+        # garde-fou : on ne relit un recadrage que si le prénom latin correspond bien à celui du cache
+        for (i, j) in list(cibles):
+            if not lec.entrees[i].blocs[j].arabe or difflib.SequenceMatcher(
+                    None, LH.sans_accents(" ".join(lec.entrees[i].blocs[j].orthographes)),
+                    LH.sans_accents(" ".join(entrees[i]["prenoms"][j]["orthographes"]))).ratio() < 0.7:
+                del cibles[(i, j)]
+                stats["non_alignees"] += 1
+        stats["pages"] += 1
+        stats["cibles"] += len(cibles)
+        restant = dict(cibles)
+        gris = net.convert("L")
+        journal = []
+        for essai in range(1, max(2, cfg.essais) + 1):
+            if not restant or etat.stop.is_set():
+                break
+            indices = {k: f"première lecture « {v['avant']} » jugée incohérente ; {v['indice']} (une lettre parmi celles entre crochets)"
+                       for k, v in restant.items()}
+            feuille, _txt, reperes = LH.construire_feuille(lec, gris, seulement=indices)
+            if feuille is None:
+                break
+            tampon = io.BytesIO()
+            feuille.save(tampon, "PNG")
+            temp = min(1.0, 0.6 + 0.15 * (essai - 1))
+            try:
+                rep = appeler_llm(cfg, info, tampon.getvalue(), LH.PROMPT_RELECTURE, "Relis ces mots arabes.", temperature=temp, top_p=0.95,
+                                  max_tokens=min(max(cfg.max_tokens, 1500), budget + 300 + 80 * len(reperes)), penser=True, budget=budget,
+                                  stop=etat.stop, suivi=None, pas_suivi=0)
+            except ErreurReflexion:
+                continue
+            except ErreurLLM as e:
+                log(f"  {ident} relecture, essai {essai} : {e}", "WARN")
+                continue
+            if rep["abandon"] == "interruption":
+                raise Interrompu()
+            _journaliser_essai(ident + "-relecture", essai, True, temp, 0.95, etat, rep, tampon.getvalue())
+            dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
+            for rp, (_k, i, j) in reperes.items():
+                v = VA.retirer_tanwin_final(nettoyer_arabe(dico.get(rp, "")))
+                if not v or (i, j) not in restant:
+                    continue
+                cible = restant[(i, j)]
+                cout, _ = VA.coherence(cible["translit"], v)
+                if cout >= 0 and cout <= cible["cout"] - 0.25:
+                    entrees[i]["prenoms"][j]["arabe"] = v
+                    journal.append({"entree": i + 1, "bloc": j + 1, "avant": cible["avant"], "apres": v, "cout_avant": cible["cout"],
+                                    "cout_apres": cout, "essai": essai, "jetons_reflexion": rep["tokens_reflexion"]})
+                    if cout < VA.SEUIL:
+                        del restant[(i, j)]
+                    else:
+                        restant[(i, j)] = {**cible, "avant": v, "cout": cout, "indice": VA.coherence(cible["translit"], v)[1]}
+        stats["corrigees"] += len(journal)
+        stats["restantes"] += len(restant)
+        if journal:
+            d.setdefault("relectures", []).extend(journal)
+            d.setdefault("avertissements", []).append(f"relecture ciblée : {len(journal)} mot(s) arabe(s) corrigé(s) ({len(restant)} encore incohérent(s))")
+            ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
+        evenement("relecture", chunk=ident, cibles=len(cibles), corrigees=len(journal), restantes=len(restant))
+        log(f"  {ident} : {len(cibles)} suspect(s), {len(journal)} corrigé(s), {len(restant)} encore incohérent(s)")
+    log(f"RELECTURE : {stats['corrigees']} mot(s) corrigé(s) sur {stats['cibles']} suspect(s) ; {stats['restantes']} restent signalés "
+        f"« arabe_incoherent_translit » ; {stats['non_alignees']} non relu(s) (mise en page différente du cache).")
+    return stats
+
+
+
 def autotest(cfg: Config) -> None:
     import verite_terrain as vt
     cfg.pages = list(vt.PAGES)
@@ -2571,6 +2740,8 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sauver-images", action="store_true", help="garde dans sortie/images les PNG envoyés au modèle")
     ap.add_argument("--ancien", default="", help="CSV de l'ancienne extraction OCR : produit comparaison_ancien.csv")
     ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
+    ap.add_argument("--relire-arabe", action="store_true", dest="relire_arabe",
+                    help="relit AVEC réflexion les seuls mots arabes incohérents avec la translittération (cache existant), puis ré-exporte")
     ap.add_argument("--autotest", action="store_true", help="traite 4 pages et compare à la vérité terrain")
     ap.add_argument("--statut", action="store_true", help="état du cache (pages faites / à faire / périmées), sans LM Studio")
     ap.add_argument("--export", action="store_true", help="régénère CSV/JSON/Excel depuis le cache, sans LM Studio")
@@ -2645,7 +2816,7 @@ def construire_cfg(a) -> Config:
 
 def cfg_pour_log(cfg: Config) -> dict:
     d = asdict(cfg)
-    d["prompt"] = f"sha1:{hashlib.sha1(cfg.prompt.encode('utf-8')).hexdigest()[:10]} ({len(cfg.prompt)} caractères)"
+    d["prompt"] = f"sha1:{hashlib.sha1(cfg.prompt.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]} ({len(cfg.prompt)} caractères)"
     d["cle_api"] = "***" if cfg.cle_api else ""
     d["pages"] = f"{len(cfg.pages)} pages ({cfg.pages[0]}-{cfg.pages[-1]})" if cfg.pages else "aucune"
     return d
@@ -2780,6 +2951,9 @@ def main(argv: list[str] | None = None) -> int:
     valides = {x.dest for x in ap._actions}
     ap.set_defaults(**{k: v for k, v in charger_config(chemin_cfg).items() if k in valides})
     a = ap.parse_args(argv)
+    repetees = sorted({o for o in argv if o.startswith("--") and "=" not in o and argv.count(o) > 1})
+    for o in repetees:
+        print(f"ATTENTION : l'option {o} est donnée plusieurs fois, seule la DERNIÈRE compte (argparse écrase en silence).", file=sys.stderr)
     installer_hooks()
     if a.tui or (not argv and not a.cli and _terminal_interactif()):
         return lancer_tui(chemin_cfg)
@@ -2797,7 +2971,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.rapport:
         log(f"rapport de debug : {creer_rapport(cfg, chemin_cfg)}")
         return 0
-    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "statut" if a.statut else "export" if a.export else "extraction"
+    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe else "statut" if a.statut else "export" if a.export else "extraction"
     JOURNAL.ouvrir(os.path.join(cfg.sortie, "logs"), mode, cfg.log_niveau)
     log(f"journal : {JOURNAL.chemin}")
     journaliser_demarrage(mode, argv, cfg)
@@ -2813,6 +2987,9 @@ def main(argv: list[str] | None = None) -> int:
         if a.autotest:
             autotest(cfg)
             return 0
+        if a.relire_arabe:
+            relire_arabe(cfg)
+            cfg.sans_llm = True                                # ré-export depuis le cache (relectures comprises)
         rows, infos, avert = run_pipeline(cfg)
         if cfg.fatal and not rows:
             sys.exit(2)                                        # rien à exporter

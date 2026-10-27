@@ -210,3 +210,14 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 - `verite_terrain.py` — pages 55, 56, 100, 150 lues à l'œil, utilisées par `--autotest`
 - `test_extraire_prenoms_llm.py`, `test_prenoms_tui.py` — tests, sans LM Studio ni GPU
 - `requirements.txt` — Pillow, NumPy, openpyxl, PyMuPDF, Textual
+
+
+## Vérification de l'arabe et relecture ciblée (v4.3)
+
+- **Contrôle automatique** : à l'export, l'arabe de chaque prénom est comparé à la translittération de la tête de définition (`verif_arabe.py`). Un écart net pose le drapeau
+  `arabe_incoherent_translit` dans `à_vérifier` (le champ ne corrige rien). Le tanwin final (يُوسُفٌ) est retiré : le livre donne la forme de dictionnaire.
+- **`--relire-arabe`** : après une extraction, relit AVEC réflexion les seuls mots arabes signalés (feuille réduite aux recadrages suspects + indice « lettres attendues ≈ … »).
+  Une nouvelle lecture n'est adoptée que si le vérificateur la juge nettement plus cohérente ; sinon l'ancienne et son drapeau restent. Les corrections sont écrites dans le cache (`relectures`) puis le CSV/Excel/JSON est ré-exporté.
+  Exemple : `python extraire_prenoms_llm.py livre.pdf --relire-arabe --essais 3 --budget-reflexion 3000`. Nécessite Tesseract (mise en page) et un modèle chargé dans LM Studio.
+- **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
+- Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).

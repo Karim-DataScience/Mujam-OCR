@@ -20,7 +20,7 @@ HARAKAT = r"\u064B-\u065F\u0670"
 def retirer_tanwin_final(ar: str) -> str:
     """Les entrées du livre sont données sous leur forme de dictionnaire : un tanwin en fin de mot est une hallucination du
     modèle (يُوسُفٌ, أَيُّوبٌ). On le retire (un tanwin interne ou une fatha finale restent)."""
-    return "/".join(re.sub(rf"[\u064B\u064C\u064D](?=[\u0651\u0652\u0670]*(?:\s|$))", "", p) for p in ar.split("/"))
+    return "/".join(re.sub(r"[\u064B\u064C\u064D](?=[\u0651\u0652\u0670]*(?:\s|$))", "", p) for p in ar.split("/"))
 
 
 # ----------------------------------------------------------------------------- squelette lu
@@ -60,7 +60,7 @@ def variantes(translit: str) -> list[str]:
     return [v.strip() for v in re.split(r"\s*[/,]\s*|\s+et\s+", t) if len(v.strip()) >= 2]
 
 
-def _unites(t: str, i: int, hors_premier: bool = False) -> list[list[Unite]]:
+def _unites(t: str, i: int) -> list[list[Unite]]:
     """Toutes les lectures possibles de la translittération (digraphes ambigus) -> listes d'unités."""
     if i >= len(t):
         return [[]]
@@ -76,10 +76,7 @@ def _unites(t: str, i: int, hors_premier: bool = False) -> list[list[Unite]]:
         v = base or {"é": "i", "è": "a", "ê": "a", "ë": "a"}.get(cl, cl)
         long = base is not None
         ens = {"a": "ا", "i": "ي", "u": "و", "o": "و", "e": "ا"}[v]
-        if long:
-            unite = (ens + ("ي" if v == "a" and False else ""), 0.4, "F")
-        else:
-            unite = (ens + "اوي", 0.0, "F")
+        unite = (ens, 0.4, "F") if long else (ens + "اوي", 0.0, "F")
         return [[unite] + r for r in suite(i + 1)]
     if cl == "y":
         return [[("ي", 0.6, "F")] + r for r in suite(i + 1)]
@@ -126,11 +123,11 @@ def squelettes_attendus(translit: str) -> list[list[Unite]]:
     res = _unites(t, 0)
     # fusion des consonnes doublées identiques (shadda)
     propres = []
-    for u in res[:12]:
-        if u and u[0][2] == "F" and not t.startswith("\u0002"):
-            u = [(u[0][0] + "ع", min(u[0][1], 0.4), "F")] + u[1:]           # initiale : أ ou ع
+    for lecture in res[:12]:
+        if lecture and lecture[0][2] == "F" and lecture[0][1] < 0.6 and not t.startswith("\u0002"):
+            lecture = [(lecture[0][0] + "ع", min(lecture[0][1], 0.4), "F")] + lecture[1:]   # initiale : أ ou ع
         out = []
-        for x in u:
+        for x in lecture:
             if out and x[2] in "SF" and out[-1][2] == x[2] and x[0] == out[-1][0] and (x[2] == "S" or x[0] in ("ي", "و")):
                 continue
             out.append(x)
@@ -188,7 +185,7 @@ def coherence(translit: str, arabe: str) -> tuple[float, str]:
     if meilleur is None:
         return -1.0, ""
     c, att, v, lu = meilleur
-    attendu_txt = "".join(u[0][0] if len(u[0]) == 1 or u[2] != "S" or True else u[0] for u in att)
+    attendu_txt = "".join(("" if (u[2] == "F" and u[1] == 0.0) else (u[0] if len(u[0]) == 1 else "[" + u[0] + "]")) for u in att)
     return round(c, 2), f"lu « {''.join(lu)} » ; attendu ≈ « {attendu_txt} » d'après « {v} »"
 
 

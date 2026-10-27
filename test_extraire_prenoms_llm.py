@@ -50,6 +50,89 @@ def rep(content="", reasoning="", finish="stop"):
     return {"content": content, "reasoning": reasoning, "finish": finish, "tokens": 10}
 
 
+class TestAuditV43(unittest.TestCase):
+    """Défauts trouvés à l'audit du 20 oct. 2026 : boucle non détectée (p. 98), doublons exportés, relecture ciblée."""
+
+    @staticmethod
+    def _ent(n):
+        return ('{"prenoms":[{"genre":"MASCULIN","orthographes":["%s"],"arabe":"عَبْد"}],'
+                '"description":"Abd al-X : le serviteur du Vivant et du Très-Compatissant, nom composé."},') % n
+
+    def test_boucle_de_plusieurs_entrees_detectee(self):
+        noms = ["Abdelhannane", "Abdelhaye", "Abdelmouhy", "Abdelkhaliq", "Abdelrahman", "Abderrahim"]
+        txt = '{"entrees":[' + "".join(self._ent(n) for n in noms * 3)
+        self.assertTrue(X.detecter_boucle(txt))
+        self.assertTrue(X.detecter_boucle_entrees(txt))
+        self.assertFalse(X.detecter_boucle_entrees('{"entrees":[' + "".join(self._ent(n) for n in noms * 2)))
+
+    def test_dedoublonnage(self):
+        noms = ["Abdelhannane", "Abdelhaye", "Abdelmouhy"]
+        brut = json.loads(("[" + "".join(self._ent(n) for n in noms * 4)).rstrip(",") + "]")
+        self.assertEqual(len(X.normaliser_page({"entrees": brut})), 3)
+
+    def test_relire_arabe_adopte_seulement_une_lecture_plus_coherente(self):
+        import lecture_hybride as LH
+        from PIL import Image
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = X.Config(pdf="faux.pdf", sortie=tmp, pages=[58], essais=2)
+        ent = lambda nom, ar, desc: {"prenoms": [{"genre": "MASCULIN", "orthographes": [nom], "arabe": ar}], "description": desc, "description_incomplete": False}
+        d = {"page": 58, "bande": 1, "decoupe": 1, "empreinte": X.empreinte(cfg), "statut": "ok", "avertissements": [], "entrees": [
+            ent("Yaqoub", "يَقُوب", "Ya'qūb (Jacob) : fils d'Ishâq, petit-fils d'Ibrâhîm."),
+            ent("Lout", "لُوط", "Lût (Loth) : prophète envoyé à Sodome et Gomorrhe."),
+            ent("Idriss", "إِدْرِيس", "Idrîs (Hénoch) : prophète cité dans le Coran, élevé au ciel.")]}
+        X.ecrire_atomique(X.chemin_cache(cfg, 58, 1), json.dumps(d, ensure_ascii=False))
+        blocs = lambda nom: [LH.BlocLu(genre="MASCULIN", orthographes=[nom], arabe=(0, 0, 10, 10))]
+        lec = LH.PageLue(entrees=[LH.EntreeLue(blocs=blocs(n)) for n in ("Yaqoub", "Lout", "Idriss")], problemes=[], page_texte=False)
+        appels = []
+
+        def faux_llm(cfg_, info, png, systeme, texte, **kw):
+            appels.append(kw.get("penser"))
+            # 1re tentative : une lecture toujours fausse ; 2e : la bonne
+            v = "يَقُوب" if len(appels) == 1 else "يَعْقُوبٌ"
+            return {"content": json.dumps({"A1": v}, ensure_ascii=False), "reasoning": "", "abandon": "", "finish": "stop", "tokens": 20,
+                    "tokens_reflexion": 150, "tokens_entree": 100, "tps": 30.0, "ttft": 0.2, "erreur": ""}
+
+        with mock.patch.object(X, "resoudre_modele", return_value=X.InfoModele(id="faux")), mock.patch.object(X, "afficher_info"), \
+                mock.patch.object(X, "image_native", return_value=Image.new("RGB", (50, 50), "white")), \
+                mock.patch.object(X, "nettoyer_page", side_effect=lambda im, *a, **k: im), mock.patch.object(LH, "lire_page", return_value=lec), \
+                mock.patch.object(LH, "disponible", return_value=(True, "ok")), mock.patch.object(X, "appeler_llm", side_effect=faux_llm), \
+                mock.patch.object(X, "_journaliser_essai"):
+            st = X.relire_arabe(cfg)
+        self.assertEqual(st["cibles"], 1)                     # seul Yaqoub était incohérent
+        self.assertEqual(st["corrigees"], 1)
+        self.assertEqual(len(appels), 2)                      # la 1re lecture (inchangée) est refusée, la 2e adoptée
+        self.assertTrue(all(appels))                          # réflexion activée
+        with open(X.chemin_cache(cfg, 58, 1), encoding="utf-8") as f:
+            apres = json.load(f)
+        self.assertEqual(apres["entrees"][0]["prenoms"][0]["arabe"], "يَعْقُوب")      # sans tanwin final
+        self.assertEqual(apres["entrees"][1]["prenoms"][0]["arabe"], "لُوط")          # intact
+        self.assertEqual(apres["relectures"][0]["avant"], "يَقُوب")
+    def test_modele_qui_ne_rend_rien_alors_que_la_mise_en_page_voit_des_entrees(self):
+        cfg = X.Config(pdf="faux.pdf", sortie=tempfile.mkdtemp(), pages=[81])
+        self.addCleanup(shutil.rmtree, cfg.sortie, True)
+        etat = X.Etat(cfg, X.InfoModele(id="faux"))
+        etat.hybride = True
+        etat.attendus[81] = 4
+        sauve = {"statut": "ok", "entrees": [{"prenoms": []}] * 4, "methode": "local"}
+        appels = []
+
+        def faux_hybride(c, e, page, local_seul=False):
+            appels.append(local_seul)
+            return sauve if local_seul else None
+
+        with mock.patch.object(X, "_traiter_page_hybride", side_effect=faux_hybride), \
+                mock.patch.object(X, "_traiter_chunk", return_value={"statut": "ok", "entrees": [], "avertissements": []}):
+            res = X._traiter_dispatch(cfg, etat, 81, 1)
+        self.assertIs(res, sauve)                           # les 4 entrées ne sont plus perdues
+        self.assertEqual(appels, [False, True])
+
+    def test_option_cli_relire_arabe(self):
+        a = X.creer_parser().parse_args(["livre.pdf", "--relire-arabe"])
+        self.assertTrue(a.relire_arabe)
+
+
+
 class TestVerifArabe(unittest.TestCase):
     """v4.3 : contrôle de l'arabe lu par le modèle à l'aide de la translittération de la tête."""
 

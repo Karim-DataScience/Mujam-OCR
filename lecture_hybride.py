@@ -227,21 +227,23 @@ def _police(taille: int):
         return ImageFont.load_default()
 
 
-def construire_feuille(page: PageLue, gris: Image.Image):
+def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None = None):
     """-> (image, texte pour l'utilisateur, {repère: (kind, entrée, bloc)}) ; (None, "", {}) s'il n'y a rien à relire."""
     lignes, reperes = [], {}
     n_a = n_t = 0
     for i, e in enumerate(page.entrees):
         for j, b in enumerate(e.blocs):
-            if b.arabe:
+            if b.arabe and (seulement is None or (i, j) in seulement):
                 n_a += 1
                 reperes[f"A{n_a}"] = ("A", i, j)
                 indice = f"prénom « {' / '.join(b.orthographes)} »"
+                if seulement is not None:
+                    indice = seulement[(i, j)]
                 tete = re.sub(r"\([^)]*\)", "", e.tete_texte or "").strip()
-                if tete and len(tete) <= 40:
+                if seulement is None and tete and len(tete) <= 40:
                     indice += f", translittération approximative « {tete} » (aide pour les lettres de base ; l'image fait foi)"
                 lignes.append((f"A{n_a}", _recadrer(gris, *b.arabe, 12), 150, indice))
-        if e.tete_box:
+        if e.tete_box and seulement is None:
             n_t += 1
             reperes[f"T{n_t}"] = ("T", i, 0)
             lignes.append((f"T{n_t}", _recadrer(gris, *e.tete_box, 8), 64, f"lecture automatique approximative « {e.tete_texte} »"))
@@ -353,3 +355,11 @@ def appliquer_feuille(page: PageLue, reperes: dict, reponse: dict) -> tuple[list
                                    for j, b in enumerate(e.blocs)],
                        "description": desc, "description_incomplete": bool(e.description_incomplete)})
     return sortie, avert
+
+
+PROMPT_RELECTURE = """Tu relis des mots arabes isolés, recadrés dans un dictionnaire de prénoms (une ligne = un repère A1, A2…).
+Pour chaque repère, une première lecture a été jugée INCOHÉRENTE avec la translittération latine du prénom : au moins une lettre est fausse, manquante ou en trop.
+Relis le mot sur l'image, lettre par lettre, de droite à gauche. La translittération aide pour les lettres de base (ʿ = ع, ḥ = ح, ṣ = ص, ḍ = ض, ṭ = ط, ẓ = ظ, dh = ذ, kh = خ, gh = غ, sh = ش, th = ث, q = ق, w = و, y = ي),
+mais l'IMAGE FAIT FOI : n'invente pas une lettre qu'on ne voit pas, ne « corrige » pas le mot d'après ce que tu connais du prénom.
+Recopie le mot avec toutes ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans tatwil et sans tanwin final.
+Réponds UNIQUEMENT par un objet JSON {"A1": "...", "A2": "..."} (un mot arabe par repère, "" si illisible), sans autre texte."""
