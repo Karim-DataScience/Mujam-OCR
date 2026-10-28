@@ -178,7 +178,7 @@ def tache_relecture(ex: Executeur, a, mdl: dict, cache_source: str, dossier_sort
     if not ex.simuler:
         shutil.copytree(cache_source, dossier_sortie, dirs_exist_ok=True, ignore=shutil.ignore_patterns("logs", "images", "*.tmp"))
     avant = taux_incoherent(dossier_sortie) if not ex.simuler else {}
-    opts = ["--relire-arabe", "--essais", str(a.essais), "--budget-reflexion", str(a.budget_reflexion)]
+    opts = ["--relire-arabe", "--essais", str(a.essais), "--budget-reflexion", str(a.budget_reflexion), "--reflexion", a.reflexion]
     if a.pages:
         opts += ["--pages", a.pages]
     t = time.time()
@@ -240,7 +240,7 @@ def comparer(a, ex: Executeur) -> dict:
                 if not ch["ok"]:
                     rapport["chaine"].append({"modele": mdl["nom"], "chargement": ch})
                     continue
-                opts = ["--relire-arabe", "--essais", str(a.essais), "--budget-reflexion", str(a.budget_reflexion)]
+                opts = ["--relire-arabe", "--essais", str(a.essais), "--budget-reflexion", str(a.budget_reflexion), "--reflexion", a.reflexion]
                 if a.pages:
                     opts += ["--pages", a.pages]
                 code, _ = ex.lancer(commande_moteur(a, mdl["nom"], dc, *opts), sortie_fichier=os.path.join(a.sortie, "chaine_" + nom_fichier(mdl["nom"]) + ".txt"))
@@ -315,6 +315,8 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--chainer", action="store_true", help="en plus : les modèles relisent le même cache à la suite (effet de la combinaison)")
     ap.add_argument("--pages", default="", help="restreindre la relecture à ces pages (ex. 55-120)")
     ap.add_argument("--essais", type=int, default=3)
+    ap.add_argument("--reflexion", choices=["non", "oui", "auto"], default="non",
+                    help="réflexion pendant la relecture : « non » par défaut (mesuré : avec réflexion le budget s'épuise sans réponse)")
     ap.add_argument("--budget-reflexion", type=int, default=3000, dest="budget_reflexion")
     ap.add_argument("--url", default="http://localhost:1234")
     ap.add_argument("--sortie", default="comparaison", help="dossier des résultats et du rapport")

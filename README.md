@@ -216,13 +216,13 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 
 - **Contrôle automatique** : à l'export, l'arabe de chaque prénom est comparé à la translittération de la tête de définition (`verif_arabe.py`). Un écart net pose le drapeau
   `arabe_incoherent_translit` dans `à_vérifier` (le champ ne corrige rien). Le tanwin final (يُوسُفٌ) est retiré : le livre donne la forme de dictionnaire.
-- **`--relire-arabe`** : après une extraction, relit AVEC réflexion les seuls mots arabes signalés (feuille réduite aux recadrages suspects + indice « lettres attendues ≈ … »).
+- **`--relire-arabe`** : après une extraction, relit les seuls mots arabes signalés (SANS réflexion par défaut : mesuré le 28 oct. 2026, la réflexion épuisait son budget sans répondre ; `--reflexion oui` pour la forcer) (feuille réduite aux recadrages suspects + indice « lettres attendues ≈ … »).
   Une nouvelle lecture n'est adoptée que si le vérificateur la juge nettement plus cohérente ; sinon l'ancienne et son drapeau restent. Les corrections sont écrites dans le cache (`relectures`) puis le CSV/Excel/JSON est ré-exporté.
   Exemple : `python extraire_prenoms_llm.py livre.pdf --relire-arabe --essais 3 --budget-reflexion 3000`. Nécessite Tesseract (mise en page) et un modèle chargé dans LM Studio.
 - **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
 - Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).
 
-## Comparer et combiner plusieurs modèles automatiquement (v4.3.2) : `comparer_modeles.py`
+## Comparer et combiner plusieurs modèles automatiquement (v4.3.3) : `comparer_modeles.py`
 
 Charge chaque modèle avec le bon contexte via la CLI `lms` de LM Studio (Settings > Developer > « Install the lms CLI »), lance les tâches, décharge, et écrit `comparaison/comparaison_modeles.md`.
 **Attention : chaque chargement est précédé de `lms unload --all`** (les modèles déjà chargés sont déchargés).
@@ -235,3 +235,12 @@ python comparer_modeles.py livre.pdf --simuler
 ```
 Syntaxe d'un modèle : `nom[@contexte][#gpu]` (contexte par défaut 16384 ; gpu = `max`, `off` ou une fraction 0-1 pour un gros modèle partiellement déchargé sur la RAM).
 Le PDF est retrouvé automatiquement s'il est dans le dossier (même pour `extraire_prenoms_llm.py`). La relecture travaille sur une COPIE du cache : l'original n'est jamais modifié.
+
+
+### Résultats mesurés le 28 oct. 2026 (autotest, 4 pages à vérité terrain, hybride, RTX 5070 Ti 12 Go)
+| Modèle | arabe exact | avec voyelles | vedettes | s/page |
+|---|---|---|---|---|
+| **google/gemma-4-12b-qat** | **22/22** | **35/35** | 35/35 | **7,9** |
+| prism-ml/bonsai-27b | 10/22 | 14/35 | 35/35 | 9,1 |
+| ornith-1.0-9b | 17/22 | 13/20 | 20/35 | 47,7 |
+Recommandation : extraire et relire avec gemma-4-12b-qat. Échantillon de 4 pages : à confirmer sur le livre entier (`python extraire_prenoms_llm.py PDF --methode hybride --modele google/gemma-4-12b-qat --sortie sortie_gemma`).

@@ -70,12 +70,12 @@ class TestAuditV43(unittest.TestCase):
         brut = json.loads(("[" + "".join(self._ent(n) for n in noms * 4)).rstrip(",") + "]")
         self.assertEqual(len(X.normaliser_page({"entrees": brut})), 3)
 
-    def test_relire_arabe_adopte_seulement_une_lecture_plus_coherente(self):
+    def _scenario_relecture(self, reflexion):
         import lecture_hybride as LH
         from PIL import Image
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        cfg = X.Config(pdf="faux.pdf", sortie=tmp, pages=[58], essais=2)
+        cfg = X.Config(pdf="faux.pdf", sortie=tmp, pages=[58], essais=2, reflexion=reflexion)
         ent = lambda nom, ar, desc: {"prenoms": [{"genre": "MASCULIN", "orthographes": [nom], "arabe": ar}], "description": desc, "description_incomplete": False}
         d = {"page": 58, "bande": 1, "decoupe": 1, "empreinte": X.empreinte(cfg), "statut": "ok", "avertissements": [], "entrees": [
             ent("Yaqoub", "يَقُوب", "Ya'qūb (Jacob) : fils d'Ishâq, petit-fils d'Ibrâhîm."),
@@ -102,12 +102,19 @@ class TestAuditV43(unittest.TestCase):
         self.assertEqual(st["cibles"], 1)                     # seul Yaqoub était incohérent
         self.assertEqual(st["corrigees"], 1)
         self.assertEqual(len(appels), 2)                      # la 1re lecture (inchangée) est refusée, la 2e adoptée
-        self.assertTrue(all(appels))                          # réflexion activée
         with open(X.chemin_cache(cfg, 58, 1), encoding="utf-8") as f:
             apres = json.load(f)
         self.assertEqual(apres["entrees"][0]["prenoms"][0]["arabe"], "يَعْقُوب")      # sans tanwin final
         self.assertEqual(apres["entrees"][1]["prenoms"][0]["arabe"], "لُوط")          # intact
         self.assertEqual(apres["relectures"][0]["avant"], "يَقُوب")
+        return appels
+
+    def test_relire_arabe_sans_reflexion_par_defaut(self):
+        """Mesuré : la réflexion épuisait son budget sans répondre (18/18) ; elle n'est active que sur demande."""
+        self.assertFalse(any(self._scenario_relecture("auto")))
+
+    def test_relire_arabe_avec_reflexion_sur_demande(self):
+        self.assertTrue(all(self._scenario_relecture("oui")))
     def test_modele_qui_ne_rend_rien_alors_que_la_mise_en_page_voit_des_entrees(self):
         cfg = X.Config(pdf="faux.pdf", sortie=tempfile.mkdtemp(), pages=[81])
         self.addCleanup(shutil.rmtree, cfg.sortie, True)

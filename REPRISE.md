@@ -136,3 +136,8 @@ Note de livraison : le premier zip « v4_3_0 » (sans `--relire-arabe`) et le se
 ## 11. v4.3.2 — comparaison automatique de modèles (27 oct. 2026)
 `comparer_modeles.py` (charge/décharge via `lms`, autotest + relecture ciblée par modèle, chaîne, rapport md/json) ; `trouver_pdf` (le PDF du dossier est retrouvé si le nom donné n'existe pas — erreur rencontrée avec « livre.pdf ») ;
 l'autotest écrit `score.json`, la relecture `relecture_stats.json`. Tests : `test_comparer_modeles.py` (5) en plus de 142 + 23. Jamais testé sur un vrai LM Studio.
+
+## 12. v4.3.3 — premiers résultats de comparaison (28 oct. 2026)
+Autotest (4 p.) : **gemma-4-12b-qat 22/22 arabe exact, 35/35 voyelles, 7,9 s/p** ; bonsai-27b 10/22, 14/35, 9,1 s/p ; ornith-1.0-9b 17/22 mais 20/35 vedettes et 47,7 s/p (structure ratée, lent).
+Relecture avec réflexion : **18 requêtes sur 18 (3 modèles) ont épuisé le budget de réflexion (1 500 jetons, en anglais, vérification lettre par lettre) sans rendre de réponse -> 0 correction.** Corrigé : relecture SANS réflexion par défaut
+(`--reflexion oui` pour la forcer), lectures refusées renvoyées en indice. Prochaine étape : extraction complète avec gemma-4-12b-qat (≈ 38 min estimées) puis `--relire-arabe --modele google/gemma-4-12b-qat`.

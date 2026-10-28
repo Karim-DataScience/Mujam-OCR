@@ -56,7 +56,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.3.2"
+VERSION = "4.3.3"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -2613,6 +2613,8 @@ def relire_arabe(cfg: Config) -> dict:
     afficher_info(info, cfg)
     etat = Etat(cfg, info, None)
     budget = cfg.budget_reflexion or 3000
+    penser = cfg.reflexion == "oui"          # MESURÉ le 28 oct. 2026 : avec réflexion, 18 requêtes sur 18 (3 modèles) épuisent le budget sans rendre
+    #                                          de réponse -> 0 correction. Sans réflexion, gemma-4-12b lit 22/22 mots de l'autotest. Réflexion = option.
     for p, d, cibles in a_relire:
         if etat.stop.is_set():
             break
@@ -2636,22 +2638,25 @@ def relire_arabe(cfg: Config) -> dict:
         stats["pages"] += 1
         stats["cibles"] += len(cibles)
         restant = dict(cibles)
+        refusees: dict = {}                                  # (i, j) -> lectures déjà proposées et rejetées par le vérificateur
         gris = net.convert("L")
         journal = []
         for essai in range(1, max(2, cfg.essais) + 1):
             if not restant or etat.stop.is_set():
                 break
             indices = {k: f"première lecture « {v['avant']} » jugée incohérente ; {v['indice']} (une lettre parmi celles entre crochets)"
+                          + (" ; lectures déjà essayées et refusées : " + ", ".join(f"« {x} »" for x in refusees[k]) if refusees.get(k) else "")
                        for k, v in restant.items()}
             feuille, _txt, reperes = LH.construire_feuille(lec, gris, seulement=indices)
             if feuille is None:
                 break
             tampon = io.BytesIO()
             feuille.save(tampon, "PNG")
-            temp = min(1.0, 0.6 + 0.15 * (essai - 1))
+            temp = min(1.0, 0.6 + 0.15 * (essai - 1)) if penser else min(1.0, 0.2 + 0.2 * (essai - 1))
+            max_tok = min(max(cfg.max_tokens, 1500), budget + 300 + 80 * len(reperes)) if penser else 200 + 90 * len(reperes)
             try:
                 rep = appeler_llm(cfg, info, tampon.getvalue(), LH.PROMPT_RELECTURE, "Relis ces mots arabes.", temperature=temp, top_p=0.95,
-                                  max_tokens=min(max(cfg.max_tokens, 1500), budget + 300 + 80 * len(reperes)), penser=True, budget=budget,
+                                  max_tokens=max_tok, penser=penser, budget=budget,
                                   stop=etat.stop, suivi=None, pas_suivi=0)
             except ErreurReflexion:
                 continue
@@ -2660,7 +2665,9 @@ def relire_arabe(cfg: Config) -> dict:
                 continue
             if rep["abandon"] == "interruption":
                 raise Interrompu()
-            _journaliser_essai(ident + "-relecture", essai, True, temp, 0.95, etat, rep, tampon.getvalue())
+            _journaliser_essai(ident + "-relecture", essai, penser, temp, 0.95, etat, rep, tampon.getvalue())
+            if rep["abandon"] == "budget_reflexion":
+                log(f"  {ident} relecture, essai {essai} : réflexion épuisée ({budget} jetons) sans réponse : augmente --budget-reflexion ou retire --reflexion oui", "WARN")
             stats["requetes"] += 1
             stats["jetons_reflexion"] += int(rep.get("tokens_reflexion") or 0)
             dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
@@ -2670,6 +2677,8 @@ def relire_arabe(cfg: Config) -> dict:
                     continue
                 cible = restant[(i, j)]
                 cout, _ = VA.coherence(cible["translit"], v)
+                if not (cout >= 0 and cout <= cible["cout"] - 0.25):
+                    refusees.setdefault((i, j), []).append(v)
                 if cout >= 0 and cout <= cible["cout"] - 0.25:
                     entrees[i]["prenoms"][j]["arabe"] = v
                     journal.append({"entree": i + 1, "bloc": j + 1, "avant": cible["avant"], "apres": v, "cout_avant": cible["cout"],
