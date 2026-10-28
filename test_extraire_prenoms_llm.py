@@ -115,7 +115,7 @@ class TestAuditV43(unittest.TestCase):
 
     def test_relire_arabe_avec_reflexion_sur_demande(self):
         self.assertTrue(all(self._scenario_relecture("oui")))
-    def test_modele_qui_ne_rend_rien_alors_que_la_mise_en_page_voit_des_entrees(self):
+    def _dispatch(self, rendu):
         cfg = X.Config(pdf="faux.pdf", sortie=tempfile.mkdtemp(), pages=[81])
         self.addCleanup(shutil.rmtree, cfg.sortie, True)
         etat = X.Etat(cfg, X.InfoModele(id="faux"))
@@ -128,11 +128,27 @@ class TestAuditV43(unittest.TestCase):
             appels.append(local_seul)
             return sauve if local_seul else None
 
-        with mock.patch.object(X, "_traiter_page_hybride", side_effect=faux_hybride), \
-                mock.patch.object(X, "_traiter_chunk", return_value={"statut": "ok", "entrees": [], "avertissements": []}):
-            res = X._traiter_dispatch(cfg, etat, 81, 1)
-        self.assertIs(res, sauve)                           # les 4 entrées ne sont plus perdues
-        self.assertEqual(appels, [False, True])
+        with mock.patch.object(X, "_traiter_page_hybride", side_effect=faux_hybride), mock.patch.object(X, "_traiter_chunk", return_value=rendu):
+            return X._traiter_dispatch(cfg, etat, 81, 1), sauve, appels
+
+    def test_reponse_vide_valide_sur_page_de_titre_est_acceptee(self):
+        """p. 53, 81, 111… : pages de titre de section (verso qui transparaît) : la mise en page y voit de FAUSSES entrées, le modèle a raison de répondre []."""
+        res, sauve, appels = self._dispatch({"statut": "ok", "entrees": [], "avertissements": []})
+        self.assertEqual(res["entrees"], [])
+        self.assertEqual(appels, [False])                   # aucune lecture locale
+
+    def test_echec_ou_emballement_du_modele_reprend_la_lecture_locale(self):
+        res, sauve, appels = self._dispatch({"statut": "erreur", "entrees": [], "avertissements": []})
+        self.assertIs(res, sauve)
+        res, sauve, appels = self._dispatch({"statut": "ok", "entrees": [{"prenoms": []}] * 40, "avertissements": []})
+        self.assertIs(res, sauve)
+
+    def test_cache_local_ancien_ignore_a_l_export(self):
+        res = {"statut": "ok", "methode": "local", "entrees": [{"prenoms": [{"genre": "MASCULIN", "orthographes": ["Fantome"], "arabe": ""}],
+                                                               "description": "Fantôme : ombre du verso.", "description_incomplete": False}]}
+        entrees, avert = X.assembler({(81, 1): res}, 1)
+        self.assertEqual(entrees, [])
+        self.assertTrue(any("fantôme" in a for a in avert))
 
     def test_option_cli_relire_arabe(self):
         a = X.creer_parser().parse_args(["livre.pdf", "--relire-arabe"])
@@ -146,7 +162,7 @@ class TestVerifArabe(unittest.TestCase):
     def test_lectures_correctes_non_signalees(self):
         import verif_arabe as VA
         for tr, ar in [("Ya'qūb", "يَعْقُوب"), ("Ayyûb", "أَيُّوب"), ("Yúsuf", "يُوسُف"), ("Lût", "لُوط"), ("Hud", "هود"), ("Sayyid / Sayyida", "سَيِّد"),
-                       ("Fâdil / Fâdila", "فَاضِلَة"), ("Sayf ad-Dîn", "سَيْف الدين"), ("Mishkât", "مَشْكَاة"), ("Âşım", "عَاصِم"), ("Ishâq", "إِسْحَاق")]:
+                       ("Fâdil / Fâdila", "فَاضِلَة"), ("Sayf ad-Dîn", "سَيْف الدين"), ("Rahmat-Allâh", "رَحْمَةُ اللهِ"), ("‘Abd al-Latîf", "عَبْدُ اللَّطِيفِ"), ("Marvam", "مَرْيَم"), ("Șâmid", "صَامِد"), ("Mishkât", "مَشْكَاة"), ("Âşım", "عَاصِم"), ("Ishâq", "إِسْحَاق")]:
             self.assertFalse(VA.incoherent(tr, ar)[0], (tr, ar))
 
     def test_lectures_fausses_signalees(self):

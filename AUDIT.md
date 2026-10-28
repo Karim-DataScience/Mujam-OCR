@@ -9,7 +9,7 @@ Non mesuré : couverture de tests chiffrée, TUI sous Windows, LM Studio réel (
 | # | Gravité | Constat (preuve) | Correctif v4.3 |
 |---|---|---|---|
 | A1 | **Haute** | **Page 98 : boucle non détectée** — le modèle a répété 6 noms pendant 8 000 jetons (550 s) et 86 « entrées » ont été exportées (7 attendues). Le détecteur ne voyait que des blocs exacts ≤ 900 caractères. | Fenêtre 9 000 car. / période ≤ 3 000 ; nouveau `detecter_boucle_entrees` (un même prénom 3 fois = boucle) ; `dedoublonner` à la lecture ET à l'export (80 doublons retirés de ton cache sur p.98, 7 ailleurs). |
-| A2 | **Haute** | **Entrées perdues en silence** : 6 pages « sans légende MASCULIN/FEMININ » (81, 111, 135, 163, 197, 221) sont revenues du repli avec 0 entrée (3-4 attendues chacune) et marquées `ok`. | Contrôle de complétude contre la mise en page (`etat.attendus`) ; modèle vide ou aberrant → **lecture locale seule** (arabe vide + drapeau) au lieu d'une perte ; écart ≥ 2 noté dans les avertissements. |
+| A2 | ~~Haute~~ **ERREUR D'AUDIT (corrigée le 28 oct.)** | ~~Entrées perdues en silence~~ : ces pages sont des **pages de titre de section** (verso qui transparaît) ; la mise en page y voit de fausses entrées et le modèle a RAISON de répondre `[]`. Le « rescue » ajouté en v4.3.0 y créait ~40 entrées fantômes (11 pages dans le run gemma). Ancien texte : 6 pages « sans légende MASCULIN/FEMININ » (81, 111, 135, 163, 197, 221) sont revenues du repli avec 0 entrée (3-4 attendues chacune) et marquées `ok`. | v4.3.4 : une réponse vide VALIDE est acceptée ; la lecture locale n'intervient que si le modèle ÉCHOUE ou s'emballe (> 2× + 2 entrées attendues) ; les caches locaux des v4.3.0-4.3.3 sont ignorés à l'export. |
 | A3 | Haute | **6 pages sur 18 en repli inutile** (page entière = 70 s au lieu de 25 s) : contrôle de « tête » trop strict face au bruit d'OCR. | `tete_plausible` tolérant (v4.2.1) ; 0 repli injustifié sur les pages du journal ; ≈ 10 % de pages signalées sur 240 pages (surtout des pages de citation, repli normal). |
 | A4 | Haute | **Arabe faux** : 24 % des lectures évaluables incohérentes avec la translittération (Mukhtâr→زُبَيْدَة, ʿImâd ad-Dîn→فَيْصَل, س pour ص, د pour ذ…) ; 437 lignes sans voyelle ; 19 avec lettres latines. | `verif_arabe` + drapeau `arabe_incoherent_translit` ; `--relire-arabe` (réflexion + arbitrage par le vérificateur). |
 | A5 | Moyenne | **Tanwins parasites** en fin de mot (يُوسُفٌ, أَيُّوبٌ). | Retrait à l'export + consigne du prompt. |
@@ -40,3 +40,7 @@ Non mesuré : couverture de tests chiffrée, TUI sous Windows, LM Studio réel (
 3. Corps français : passer Tesseract sur 2 modèles ou faire relire par le modèle les seuls mots hors lexique.
 4. Étendre la vérité terrain (10 pages) : 4 pages ne permettent pas de trancher hybride vs modèle seul (arabe exact 13/22 contre 15/22).
 5. Limite structurelle du vérificateur : il ne voit pas ش lu pour س+ح ni un و mal placé (coût 0,4 < seuil 0,5). Une 2ᵉ source (autre modèle) reste nécessaire pour ces cas.
+
+
+## E. Correctif d'audit du 28 oct. 2026
+L'audit initial avait conclu à tort (A2) que le modèle « perdait » des entrées sur 6-7 pages. Le run gemma l'a réfuté : 11 pages « locales » = toutes des pages de titre (53, 81, 111, 135, 163, 197, 221, 249, 279, 289, 329). Leçon : vérifier l'image avant de conclure à une perte. Corrigé en 4.3.4 (voir REPRISE §13).

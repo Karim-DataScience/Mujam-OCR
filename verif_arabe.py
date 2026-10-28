@@ -36,12 +36,12 @@ def squelette_lu(ar: str) -> list[str]:
 
 # ----------------------------------------------------------------------------- squelette attendu
 _ACCENTS_LONGS = {c: "a" for c in "âäāàáãÂÄĀ"} | {c: "u" for c in "ûüūúùÛÜŪ"} | {c: "i" for c in "îïīíìÎÏĪ"}
-_POINTS = {"Ħ": "ḥ", "Ĥ": "ḥ", "ħ": "ḥ", "ĥ": "ḥ", "Ḥ": "ḥ", "ş": "ṣ", "Ş": "ṣ", "Ṣ": "ṣ", "ḍ": "ḍ", "Ḍ": "ḍ", "ṭ": "ṭ", "Ṭ": "ṭ",
+_POINTS = {"Ș": "ṣ", "ș": "ṣ", "Ż": "ẓ", "ż": "ẓ", "Ħ": "ḥ", "Ĥ": "ḥ", "ħ": "ḥ", "ĥ": "ḥ", "Ḥ": "ḥ", "ş": "ṣ", "Ş": "ṣ", "Ṣ": "ṣ", "ḍ": "ḍ", "Ḍ": "ḍ", "ṭ": "ṭ", "Ṭ": "ṭ",
            "ẓ": "ẓ", "Ẓ": "ẓ", "ƶ": "ẓ", "ʿ": "ʿ", "‘": "ʿ", "`": "ʿ", "’": "’", "'": "’", "ʾ": "’"}
 CONS = {
     "b": "ب", "t": "تط", "ṭ": "ط", "j": "ج", "ḥ": "ح", "h": "هح", "d": "دض", "ḍ": "ض", "r": "ر", "z": "زظ", "ẓ": "ظ",
     "s": "سص", "ṣ": "ص", "f": "ف", "q": "ق", "k": "ك", "l": "ل", "m": "م", "n": "ن", "g": "غجقك", "p": "ب", "v": "ف",
-    "c": "كس", "x": "ك", "ʿ": "ع",
+    "c": "كس", "x": "ك", "ʿ": "ع", "š": "شص",
 }
 DIGRAPHES = {"sh": "ش", "kh": "خ", "dh": "ذظض", "gh": "غ", "th": "ث", "ch": "ش"}
 # unité = (ensemble de lettres admises, coût de suppression, nature) ; nature : S forte, F faible, O apostrophe
@@ -101,11 +101,15 @@ def _unites(t: str, i: int) -> list[list[Unite]]:
         return sorties
     if c == "\u0001":
         return suite(i + 1)
+    if c == "\u0003":                                              # الله
+        return [[("ا", 0.3, "F"), ("ل", 1.0, "S"), ("ل", 0.8, "S"), ("ه", 1.0, "S")] + r for r in suite(i + 1)]
+    if cl == "v":                                                  # « Marvam », « Havât » : y lu v par l'OCR
+        return [[("في", 0.8, "S")] + r for r in suite(i + 1)]
     if c == "\u0002":
         return [[("ا", 0.3, "F"), ("ل", 0.8, "S")] + r for r in suite(i + 1)]
     key = cm if cm in CONS else cl
-    if cl == "t" and all(ch in " -/" for ch in t[i + 1:]):
-        return [[("تطه", 1.0, "S")] + r for r in suite(i + 1)]       # « -t » final : parfois ة
+    if cl == "t" and (i + 1 >= len(t) or t[i + 1] in " -/"):
+        return [[("تطه", 1.0, "S")] + r for r in suite(i + 1)]       # « -t » final de mot (Rahmat-Allâh) : parfois ة
     if cl == "h" and cm not in CONS:
         key = "h"
     ens = CONS.get(key)
@@ -120,6 +124,7 @@ def squelettes_attendus(translit: str) -> list[list[Unite]]:
     # article « al-, an-, ar-, as-, ash-, ad-… »
     ART = r"(?:a[lnrsdtzşṣṭḍẓ]|ash|adh|ath)"
     t = re.sub(rf"(^|[\s\-‑–]){ART}[-‑–]", lambda m: m.group(1) + "\u0002", t, flags=re.I)        # article assimilé : ال
+    t = re.sub(r"(?<![A-Za-z])a[lhniI1]{1,3}[âaāàáä]h", "\u0003", t, flags=re.I)      # Allâh (et ses lectures OCR « AHâh », « ANHâh »)
     res = _unites(t, 0)
     # fusion des consonnes doublées identiques (shadda)
     propres = []
@@ -128,7 +133,7 @@ def squelettes_attendus(translit: str) -> list[list[Unite]]:
             lecture = [(lecture[0][0] + "ع", min(lecture[0][1], 0.4), "F")] + lecture[1:]   # initiale : أ ou ع
         out = []
         for x in lecture:
-            if out and x[2] in "SF" and out[-1][2] == x[2] and x[0] == out[-1][0] and (x[2] == "S" or x[0] in ("ي", "و")):
+            if out and x[2] in "SF" and out[-1][2] == x[2] and x[0] == out[-1][0] and x[1] != 0.8 and out[-1][1] != 0.8 and (x[2] == "S" or x[0] in ("ي", "و")):
                 continue
             out.append(x)
         if out and out[-1][2] == "F" and out[-1][0].startswith("ا") and t[-1:].lower() == "a" and t[-1:] not in _ACCENTS_LONGS:

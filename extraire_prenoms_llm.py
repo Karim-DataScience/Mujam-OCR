@@ -56,7 +56,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.3.3"
+VERSION = "4.3.4"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -1773,7 +1773,7 @@ def _traiter_page_hybride(cfg: Config, etat: Etat, page: int, local_seul: bool =
     brutes, avert = LH.appliquer_feuille(lec, reperes, dico)
     if local_seul:
         avert = [f"lecture locale seule : le modèle n'a rien rendu d'utilisable, arabe non lu ({len(lec.problemes)} problème(s) de mise en page)"] + avert
-        base = {**base, "methode": "local"}
+        base = {**base, "methode": "local", "raison": "rescue"}
     entrees = normaliser_page({"entrees": brutes})
     res = {**base, "statut": "ok", "avertissements": avert, "duree": round(time.time() - t, 1), "tokens": rep["tokens"] if rep else 0,
            "tokens_reflexion": rep["tokens_reflexion"] if rep else 0, "tokens_entree": rep["tokens_entree"] if rep else 0,
@@ -1793,7 +1793,11 @@ def _traiter_dispatch(cfg: Config, etat: Etat, page: int, bande: int) -> dict:
     attendu = etat.attendus.get(page) if etat.hybride and cfg.decoupe == 1 else None
     if attendu:
         n = len(res["entrees"])
-        if n == 0 or n > 2 * attendu + 2 or res.get("statut") == "partiel" and n > attendu + 3:
+        # NB : « le modèle répond [] » sur une page non blanche est une réponse VALIDE (pages de titre de section dont le verso transparaît :
+        # la mise en page y voit de fausses entrées, p. 53, 81, 111… ; le rescue de la v4.3.0 y fabriquait ~40 entrées fantômes). On ne
+        # reprend donc la lecture locale que si le modèle a ÉCHOUÉ (statut non « ok ») ou s'est emballé.
+        echec = n == 0 and res.get("statut") != "ok"
+        if echec or n > 2 * attendu + 2 or res.get("statut") == "partiel" and n > attendu + 3:
             log(f"  p{page:03d} : le modèle rend {n} entrée(s) pour {attendu} vue(s) par la mise en page : lecture locale seule (arabe à relire)", "WARN")
             evenement("rescue_local", page=page, rendues=n, attendues=attendu)
             sauve = _traiter_page_hybride(cfg, etat, page, local_seul=True)
@@ -1936,6 +1940,9 @@ def assembler(resultats: dict, nb_bandes: int) -> tuple[list[dict], list[str]]:
         if prec is not None and idx != prec + 1:
             derniere = None                       # trou (page manquante) : on ne rattache rien à l'aveugle
         prec = idx
+        if res.get("methode") == "local" and res.get("raison") != "rescue":      # lecture locale des v4.3.0-4.3.3 : pages de titre -> entrées fantômes
+            avert.append(f"p.{page} : lecture locale d'une version antérieure ignorée (page de titre de section probable, {len(res['entrees'])} entrée(s) fantôme(s))")
+            continue
         brutes = dedoublonner(res["entrees"])                 # caches écrits avant la v4.3 : entrées fantômes d'une boucle
         if len(brutes) < len(res["entrees"]):
             avert.append(f"p.{page} : {len(res['entrees']) - len(brutes)} entrée(s) en double ignorée(s) (boucle du modèle)")

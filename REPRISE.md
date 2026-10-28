@@ -141,3 +141,10 @@ l'autotest écrit `score.json`, la relecture `relecture_stats.json`. Tests : `te
 Autotest (4 p.) : **gemma-4-12b-qat 22/22 arabe exact, 35/35 voyelles, 7,9 s/p** ; bonsai-27b 10/22, 14/35, 9,1 s/p ; ornith-1.0-9b 17/22 mais 20/35 vedettes et 47,7 s/p (structure ratée, lent).
 Relecture avec réflexion : **18 requêtes sur 18 (3 modèles) ont épuisé le budget de réflexion (1 500 jetons, en anglais, vérification lettre par lettre) sans rendre de réponse -> 0 correction.** Corrigé : relecture SANS réflexion par défaut
 (`--reflexion oui` pour la forcer), lectures refusées renvoyées en indice. Prochaine étape : extraction complète avec gemma-4-12b-qat (≈ 38 min estimées) puis `--relire-arabe --modele google/gemma-4-12b-qat`.
+
+## 13. v4.3.4 — run complet gemma-4-12b-qat vs bonsai-27b (28 oct. 2026) et correction d'une erreur de ma part
+Run complet hybride (286 p., 271 pages d'entrées, ≈ 40 min) : **gemma 3 165 lignes, 4,0 % d'arabe incohérent avec la translittération, 108 sans voyelle, 15 sans arabe, 2 avec lettres latines** ;
+**bonsai 3 156 lignes, 25,8 % incohérent, 1 301 sans voyelle, 334 sans arabe, 21 latines**. ornith-1.0-9b arrêté p. 65 (lent, 15 % incohérent, structure ratée). -> **gemma-4-12b-qat est le lecteur à utiliser.**
+Erreur corrigée : les 11 pages « lecture locale » (53, 81, 111, 135, 163, 197, 221, 249, 279, 289, 329) sont des pages de TITRE de section ; mon « rescue » y fabriquait des entrées fantômes. Désormais réponse vide valide = acceptée ; caches locaux anciens ignorés à l'export.
+Vérificateur affiné (-Allâh, ʻt final de mot = ة, y lu v par l'OCR, ș/š/ż, double lam de l'article) : faux positifs retirés (gemma 7,5 % -> 4,0 %). Les incohérences restantes sont surtout des TÊTES mal lues (Gjhâin, Wabhîd, Safivv-AÏlâh) et quelques vraies erreurs (Ghivâth→غِيَاص).
+Reste : relecture des ≈ 119 mots signalés avec gemma (sans réflexion) ; relecture des têtes par le modèle ; corps français ; 26 pages en repli page entière (≈ 9 %).
