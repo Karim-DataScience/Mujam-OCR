@@ -76,7 +76,8 @@ def _unites(t: str, i: int) -> list[list[Unite]]:
         v = base or {"é": "i", "è": "a", "ê": "a", "ë": "a"}.get(cl, cl)
         long = base is not None
         ens = {"a": "ا", "i": "ي", "u": "و", "o": "و", "e": "ا"}[v]
-        unite = (ens, 0.4, "F") if long else (ens + "اوي", 0.0, "F")
+        # â long : l'alef est souvent non écrit (alef suscrit : طه, الله, هذا) -> suppression peu coûteuse ; û / î toujours écrits
+        unite = (ens, 0.2 if v == "a" else 0.4, "F") if long else (ens + "اوي", 0.0, "F")
         return [[unite] + r for r in suite(i + 1)]
     if cl == "y":
         return [[("ي", 0.6, "F")] + r for r in suite(i + 1)]

@@ -214,6 +214,12 @@ def lire_page(net: Image.Image) -> PageLue:
 
 # ---------------------------------------------------------------- feuille de recadrages pour le modèle de vision
 
+try:
+    import verif_arabe as VA
+except ImportError:                                  # module facultatif
+    VA = None
+
+
 PROMPT_FEUILLE = """Tu lis des extraits d'un livre de prénoms arabes. Chaque ligne de l'image porte un repère à gauche (A1, A2… = un mot arabe ; T1, T2… = un texte latin) suivi de l'extrait.
 - Repère A… : recopie le mot arabe avec TOUTES ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans les barres d'allongement (tatwil « ـ ») et SANS tanwin final (ً ٌ ٍ) : le mot est donné sous sa forme de dictionnaire. Ne complète rien : un signe absent de l'image reste absent. Illisible : "".
 - Repère T… : recopie exactement le texte latin avec ses accents (â î û ê é è), ses points souscrits (ḥ ṣ ḍ ṭ ẓ), ses apostrophes (ʿ ʾ ’ ‘), ses tirets et ses parenthèses. Une lecture automatique approximative est donnée : corrige-la d'après l'image.
@@ -227,13 +233,13 @@ def _police(taille: int):
         return ImageFont.load_default()
 
 
-def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None = None):
+def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None = None, seulement_tetes: dict | None = None):
     """-> (image, texte pour l'utilisateur, {repère: (kind, entrée, bloc)}) ; (None, "", {}) s'il n'y a rien à relire."""
     lignes, reperes = [], {}
     n_a = n_t = 0
     for i, e in enumerate(page.entrees):
         for j, b in enumerate(e.blocs):
-            if b.arabe and (seulement is None or (i, j) in seulement):
+            if b.arabe and seulement_tetes is None and (seulement is None or (i, j) in seulement):
                 n_a += 1
                 reperes[f"A{n_a}"] = ("A", i, j)
                 indice = f"prénom « {' / '.join(b.orthographes)} »"
@@ -243,7 +249,7 @@ def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None 
                 if seulement is None and tete and len(tete) <= 40:
                     indice += f", translittération approximative « {tete} » (aide pour les lettres de base ; l'image fait foi)"
                 lignes.append((f"A{n_a}", _recadrer(gris, *b.arabe, 12), 150, indice))
-        if e.tete_box and seulement is None:
+        if e.tete_box and seulement is None and (seulement_tetes is None or i in seulement_tetes):
             n_t += 1
             reperes[f"T{n_t}"] = ("T", i, 0)
             lignes.append((f"T{n_t}", _recadrer(gris, *e.tete_box, 8), 64, f"lecture automatique approximative « {e.tete_texte} »"))
@@ -303,7 +309,14 @@ def sans_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
 
 
-def fusionner_tete(description: str, tete_vision: str) -> tuple[str, str]:
+def cout_tete(tete: str, arabes) -> float:
+    """Pire incohérence (verif_arabe) entre une tête latine et les mots arabes de l'entrée ; -1 si non évaluable."""
+    couts = [VA.coherence(tete, a)[0] for a in arabes if a] if VA is not None else []
+    couts = [c for c in couts if c >= 0]
+    return max(couts) if couts else -1.0
+
+
+def fusionner_tete(description: str, tete_vision: str, arabes=()) -> tuple[str, str]:
     """Remplace la tête (avant « : ») lue par Tesseract par celle du modèle de vision si les lettres de base concordent
     (le modèle ne fait que restituer accents et points souscrits que Tesseract perd). -> (description, avertissement)."""
     m = re.match(r"^(.*?)\s*:\s+(.*)$", description)
@@ -313,6 +326,11 @@ def fusionner_tete(description: str, tete_vision: str) -> tuple[str, str]:
     a, b = sans_accents(m.group(1)), sans_accents(tete_vision)
     if difflib.SequenceMatcher(None, a, b).ratio() >= 0.8:
         return f"{tete_vision} : {m.group(2)}", ""
+    # Les lettres de base divergent : ARBITRAGE par l'arabe lu (« Khalil-ATâR » lu par Tesseract pour « Khalîl-Allâh »)
+    if arabes and VA is not None:
+        ancien, nouveau = cout_tete(m.group(1), arabes), cout_tete(tete_vision, arabes)
+        if nouveau >= 0 and nouveau < VA.SEUIL and (ancien < 0 or nouveau <= ancien - 0.5):
+            return f"{tete_vision} : {m.group(2)}", f"tête du modèle adoptée (cohérente avec l'arabe : coût {nouveau:g} contre {ancien:g} pour Tesseract « {m.group(1)} »)"
     return description, f"tête divergente (Tesseract « {m.group(1)} » ≠ modèle « {tete_vision} ») : lecture Tesseract conservée"
 
 
@@ -345,7 +363,7 @@ def appliquer_feuille(page: PageLue, reperes: dict, reponse: dict) -> tuple[list
     for i, e in enumerate(page.entrees):
         desc = e.description
         if e.tete_box and e.tete_texte:
-            desc, w = fusionner_tete(desc, tetes.get(i, ""))
+            desc, w = fusionner_tete(desc, tetes.get(i, ""), [arabes.get((i, j), "") for j in range(len(e.blocs))])
             if w:
                 avert.append(f"entrée {i + 1} : {w}")
             desc = propager_diacritiques(desc)
@@ -363,3 +381,9 @@ Relis le mot sur l'image, lettre par lettre, de droite à gauche. La translitté
 mais l'IMAGE FAIT FOI : n'invente pas une lettre qu'on ne voit pas, ne « corrige » pas le mot d'après ce que tu connais du prénom.
 Recopie le mot avec toutes ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans tatwil et sans tanwin final.
 Réponds UNIQUEMENT par un objet JSON {"A1": "...", "A2": "..."} (un mot arabe par repère, "" si illisible), sans autre texte."""
+
+
+PROMPT_TETES = """Tu relis des textes latins isolés, recadrés dans un dictionnaire de prénoms arabes : chaque ligne (repère T1, T2…) est le début d'une définition, de la forme « Prénom (équivalent étranger) : ».
+Recopie le texte EXACTEMENT comme il est imprimé, avec ses accents longs (â î û ā ī ū), ses points souscrits (ḥ ṣ ḍ ṭ ẓ), ses apostrophes (ʿ ʾ ’ ‘), ses tirets et ses parenthèses. N'ajoute rien, ne corrige pas l'orthographe,
+n'invente pas une lettre qu'on ne voit pas : une lecture automatique approximative (souvent fausse sur les lettres) est donnée seulement comme repère.
+Ne recopie PAS les « : » finaux ni le début de la définition. Réponds UNIQUEMENT par un objet JSON {"T1": "...", "T2": "..."}, sans autre texte."""

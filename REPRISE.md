@@ -148,3 +148,9 @@ Run complet hybride (286 p., 271 pages d'entrées, ≈ 40 min) : **gemma 3 165 l
 Erreur corrigée : les 11 pages « lecture locale » (53, 81, 111, 135, 163, 197, 221, 249, 279, 289, 329) sont des pages de TITRE de section ; mon « rescue » y fabriquait des entrées fantômes. Désormais réponse vide valide = acceptée ; caches locaux anciens ignorés à l'export.
 Vérificateur affiné (-Allâh, ʻt final de mot = ة, y lu v par l'OCR, ș/š/ż, double lam de l'article) : faux positifs retirés (gemma 7,5 % -> 4,0 %). Les incohérences restantes sont surtout des TÊTES mal lues (Gjhâin, Wabhîd, Safivv-AÏlâh) et quelques vraies erreurs (Ghivâth→غِيَاص).
 Reste : relecture des ≈ 119 mots signalés avec gemma (sans réflexion) ; relecture des têtes par le modèle ; corps français ; 26 pages en repli page entière (≈ 9 %).
+
+## 14. v4.4.0 — revue manuelle + relecture des têtes (28 oct. 2026)
+Relecture gemma des 72 mots signalés (sans réflexion, 508 s) : 11 corrigés, 62 restent ; réflexion jamais utilisée dans l'extraction ni la relecture (0 jeton) : seule la comparaison l'avait essayée (budget épuisé, 0 réponse).
+Cause des restes (vérifiée sur les recadrages) : surtout des TÊTES mal lues par Tesseract (Khalil-ATâR, Safivv-AÏlâh) alors que l'arabe de gemma est juste ; quelques vraies erreurs (Ghiyâth lu غِيَاص). Ajouts : arbitrage de tête par l'arabe (extraction + `--relire-tetes`),
+`revue_manuelle.py` (`--exporter-problemes`, `--appliquer-corrections`), coût de l'alef suscrit abaissé (طه, الله), journal `relecture_mot` / `relecture_tete` (lectures proposées). Taux d'incohérence gemma 3,6 %.
+Tests : 145 + 10 (revue) + 23 (TUI) + 5 (comparateur).

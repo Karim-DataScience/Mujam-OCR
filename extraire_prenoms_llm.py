@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import csv
 import hashlib
 import http.client
@@ -56,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.3.4"
+VERSION = "4.4.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -1975,17 +1976,20 @@ def translit_de(row: dict) -> str:
     return row.get("translittération") or ""
 
 
-def drapeaux(row: dict, e: dict) -> list[str]:
+def drapeaux(row: dict, e: dict, b: dict | None = None) -> list[str]:
     f = []
     ar, d, s = row["prénom_arab_diacritiques"], row["description_en_français"], row["prénom_fr"]
-    if not ar:
+    valide = bool(b and b.get("valide"))                 # arabe relu et validé / corrigé à la main (revue_manuelle)
+    if valide:
+        pass
+    elif not ar:
         f.append("arabe_vide")
     else:
         if re.search(r"[A-Za-z0-9]", ar):
             f.append("arabe_non_arabe")
         if not re.search(f"[{HARAKAT}]", ar):
             f.append("arabe_sans_voyelles")
-    if ar and VA is not None and translit_de(row):
+    if ar and VA is not None and translit_de(row) and not valide:
         ko, indice = VA.incoherent(translit_de(row), ar)
         if ko:
             f.append("arabe_incoherent_translit")
@@ -2037,7 +2041,7 @@ def exploser(entrees: list[dict]) -> list[dict]:
                        "thème": theme, "sous_thème": sous,
                        "page_imprimée": e["page"] - PAGE_OFFSET, "page_pdf": e["page"],
                        "id_entrée": e["id"]}
-                row["à_vérifier"] = "; ".join(drapeaux(row, e))
+                row["à_vérifier"] = "; ".join(drapeaux(row, e, b))
                 rows.append(row)
     return rows
 
@@ -2608,6 +2612,8 @@ def relire_arabe(cfg: Config) -> dict:
             if not translit:
                 continue
             for j, b in enumerate(e["prenoms"]):
+                if b.get("valide"):
+                    continue
                 c, indice = VA.coherence(translit, b["arabe"]) if b["arabe"] else (9.0, f"aucune lecture ; translittération « {translit} »")
                 if c >= VA.SEUIL:
                     cibles[(i, j)] = {"translit": translit, "avant": b["arabe"], "cout": c, "indice": indice}
@@ -2684,6 +2690,8 @@ def relire_arabe(cfg: Config) -> dict:
                     continue
                 cible = restant[(i, j)]
                 cout, _ = VA.coherence(cible["translit"], v)
+                evenement("relecture_mot", chunk=ident, repere=rp, essai=essai, translit=cible["translit"], avant=cible["avant"], propose=v,
+                          cout_avant=cible["cout"], cout_propose=cout, adopte=bool(cout >= 0 and cout <= cible["cout"] - 0.25))
                 if not (cout >= 0 and cout <= cible["cout"] - 0.25):
                     refusees.setdefault((i, j), []).append(v)
                 if cout >= 0 and cout <= cible["cout"] - 0.25:
@@ -2707,6 +2715,203 @@ def relire_arabe(cfg: Config) -> dict:
         f"« arabe_incoherent_translit » ; {stats['non_alignees']} non relu(s) (mise en page différente du cache).")
     return stats
 
+
+
+# ============================================================================
+# 11 ter) REVUE MANUELLE (v4.4) : exporter les mots problématiques, appliquer les corrections
+# ============================================================================
+
+def _page_alignee(lec, entrees: list) -> bool:
+    return (not lec.page_texte and len(lec.entrees) == len(entrees)
+            and all(len(le.blocs) == len(e["prenoms"]) for le, e in zip(lec.entrees, entrees, strict=True)))
+
+
+def exporter_problemes(cfg: Config, inclure_voyelles: bool = False) -> str:
+    """Écrit <sortie>/problemes/{problemes.html, problemes.csv, images/} : recadrages du mot arabe et de la tête pour chaque mot signalé."""
+    import lecture_hybride as LH
+    import revue_manuelle as RM
+    pages = {}
+    for p in cfg.pages:
+        d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        if d and d.get("entrees") and not d.get("blanche") and not (d.get("methode") == "local" and d.get("raison") != "rescue"):
+            pages[p] = d
+    problemes = RM.lister_problemes(pages, parse_description, VA, HARAKAT, inclure_voyelles)
+    dossier = os.path.join(cfg.sortie, "problemes")
+    dossier_img = os.path.join(dossier, "images")
+    os.makedirs(dossier_img, exist_ok=True)
+    LH.configurer(cfg.tesseract, cfg.tessdata, cfg.tess_lang)
+    ok, msg = LH.disponible()
+    if not ok:
+        log(f"Tesseract indisponible ({msg}) : la liste est écrite SANS recadrages.", "WARN")
+    par_page: dict = {}
+    for pb in problemes:
+        par_page.setdefault(pb["page"], []).append(pb)
+    sans_image = 0
+    for p, liste in sorted(par_page.items()):
+        lec = None
+        if ok:
+            net = nettoyer_page(image_native(cfg.pdf, p))
+            lec = LH.lire_page(net)
+            gris = net.convert("L")
+            if not _page_alignee(lec, pages[p]["entrees"]):
+                lec = None
+        for pb in liste:
+            pb["_b64_arabe"] = pb["_b64_tete"] = ""
+            pb["image_arabe"] = pb["image_tete"] = ""
+            if lec is None:
+                sans_image += 1
+                continue
+            bloc = lec.entrees[pb["i"]].blocs[pb["j"]]
+            if bloc.arabe:
+                png = RM._png(LH._recadrer(gris, *bloc.arabe, 14), 110)
+                pb["image_arabe"] = f"images/{pb['id']}_ar.png"
+                pb["_b64_arabe"] = RM._b64(png)
+                ecrire_atomique_octets(os.path.join(dossier, pb["image_arabe"]), png)
+            if lec.entrees[pb["i"]].tete_box:
+                png = RM._png(LH._recadrer(gris, *lec.entrees[pb["i"]].tete_box, 8), 56)
+                pb["image_tete"] = f"images/{pb['id']}_tete.png"
+                pb["_b64_tete"] = RM._b64(png)
+                ecrire_atomique_octets(os.path.join(dossier, pb["image_tete"]), png)
+    lignes = [{"id": pb["id"], "page_pdf": pb["page"], "page_imprimee": pb["page"] - PAGE_OFFSET, "prenom_fr": pb["prenom_fr"],
+               "translittération": pb["translit"], "arabe_actuel": pb["arabe"], "categorie": pb["categorie"], "indice": pb["indice"],
+               "image_arabe": pb["image_arabe"], "image_tete": pb["image_tete"], "arabe_corrige": "", "translit_corrigee": "", "valide": "",
+               "_b64_arabe": pb["_b64_arabe"], "_b64_tete": pb["_b64_tete"]} for pb in problemes]
+    RM.ecrire_csv(os.path.join(dossier, "problemes.csv"), lignes)
+    ecrire_atomique(os.path.join(dossier, "problemes.html"), RM.page_html(lignes, "Revue des mots arabes"))
+    par_cat = collections.Counter(pb["categorie"] for pb in problemes)
+    log(f"REVUE : {len(problemes)} mot(s) à relire sur {len(par_page)} page(s) : " + ", ".join(f"{n} {RM.CATEGORIES[c]}" for c, n in par_cat.most_common()) + ".")
+    if sans_image:
+        log(f"  {sans_image} mot(s) sans recadrage (mise en page différente du cache) : repère-les par la page du PDF.", "WARN")
+    log(f"  Ouvre {os.path.join(dossier, 'problemes.html')} dans ton navigateur, corrige, télécharge corrections.csv, puis :")
+    log("  python extraire_prenoms_llm.py --appliquer-corrections corrections.csv --sortie " + cfg.sortie)
+    return os.path.join(dossier, "problemes.html")
+
+
+def ecrire_atomique_octets(chemin: str, octets: bytes) -> None:
+    os.makedirs(os.path.dirname(chemin) or ".", exist_ok=True)
+    tmp = chemin + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(octets)
+    os.replace(tmp, chemin)
+
+
+def appliquer_corrections_cli(cfg: Config, fichier: str) -> dict:
+    import revue_manuelle as RM
+    lignes = RM.lire_corrections(fichier)
+    pages = {}
+    for L in lignes:
+        try:
+            p, _i, _j = RM.lire_identifiant(L.get("id", ""))
+        except ValueError:
+            continue
+        if p not in pages:
+            d, _ = lire_cache(cfg, p, 1, tolerer=True)
+            if d:
+                pages[p] = d
+    modifies, st = RM.appliquer(pages, lignes, parse_description, nettoyer_arabe)
+    for p, d in modifies.items():
+        ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
+    log(f"CORRECTIONS : {st['valides']} mot(s) validé(s) ({st['arabe_corrige']} arabe corrigé, {st['translit_corrigee']} translittération corrigée), "
+        f"{st['ignorees']} ligne(s) ignorée(s) sur {st['lignes']}.")
+    return st
+
+
+def relire_tetes(cfg: Config) -> dict:
+    """Relit au modèle de vision les TÊTES de définition (« Khalîl-Allâh : ») dont la lecture Tesseract est incohérente avec l'arabe de l'entrée.
+    L'arabe sert d'arbitre : la nouvelle tête n'est adoptée que si elle devient cohérente avec lui (coût < seuil, gain ≥ 0,5). Écrit dans le cache."""
+    import lecture_hybride as LH
+    if VA is None:
+        raise ErreurFatale("verif_arabe.py introuvable.")
+    LH.configurer(cfg.tesseract, cfg.tessdata, cfg.tess_lang)
+    ok, msg = LH.disponible()
+    if not ok:
+        raise ErreurFatale(f"--relire-tetes a besoin de Tesseract (mise en page) : {msg}")
+    stats = {"pages": 0, "cibles": 0, "corrigees": 0, "restantes": 0, "non_alignees": 0, "requetes": 0, "duree_s": 0.0}
+    t_debut = time.time()
+    a_relire = []
+    for p in cfg.pages:
+        d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        if not d or d.get("blanche") or not d.get("entrees") or (d.get("methode") == "local" and d.get("raison") != "rescue"):
+            continue
+        cibles = {}
+        for i, e in enumerate(d["entrees"]):
+            if any(b.get("valide") for b in e["prenoms"]):
+                continue
+            translit, _eq = parse_description(e["description"])
+            arabes = [b["arabe"] for b in e["prenoms"] if b["arabe"]]
+            c = LH.cout_tete(translit, arabes) if translit else -1.0
+            if c >= VA.SEUIL:
+                cibles[i] = {"translit": translit, "cout": c, "arabes": arabes}
+        if cibles:
+            a_relire.append((p, d, cibles))
+    log(f"relecture des têtes : {sum(len(c) for _, _, c in a_relire)} tête(s) incohérente(s) avec l'arabe sur {len(a_relire)} page(s) du cache.")
+    if not a_relire:
+        return stats
+    info = resoudre_modele(cfg)
+    afficher_info(info, cfg)
+    etat = Etat(cfg, info, None)
+    for p, d, cibles in a_relire:
+        if etat.stop.is_set():
+            break
+        ident = id_chunk(p, 1, 1)
+        net = nettoyer_page(image_native(cfg.pdf, p))
+        lec = LH.lire_page(net)
+        if not _page_alignee(lec, d["entrees"]):
+            stats["non_alignees"] += len(cibles)
+            log(f"  {ident} : la mise en page ne correspond pas au cache : {len(cibles)} tête(s) laissée(s) telle(s) quelle(s)", "WARN")
+            continue
+        for i in list(cibles):
+            if not lec.entrees[i].tete_box:
+                del cibles[i]
+                stats["non_alignees"] += 1
+        stats["pages"] += 1
+        stats["cibles"] += len(cibles)
+        restant, journal, gris = dict(cibles), [], net.convert("L")
+        for essai in range(1, max(2, cfg.essais) + 1):
+            if not restant or etat.stop.is_set():
+                break
+            indices = {i: f"lecture automatique approximative « {lec.entrees[i].tete_texte} » (jugée incohérente avec l'arabe de l'entrée)" for i in restant}
+            feuille, _txt, reperes = LH.construire_feuille(lec, gris, seulement_tetes=indices)
+            if feuille is None:
+                break
+            tampon = io.BytesIO()
+            feuille.save(tampon, "PNG")
+            temp = min(1.0, 0.2 + 0.2 * (essai - 1))
+            try:
+                rep = appeler_llm(cfg, info, tampon.getvalue(), LH.PROMPT_TETES, "Relis ces débuts de définition.", temperature=temp, top_p=0.95,
+                                  max_tokens=200 + 80 * len(reperes), penser=False, budget=0, stop=etat.stop, suivi=None, pas_suivi=0)
+            except (ErreurReflexion, ErreurLLM) as e:
+                log(f"  {ident} têtes, essai {essai} : {e}", "WARN")
+                continue
+            if rep["abandon"] == "interruption":
+                raise Interrompu()
+            stats["requetes"] += 1
+            dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
+            for rp, (_k, i, _j) in reperes.items():
+                v = re.sub(r"\s+", " ", str(dico.get(rp, ""))).strip(" :")
+                if not v or i not in restant:
+                    continue
+                cible = restant[i]
+                nouveau = LH.cout_tete(v, cible["arabes"])
+                adopte = bool(0 <= nouveau < VA.SEUIL and nouveau <= cible["cout"] - 0.5)
+                evenement("relecture_tete", chunk=ident, repere=rp, essai=essai, avant=cible["translit"], propose=v, cout_avant=cible["cout"],
+                          cout_propose=nouveau, adopte=adopte)
+                if adopte:
+                    m = re.match(r"^(.*?)\s*:\s+(.*)$", d["entrees"][i]["description"], re.S)
+                    if m:
+                        d["entrees"][i]["description"] = f"{v} : {m.group(2)}"
+                        d["entrees"][i].setdefault("corrections_auto", []).append({"champ": "tête", "avant": m.group(1), "apres": v, "cout_avant": cible["cout"], "cout_apres": nouveau})
+                        journal.append(i)
+                        del restant[i]
+        stats["corrigees"] += len(journal)
+        stats["restantes"] += len(restant)
+        if journal:
+            d.setdefault("avertissements", []).append(f"relecture des têtes : {len(journal)} tête(s) corrigée(s)")
+            ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
+        log(f"  {ident} : {len(cibles)} tête(s) suspecte(s), {len(journal)} corrigée(s), {len(restant)} encore incohérente(s)")
+    stats["duree_s"] = round(time.time() - t_debut, 1)
+    log(f"TÊTES : {stats['corrigees']} corrigée(s) sur {stats['cibles']} suspecte(s) ; {stats['restantes']} restent incohérentes ; {stats['non_alignees']} non relue(s).")
+    return stats
 
 
 def autotest(cfg: Config) -> None:
@@ -2786,6 +2991,13 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
     ap.add_argument("--relire-arabe", action="store_true", dest="relire_arabe",
                     help="relit AVEC réflexion les seuls mots arabes incohérents avec la translittération (cache existant), puis ré-exporte")
+    ap.add_argument("--relire-tetes", action="store_true", dest="relire_tetes",
+                    help="relit au modèle de vision les têtes de définition incohérentes avec l'arabe (arbitrage par l'arabe), puis ré-exporte")
+    ap.add_argument("--exporter-problemes", action="store_true", dest="exporter_problemes",
+                    help="écrit <sortie>/problemes/ : page HTML avec les recadrages des mots arabes à relire (à corriger toi-même)")
+    ap.add_argument("--inclure-voyelles", action="store_true", dest="inclure_voyelles", help="avec --exporter-problemes : ajoute aussi les mots sans voyelles")
+    ap.add_argument("--appliquer-corrections", default="", dest="appliquer_corrections", metavar="FICHIER",
+                    help="applique corrections.csv (issu de problemes.html ou de problemes.csv) au cache, puis ré-exporte")
     ap.add_argument("--autotest", action="store_true", help="traite 4 pages et compare à la vérité terrain")
     ap.add_argument("--statut", action="store_true", help="état du cache (pages faites / à faire / périmées), sans LM Studio")
     ap.add_argument("--export", action="store_true", help="régénère CSV/JSON/Excel depuis le cache, sans LM Studio")
@@ -3004,7 +3216,7 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv == ["--cli"]:
         ap.print_help()                                        # rien à faire : l'aide plutôt qu'une erreur d'usage
         return 0
-    if not (a.export or a.statut or a.diagnostic or a.rapport or a.ecrire_config):
+    if not (a.export or a.statut or a.diagnostic or a.rapport or a.ecrire_config or a.appliquer_corrections):
         a.pdf = trouver_pdf(a.pdf)
     try:
         cfg = construire_cfg(a)
@@ -3017,7 +3229,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.rapport:
         log(f"rapport de debug : {creer_rapport(cfg, chemin_cfg)}")
         return 0
-    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe else "statut" if a.statut else "export" if a.export else "extraction"
+    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe or a.relire_tetes else "problemes" if a.exporter_problemes else "corrections" if a.appliquer_corrections else "statut" if a.statut else "export" if a.export else "extraction"
     JOURNAL.ouvrir(os.path.join(cfg.sortie, "logs"), mode, cfg.log_niveau)
     log(f"journal : {JOURNAL.chemin}")
     journaliser_demarrage(mode, argv, cfg)
@@ -3028,11 +3240,20 @@ def main(argv: list[str] | None = None) -> int:
         if a.statut:
             afficher_statut(cfg)
             return 0
-        if not a.export and (not a.pdf or not os.path.exists(a.pdf)):
+        if not a.export and not a.appliquer_corrections and (not a.pdf or not os.path.exists(a.pdf)):
             ap.error("indique le chemin du PDF (fichier introuvable)")
         if a.autotest:
             autotest(cfg)
             return 0
+        if a.exporter_problemes:
+            exporter_problemes(cfg, a.inclure_voyelles)
+            return 0
+        if a.appliquer_corrections:
+            appliquer_corrections_cli(cfg, a.appliquer_corrections)
+            cfg.sans_llm = True
+        if a.relire_tetes:
+            relire_tetes(cfg)
+            cfg.sans_llm = True
         if a.relire_arabe:
             st_rel = relire_arabe(cfg)
             ecrire_atomique(os.path.join(cfg.sortie, "relecture_stats.json"), json.dumps({"modele": cfg.modele, **st_rel}, ensure_ascii=False, indent=1))
