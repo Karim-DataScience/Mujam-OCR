@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.4.0"
+VERSION = "4.4.1"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -2811,6 +2811,11 @@ def appliquer_corrections_cli(cfg: Config, fichier: str) -> dict:
     modifies, st = RM.appliquer(pages, lignes, parse_description, nettoyer_arabe)
     for p, d in modifies.items():
         ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
+    suspectes = RM.controler_corrections(pages, lignes, parse_description, VA, HARAKAT)
+    for sp in suspectes[:40]:
+        log(f"  à revoir : {sp['id']} « {sp['arabe']} » ({sp['translit']}) : {sp['motif']}", "WARN")
+    if suspectes:
+        log(f"  {len(suspectes)} correction(s) appliquée(s) mais à revoir (faute de frappe possible) : corrige-les dans le CSV et relance --appliquer-corrections.", "WARN")
     log(f"CORRECTIONS : {st['valides']} mot(s) validé(s) ({st['arabe_corrige']} arabe corrigé, {st['translit_corrigee']} translittération corrigée), "
         f"{st['ignorees']} ligne(s) ignorée(s) sur {st['lignes']}.")
     return st

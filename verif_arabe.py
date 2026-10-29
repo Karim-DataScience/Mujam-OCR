@@ -57,7 +57,7 @@ def _normaliser_translit(t: str) -> str:
 def variantes(translit: str) -> list[str]:
     """« Fâdil / Fâdila » -> ['Fâdil', 'Fâdila'] : l'arabe lu peut être celui de n'importe laquelle des formes."""
     t = re.sub(r"\([^)]*\)", " ", unicodedata.normalize("NFKC", translit).replace("ı", "i"))
-    return [v.strip() for v in re.split(r"\s*[/,]\s*|\s+et\s+", t) if len(v.strip()) >= 2]
+    return [v.strip() for v in re.split(r"\s*[/,]\s*|\s+(?:et|ou)\s+", t) if len(v.strip()) >= 2]
 
 
 def _unites(t: str, i: int) -> list[list[Unite]]:
@@ -139,6 +139,8 @@ def squelettes_attendus(translit: str) -> list[list[Unite]]:
             out.append(x)
         if out and out[-1][2] == "F" and out[-1][0].startswith("ا") and t[-1:].lower() == "a" and t[-1:] not in _ACCENTS_LONGS:
             out[-1] = ("هاة", 0.3, "F")                              # « -a » final = ة / ه
+        if out and out[-1][2] == "F" and out[-1][1] == 0.2 and t[-1:] in "âäāàá":
+            out[-1] = ("اهيى", 0.2, "F")                                   # « Ṣafwâ » : صَفْوَى / صَفْوَة
         propres.append(out)
     return propres or [[]]
 
@@ -164,7 +166,7 @@ def cout_alignement(attendu: list[Unite], lu: list[str]) -> float:
             elif nat == "F" and l in FAIBLES:
                 sub = 0.5 if cdel >= 0.6 else 0.3                        # y/w consonantiques : on les confond moins volontiers
             elif nat == "O" and l in FAIBLES:
-                sub = 0.3
+                sub = 0.15                                               # hamza portée par و / ي / ا (Lu'lu' = لُؤْلُؤ)
             else:
                 sub = 1.0
             D[i][j] = min(D[i - 1][j - 1] + sub, D[i - 1][j] + cdel, D[i][j - 1] + _cout_insertion(l))
@@ -186,6 +188,8 @@ def coherence(translit: str, arabe: str) -> tuple[float, str]:
                 if not att:
                     continue
                 c = cout_alignement(att, lu)
+                if lu[-1] == "ه" and len(lu) > 2:                       # ة finale d'une forme féminine non citée dans la tête
+                    c = min(c, cout_alignement(att, lu[:-1]) + 0.3)
                 if meilleur is None or c < meilleur[0]:
                     meilleur = (c, att, v, lu)
     if meilleur is None:

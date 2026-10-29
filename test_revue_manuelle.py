@@ -73,6 +73,21 @@ class TestRevueManuelle(unittest.TestCase):
         self.assertEqual(RM.lire_corrections(chemin)[0]["arabe_corrige"], "يَعْقُوب")
 
 
+class TestControleDesCorrections(unittest.TestCase):
+    def test_signale_fautes_de_frappe_et_mots_sans_voyelle(self):
+        d = {"entrees": [entree("Kuhayla", "كُحَيْلَاة", "Kuḥaylâ' : petite kohl."), entree("Moujir", "مجير", "Mujîr : protecteur."),
+                         entree("Yaqoub", "يَعْقُوب", "Ya'qūb (Jacob) : fils d'Ishâq.")]}
+        L = [{"id": "p058-e1-b1", "arabe_corrige": "كُحَيْلَاة"}, {"id": "p058-e2-b1", "arabe_corrige": "مجير"}, {"id": "p058-e3-b1", "arabe_corrige": "يَعْقُوب"}]
+        res = RM.controler_corrections({58: d}, L, X.parse_description, VA, X.HARAKAT)
+        self.assertEqual([r["id"] for r in res], ["p058-e1-b1", "p058-e2-b1"])
+        self.assertIn("voyelle", res[1]["motif"])
+
+    def test_verificateur_formes_feminines_et_ou(self):
+        for tr, ar in [("Ḥākim", "حَاكِمَة"), ("Tawfîq", "تَوْفِيقَة"), ("Lu'lu'", "لُؤْلُؤ"), ("Jihân ou Jihân", "جِهان"), ("Ṣafwâ", "صَفْوَة")]:
+            self.assertFalse(VA.incoherent(tr, ar)[0], (tr, ar))
+        self.assertTrue(VA.incoherent("Kuḥaylâ'", "كُحَيْلَاة")[0])
+
+
 class TestArbitrageDesTetes(unittest.TestCase):
     def test_tete_du_modele_adoptee_si_coherente_avec_l_arabe(self):
         desc, w = LH.fusionner_tete("Khalil-ATâR : l'ami de Dieu.", "Khalîl-Allâh", ["خَلِيلُ اللهِ"])

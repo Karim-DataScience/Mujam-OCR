@@ -188,3 +188,25 @@ def lire_corrections(chemin: str) -> list[dict]:
         f.seek(0)
         delim = ";" if echantillon.count(";") > echantillon.count(",") else ","
         return list(csv.DictReader(f, delimiter=delim))
+
+
+def controler_corrections(pages: dict, lignes: list[dict], parse_description, VA, harakat: str) -> list[dict]:
+    """Relit tes corrections : signale celles qui restent incohérentes avec la translittération (faute de frappe possible) ou sans voyelle."""
+    res = []
+    for L in lignes:
+        ar = (L.get("arabe_corrige") or "").strip()
+        if not ar:
+            continue
+        try:
+            page, i, j = lire_identifiant(L.get("id", ""))
+            e = pages[page]["entrees"][i]
+        except (ValueError, KeyError, IndexError):
+            continue
+        translit, _ = parse_description(e.get("description", ""))
+        if not re.search(f"[{harakat}]", ar):
+            res.append({"id": L["id"], "arabe": ar, "translit": translit, "motif": "aucune voyelle"})
+        elif VA is not None and translit:
+            c, indice = VA.coherence(translit, ar)
+            if c >= VA.SEUIL:
+                res.append({"id": L["id"], "arabe": ar, "translit": translit, "motif": f"incohérent avec la translittération ({indice})"})
+    return res

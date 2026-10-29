@@ -154,3 +154,8 @@ Relecture gemma des 72 mots signalés (sans réflexion, 508 s) : 11 corrigés, 6
 Cause des restes (vérifiée sur les recadrages) : surtout des TÊTES mal lues par Tesseract (Khalil-ATâR, Safivv-AÏlâh) alors que l'arabe de gemma est juste ; quelques vraies erreurs (Ghiyâth lu غِيَاص). Ajouts : arbitrage de tête par l'arabe (extraction + `--relire-tetes`),
 `revue_manuelle.py` (`--exporter-problemes`, `--appliquer-corrections`), coût de l'alef suscrit abaissé (طه, الله), journal `relecture_mot` / `relecture_tete` (lectures proposées). Taux d'incohérence gemma 3,6 %.
 Tests : 145 + 10 (revue) + 23 (TUI) + 5 (comparateur).
+
+## 15. v4.4.1 — premier retour de la revue manuelle (29 oct. 2026)
+`--relire-tetes` sur le cache gemma : 31 têtes corrigées sur 56 suspectes (388 s). Export des problèmes : 96 mots (66 sans voyelles, 29 incohérents, 1 non arabe). corrections.csv rendu par l'utilisateur : 96 lignes, 87 arabes corrigés, 18 translittérations corrigées, 0 identifiant inconnu.
+`--appliquer-corrections` signale maintenant les corrections à revoir (faute de frappe possible : كُحَيْلَاة pour Kuḥaylâ', مجير sans voyelle, translittération « Tufayi » mal lue). Vérificateur : forme féminine d'une tête masculine (ة finale facultative), « ou », hamza porté (Lu'lu'), ة pour â final (Ṣafwâ).
+Reste : 79 drapeaux `genre_a_verifier` (surtout des prénoms « mixtes » ou masculins en ة : à traiter ou à neutraliser), 26 `sans_point_final`, 11 pages avec < 3 entrées, 5 suites de définition orphelines, ~9 % de pages en repli page entière.
