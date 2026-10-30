@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.4.1"
+VERSION = "4.5.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -2008,7 +2008,8 @@ def drapeaux(row: dict, e: dict, b: dict | None = None) -> list[str]:
         f.append("caracteres_suspects")
     if len(re.sub(r"[^A-Za-zÀ-ÿ]", "", s)) < 2:
         f.append("prenom_court")
-    if not row["genre"] or (row["genre"] == "MASCULIN" and re.sub(f"[{HARAKAT}]+$", "", ar).endswith("ة")):
+    mixte = bool(re.search(r"\(mixte\)|selon l.usage", d[:120], re.I))        # prénoms mixtes : listés dans les deux genres, ة finale normale
+    if not row["genre"] or (row["genre"] == "MASCULIN" and not mixte and re.sub(f"[{HARAKAT}]+$", "", ar).endswith("ة")):
         f.append("genre_a_verifier")
     if e["partiel"]:
         f.append("page_partielle")
@@ -2017,7 +2018,7 @@ def drapeaux(row: dict, e: dict, b: dict | None = None) -> list[str]:
 
 COLS = ["prénom_fr", "prénom_arab_diacritiques", "genre", "description_en_français",
         "prénoms_équivalents", "forme_associée", "équivalent_étranger", "translittération",
-        "thème", "sous_thème", "page_imprimée", "page_pdf", "id_entrée", "à_vérifier"]
+        "thème", "sous_thème", "page_imprimée", "page_pdf", "id_entrée", "mixte", "à_vérifier"]
 
 
 def exploser(entrees: list[dict]) -> list[dict]:
@@ -2040,7 +2041,8 @@ def exploser(entrees: list[dict]) -> list[dict]:
                        "translittération": translit,
                        "thème": theme, "sous_thème": sous,
                        "page_imprimée": e["page"] - PAGE_OFFSET, "page_pdf": e["page"],
-                       "id_entrée": e["id"]}
+                       "id_entrée": e["id"],
+                       "mixte": "oui" if re.search(r"\(mixte\)", e["description"][:120], re.I) else ""}
                 row["à_vérifier"] = "; ".join(drapeaux(row, e, b))
                 rows.append(row)
     return rows
@@ -2083,7 +2085,7 @@ def exporter(rows: list[dict], infos_pages: list[dict], dossier: str, nom: str =
     entete = PatternFill("solid", fgColor="1F4E78")
     larg = {"prénom_fr": 20, "prénom_arab_diacritiques": 24, "genre": 11, "description_en_français": 80,
             "prénoms_équivalents": 22, "forme_associée": 20, "équivalent_étranger": 16, "translittération": 20,
-            "thème": 24, "sous_thème": 30, "page_imprimée": 9, "page_pdf": 9, "id_entrée": 9, "à_vérifier": 28}
+            "thème": 24, "sous_thème": 30, "page_imprimée": 9, "page_pdf": 9, "id_entrée": 9, "mixte": 7, "à_vérifier": 28}
 
     def feuille(ws, lignes, colonnes, surligner=False):
         ws.append(colonnes)
@@ -2919,6 +2921,108 @@ def relire_tetes(cfg: Config) -> dict:
     return stats
 
 
+def relire_corps(cfg: Config) -> dict:
+    """Corrige le FRANÇAIS des définitions (lu par Tesseract) : les paragraphes contenant des mots suspects (hors dictionnaire, rares dans le corpus)
+    sont relus par le modèle de vision, mais on ne lui emprunte que les mots qui remplacent un mot suspect par un mot connu et ressemblant
+    (verif_francais.fusionner) : le modèle ne réécrit jamais le texte. Écrit dans le cache (`corrections_auto`)."""
+    import lecture_hybride as LH
+    import verif_francais as VF
+    dico = VF.charger_dictionnaire()
+    if dico is None:
+        raise ErreurFatale("--relire-corps a besoin du dictionnaire français : pip install pyspellchecker")
+    LH.configurer(cfg.tesseract, cfg.tessdata, cfg.tess_lang)
+    ok, msg = LH.disponible()
+    if not ok:
+        raise ErreurFatale(f"--relire-corps a besoin de Tesseract (mise en page) : {msg}")
+    pages_cache = {}
+    for p in cfg.pages:
+        d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        if d and d.get("entrees") and not d.get("blanche") and not (d.get("methode") == "local" and d.get("raison") != "rescue"):
+            pages_cache[p] = d
+    freq = VF.frequences(e["description"] for d in pages_cache.values() for e in d["entrees"])
+    stats = {"pages": 0, "entrees": 0, "mots_suspects": 0, "mots_corriges": 0, "non_alignees": 0, "requetes": 0, "duree_s": 0.0}
+    t_debut = time.time()
+    a_relire = []
+    for p, d in pages_cache.items():
+        cibles = {}
+        for i, e in enumerate(d["entrees"]):
+            sus = VF.mots_suspects(VF.corps(e["description"])[1], dico, freq)
+            if sus and not e.get("corrections_manuelles"):
+                cibles[i] = sus
+        if cibles:
+            a_relire.append((p, d, cibles))
+    log(f"relecture du français : {sum(len(c) for _, _, c in a_relire)} définition(s) avec des mots suspects sur {len(a_relire)} page(s) du cache.")
+    if not a_relire:
+        return stats
+    info = resoudre_modele(cfg)
+    afficher_info(info, cfg)
+    etat = Etat(cfg, info, None)
+    for p, d, cibles in a_relire:
+        if etat.stop.is_set():
+            break
+        ident = id_chunk(p, 1, 1)
+        net = nettoyer_page(image_native(cfg.pdf, p))
+        lec = LH.lire_page(net)
+        if not _page_alignee(lec, d["entrees"]):
+            stats["non_alignees"] += len(cibles)
+            log(f"  {ident} : la mise en page ne correspond pas au cache : {len(cibles)} définition(s) laissée(s) telle(s) quelle(s)", "WARN")
+            continue
+        for i in list(cibles):
+            lu = lec.entrees[i]
+            if not lu.def_box or lu.suite_page_precedente or difflib.SequenceMatcher(None, VF.corps(lu.description)[1][:120], VF.corps(d["entrees"][i]["description"])[1][:120]).ratio() < 0.6:
+                del cibles[i]
+                stats["non_alignees"] += 1
+        stats["pages"] += 1
+        stats["entrees"] += len(cibles)
+        stats["mots_suspects"] += sum(len(v) for v in cibles.values())
+        gris = net.convert("L")
+        indices = {i: f"lecture automatique approximative (avec fautes d'OCR, mots douteux : {', '.join(sorted(set(v)))}) : « {d['entrees'][i]['description'][:160]} »" for i, v in cibles.items()}
+        corrigees = 0
+        for essai in range(1, max(2, cfg.essais) + 1):
+            restant = {i: indices[i] for i in cibles if i in indices}
+            if not restant or etat.stop.is_set():
+                break
+            feuille, _txt, reperes = LH.construire_feuille(lec, gris, seulement_corps=restant)
+            if feuille is None:
+                break
+            tampon = io.BytesIO()
+            feuille.save(tampon, "PNG")
+            temp = min(1.0, 0.2 + 0.2 * (essai - 1))
+            try:
+                rep = appeler_llm(cfg, info, tampon.getvalue(), LH.PROMPT_CORPS, "Relis ces paragraphes de définition.", temperature=temp, top_p=0.95,
+                                  max_tokens=300 + 450 * len(reperes), penser=False, budget=0, stop=etat.stop, suivi=None, pas_suivi=0)
+            except (ErreurReflexion, ErreurLLM) as e:
+                log(f"  {ident} corps, essai {essai} : {e}", "WARN")
+                continue
+            if rep["abandon"] == "interruption":
+                raise Interrompu()
+            stats["requetes"] += 1
+            dico_rep = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
+            for rp, (_k, i, _j) in reperes.items():
+                if rp not in dico_rep:
+                    continue
+                _tete_m, corps_m = VF.corps(dico_rep[rp])
+                e = d["entrees"][i]
+                tete, corps_old = VF.corps(e["description"])
+                if not tete:
+                    continue
+                nouveau, changes = VF.fusionner(corps_old, corps_m or dico_rep[rp], dico, freq)
+                evenement("relecture_corps", chunk=ident, repere=rp, essai=essai, changements=[list(c) for c in changes])
+                if changes:
+                    e["description"] = f"{tete} : {nouveau}"
+                    e.setdefault("corrections_auto", []).append({"champ": "corps", "changements": [list(c) for c in changes]})
+                    corrigees += len(changes)
+                indices.pop(i, None)             # réponse obtenue : les mots que le modèle lit comme Tesseract sont légitimes (translittérations en italique…), pas de nouvel essai
+        stats["mots_corriges"] += corrigees
+        if corrigees:
+            d.setdefault("avertissements", []).append(f"relecture du français : {corrigees} mot(s) corrigé(s)")
+            ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
+        log(f"  {ident} : {corrigees} mot(s) corrigé(s)")
+    stats["duree_s"] = round(time.time() - t_debut, 1)
+    log(f"FRANÇAIS : {stats['mots_corriges']} mot(s) corrigé(s) sur {stats['mots_suspects']} suspect(s) dans {stats['entrees']} définition(s) ; {stats['non_alignees']} non relue(s) (mise en page différente).")
+    return stats
+
+
 def autotest(cfg: Config) -> None:
     import verite_terrain as vt
     cfg.pages = list(vt.PAGES)
@@ -2996,6 +3100,8 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
     ap.add_argument("--relire-arabe", action="store_true", dest="relire_arabe",
                     help="relit AVEC réflexion les seuls mots arabes incohérents avec la translittération (cache existant), puis ré-exporte")
+    ap.add_argument("--relire-corps", action="store_true", dest="relire_corps",
+                    help="corrige le français des définitions (mots suspects relus par le modèle de vision, remplacement conservateur), puis ré-exporte")
     ap.add_argument("--relire-tetes", action="store_true", dest="relire_tetes",
                     help="relit au modèle de vision les têtes de définition incohérentes avec l'arabe (arbitrage par l'arabe), puis ré-exporte")
     ap.add_argument("--exporter-problemes", action="store_true", dest="exporter_problemes",
@@ -3234,7 +3340,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.rapport:
         log(f"rapport de debug : {creer_rapport(cfg, chemin_cfg)}")
         return 0
-    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe or a.relire_tetes else "problemes" if a.exporter_problemes else "corrections" if a.appliquer_corrections else "statut" if a.statut else "export" if a.export else "extraction"
+    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe or a.relire_tetes or a.relire_corps else "problemes" if a.exporter_problemes else "corrections" if a.appliquer_corrections else "statut" if a.statut else "export" if a.export else "extraction"
     JOURNAL.ouvrir(os.path.join(cfg.sortie, "logs"), mode, cfg.log_niveau)
     log(f"journal : {JOURNAL.chemin}")
     journaliser_demarrage(mode, argv, cfg)
@@ -3258,6 +3364,9 @@ def main(argv: list[str] | None = None) -> int:
             cfg.sans_llm = True
         if a.relire_tetes:
             relire_tetes(cfg)
+            cfg.sans_llm = True
+        if a.relire_corps:
+            relire_corps(cfg)
             cfg.sans_llm = True
         if a.relire_arabe:
             st_rel = relire_arabe(cfg)

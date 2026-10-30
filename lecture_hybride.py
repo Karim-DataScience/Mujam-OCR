@@ -130,6 +130,7 @@ class EntreeLue:
     confiance: float = 0.0
     tete_box: tuple | None = None        # zone de la « tête » (translittération + équivalent) à relire par le modèle de vision
     tete_texte: str = ""
+    def_box: tuple | None = None         # zone du paragraphe de définition (relecture du corps par le modèle de vision)
     suite_page_precedente: bool = False
     description_incomplete: bool = False
 
@@ -193,6 +194,7 @@ def lire_page(net: Image.Image) -> PageLue:
                                 sum(confs) / len(confs) if confs else 0.0))
         lu = EntreeLue(blocs, suite_page_precedente=e.suite_page_precedente)
         if e.definition:
+            lu.def_box = tuple(e.definition)
             lignes = lire_definition(gris, *e.definition)
             lu.description = nettoyer_debut(corriger_ocr_fr(recoller(lignes)))
             lu.confiance = sum(l.conf for l in lignes) / len(lignes) if lignes else 0.0
@@ -233,11 +235,20 @@ def _police(taille: int):
         return ImageFont.load_default()
 
 
-def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None = None, seulement_tetes: dict | None = None):
+def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None = None, seulement_tetes: dict | None = None,
+                       seulement_corps: dict | None = None):
     """-> (image, texte pour l'utilisateur, {repère: (kind, entrée, bloc)}) ; (None, "", {}) s'il n'y a rien à relire."""
     lignes, reperes = [], {}
     n_a = n_t = 0
+    n_d = 0
     for i, e in enumerate(page.entrees):
+        if seulement_corps is not None:
+            if i in seulement_corps and e.def_box:
+                n_d += 1
+                reperes[f"D{n_d}"] = ("D", i, 0)
+                crop = _recadrer(gris, *e.def_box, 6)
+                lignes.append((f"D{n_d}", crop, crop.height, seulement_corps[i]))
+            continue
         for j, b in enumerate(e.blocs):
             if b.arabe and seulement_tetes is None and (seulement is None or (i, j) in seulement):
                 n_a += 1
@@ -258,7 +269,7 @@ def construire_feuille(page: PageLue, gris: Image.Image, seulement: dict | None 
     police = _police(34)
     rows = []
     for rep, crop, h_cible, _ in lignes:
-        w = min(800, max(1, round(crop.width * h_cible / max(1, crop.height))))
+        w = min(1200 if rep.startswith("D") else 800, max(1, round(crop.width * h_cible / max(1, crop.height))))
         rows.append((rep, crop.resize((w, max(1, round(crop.height * w / crop.width))), Image.LANCZOS)))
     largeur = 110 + max(c.width for _, c in rows) + 20
     hauteur = sum(c.height + 26 for _, c in rows) + 10
@@ -288,7 +299,7 @@ def extraire_feuille_json(contenu: str, reflexion: str = "") -> dict | None:
             if source[i] == "{":
                 try:
                     obj, fin = dec.raw_decode(source, i)
-                    if isinstance(obj, dict) and any(re.fullmatch(r"[AT]\d+", str(k)) for k in obj):
+                    if isinstance(obj, dict) and any(re.fullmatch(r"[ATD]\d+", str(k)) for k in obj):
                         trouves.append(obj)
                     i = fin
                     continue
@@ -296,8 +307,8 @@ def extraire_feuille_json(contenu: str, reflexion: str = "") -> dict | None:
                     pass
             i += 1
         if trouves:
-            return {str(k): str(v) for k, v in trouves[-1].items() if re.fullmatch(r"[AT]\d+", str(k))}
-        paires = re.findall(r'"([AT]\d+)"\s*:\s*"((?:[^"\\]|\\.)*)"', source)          # réponse tronquée : on récupère les paires complètes
+            return {str(k): str(v) for k, v in trouves[-1].items() if re.fullmatch(r"[ATD]\d+", str(k))}
+        paires = re.findall(r'"([ATD]\d+)"\s*:\s*"((?:[^"\\]|\\.)*)"', source)          # réponse tronquée : on récupère les paires complètes
         if paires:
             return {k: v for k, v in paires}
     return None
@@ -387,3 +398,10 @@ PROMPT_TETES = """Tu relis des textes latins isolés, recadrés dans un dictionn
 Recopie le texte EXACTEMENT comme il est imprimé, avec ses accents longs (â î û ā ī ū), ses points souscrits (ḥ ṣ ḍ ṭ ẓ), ses apostrophes (ʿ ʾ ’ ‘), ses tirets et ses parenthèses. N'ajoute rien, ne corrige pas l'orthographe,
 n'invente pas une lettre qu'on ne voit pas : une lecture automatique approximative (souvent fausse sur les lettres) est donnée seulement comme repère.
 Ne recopie PAS les « : » finaux ni le début de la définition. Réponds UNIQUEMENT par un objet JSON {"T1": "...", "T2": "..."}, sans autre texte."""
+
+
+PROMPT_CORPS = """Tu relis des paragraphes de définition imprimés en français, extraits d'un dictionnaire de prénoms arabes. Chaque ligne de l'image porte un repère (D1, D2…) suivi d'un paragraphe : il commence par un prénom
+(avec parfois son équivalent entre parenthèses) suivi de « : », puis la définition. Recopie le paragraphe EXACTEMENT comme il est imprimé, sur UNE seule ligne : recolle les mots coupés en fin de ligne,
+garde les accents, les apostrophes, les guillemets, les parenthèses, les tirets et les signes de translittération (â î û ḥ ṣ ḍ ṭ ẓ ʿ ʾ). Ne corrige rien, n'ajoute rien, ne résume rien, n'invente aucun mot :
+si un mot est illisible, recopie ce que tu vois. Une lecture automatique approximative (avec des fautes d'OCR) est fournie comme repère : l'image fait foi.
+Réponds UNIQUEMENT par un objet JSON {"D1": "...", "D2": "..."}, sans autre texte."""

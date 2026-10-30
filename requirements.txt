@@ -8,3 +8,4 @@ textual>=1.0
 # Lecture hybride (mise en page + Tesseract) ; sans elle, le modele de vision lit les pages entieres
 opencv-python-headless>=4.8
 pytesseract>=0.3.10
+pyspellchecker>=0.8        # optionnel : dictionnaire français pour --relire-corps

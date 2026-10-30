@@ -222,7 +222,7 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 - **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
 - Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).
 
-## Comparer et combiner plusieurs modèles automatiquement (v4.4.1) : `comparer_modeles.py`
+## Comparer et combiner plusieurs modèles automatiquement (v4.5.0) : `comparer_modeles.py`
 
 Charge chaque modèle avec le bon contexte via la CLI `lms` de LM Studio (Settings > Developer > « Install the lms CLI »), lance les tâches, décharge, et écrit `comparaison/comparaison_modeles.md`.
 **Attention : chaque chargement est précédé de `lms unload --all`** (les modèles déjà chargés sont déchargés).
@@ -262,3 +262,12 @@ python extraire_prenoms_llm.py lelivredesprenom0000geof.pdf --exporter-problemes
 # ouvre sortie_llm_googlegemma-4-12b-qat\problemes\problemes.html, corrige, télécharge corrections.csv, puis :
 python extraire_prenoms_llm.py --appliquer-corrections corrections.csv --sortie sortie_llm_googlegemma-4-12b-qat
 ```
+
+## Français des définitions et prénoms « mixtes » (v4.5)
+
+- **`--relire-corps`** : corrige le français lu par Tesseract. Les définitions qui contiennent des mots suspects (absents du dictionnaire, rares dans le corpus : « seroiteur », « lunnière », « fennne »)
+  sont relues par le modèle de vision (une requête par page, paragraphes recadrés), mais **on ne lui emprunte que les mots qui remplacent un mot suspect par un mot connu et ressemblant** : il ne réécrit jamais le texte.
+  Les mots que le modèle lit comme Tesseract sont considérés légitimes (translittérations en italique, mots du domaine). Nécessite `pip install pyspellchecker` et Tesseract. Sur ton cache : ≈ 300 définitions ciblées sur 1 670 (≈ 370 mots suspects, dont une partie légitime).
+  `python extraire_prenoms_llm.py lelivredesprenom0000geof.pdf --relire-corps --modele google/gemma-4-12b-qat --sortie sortie_llm_googlegemma-4-12b-qat`
+- **Prénoms « mixtes »** : les entrées notées « (mixte) » dans le livre sont exportées dans les deux genres (une ligne MASCULIN, une ligne FEMININ). Nouvelle colonne **`mixte`** (« oui ») pour les repérer / dédoublonner,
+  et le drapeau `genre_a_verifier` n'est plus posé sur un masculin en ة quand la définition dit « (mixte) » ou « selon l'usage ».

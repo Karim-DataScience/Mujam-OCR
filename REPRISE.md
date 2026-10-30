@@ -159,3 +159,9 @@ Tests : 145 + 10 (revue) + 23 (TUI) + 5 (comparateur).
 `--relire-tetes` sur le cache gemma : 31 têtes corrigées sur 56 suspectes (388 s). Export des problèmes : 96 mots (66 sans voyelles, 29 incohérents, 1 non arabe). corrections.csv rendu par l'utilisateur : 96 lignes, 87 arabes corrigés, 18 translittérations corrigées, 0 identifiant inconnu.
 `--appliquer-corrections` signale maintenant les corrections à revoir (faute de frappe possible : كُحَيْلَاة pour Kuḥaylâ', مجير sans voyelle, translittération « Tufayi » mal lue). Vérificateur : forme féminine d'une tête masculine (ة finale facultative), « ou », hamza porté (Lu'lu'), ة pour â final (Ṣafwâ).
 Reste : 79 drapeaux `genre_a_verifier` (surtout des prénoms « mixtes » ou masculins en ة : à traiter ou à neutraliser), 26 `sans_point_final`, 11 pages avec < 3 entrées, 5 suites de définition orphelines, ~9 % de pages en repli page entière.
+
+## 16. v4.5.0 — français des définitions, prénoms mixtes (29 oct. 2026)
+Audit de la sortie finale gemma (3 165 lignes, 116 « à vérifier ») : structure et arabe OK ; **français Tesseract = point faible** (≈ 17 % des définitions avec ≥ 1 faute probable, borne haute ; 5 % des mots).
+Ajouts : `verif_francais.py` (suspect = hors dictionnaire fr + rare dans le corpus + hors lexique du domaine ; fusion mot à mot conservatrice), `--relire-corps` (feuille de paragraphes D1…, `EntreeLue.def_box`),
+colonne `mixte`, drapeau de genre neutralisé pour les mixtes (167 entrées mixtes = 205 des 211 « doublons »). Les définitions déjà relues par le modèle ne sont pas réessayées (mots identiques = légitimes).
+Reste : 5 suites de définition orphelines (p. 63, 93, 96, 228, 320), 11 pages à < 3 entrées, 44 `genre_a_verifier` non mixtes, 2 corrections manuelles à revoir (p191-e7-b1, p153-e7-b1), qualité réelle de `--relire-corps` à mesurer sur ton LM Studio.
