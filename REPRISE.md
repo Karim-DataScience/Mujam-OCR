@@ -172,3 +172,9 @@ Run : 285 définitions ciblées, 198 mots corrigés, durée 2 h 04 dont ≈ 1 h 
 Qualité (liste des 198 changements relue) : très majoritairement justes (seroiteur→serviteur, lunnière→lumière, fennne→femme, bonlieur→bonheur, intriédiatement→immédiatement…) ; ratés possibles sur les mots courts (sen→son, bou→bon, sir→sûr, nine→mine) et une apostrophe typographique redressée (aujourd’hui) :
 corrigés (mots < 4 lettres jamais remplacés ; apostrophes ignorées). Définitions avec ≥ 1 mot suspect : 300 (18,0 %) -> 146 (8,8 %) ; mots suspects 370 -> 176 (5,3 % -> 2,5 %) ; le reste = translittérations en italique légitimes + pages 332-338 non traitées.
 À refaire : relancer `--relire-corps` (ne traite que ce qui reste, quelques minutes). Export final : 3 165 lignes, 79 « à vérifier » (42 genre_a_verifier non mixtes, 26 sans_point_final, 5 description_coupee, 4 caracteres_suspects…).
+
+## 18. v4.5.2 — 2ᵉ passe de `--relire-corps` (1er nov. 2026)
+2ᵉ passe : 131 définitions / 156 mots suspects ; seulement 5 mots corrigés (632 s ; pages 332-338 enfin traitées). Diagnostic : le prompt envoyé au modèle ne contenait PAS l'indice Tesseract (pas d'ancrage) ; les mots restants sont soit légitimes
+(≈ 130 : translittérations en italique, mots rares : jujube, houri, gnose…), soit des fautes (≈ 35 : fennne, femine, lunnère, honime, oinbre, nuilieu, parfun, forrnée…) que l'ancienne fusion ne pouvait pas corriger : (1) alignement `difflib` mot pour mot
+(une différence voisine fusionnait les blocs et bloquait le remplacement) ; (2) un mot proposé avec élision (l'homme, l'hyacinthe) était jugé « inconnu » ; (3) « guidance » (2 occurrences) refusé car seuil de fréquence 3.
+Corrigé : alignement par fenêtre de ± 4 mots autour de la position estimée, élisions décomposées, mot du modèle accepté s'il apparaît ≥ 2 fois dans le corpus. À relancer : `--relire-corps` (≈ 10 min). Les ≈ 130 mots légitimes resteront « suspects » (aucun effet).

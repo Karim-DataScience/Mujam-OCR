@@ -59,32 +59,52 @@ def _coeur(mot: str) -> tuple[str, str, str]:
     return m.group(1), m.group(2), m.group(3)
 
 
-def fusionner(ancien: str, propose: str, dico, freq: Counter, similarite_min: float = 0.5) -> tuple[str, list[tuple[str, str]]]:
+def mot_connu(mot: str, dico, freq: Counter) -> bool:
+    """Mot proposé par le modèle : connu du dictionnaire, ou présent au moins 2 fois dans la lecture de Tesseract elle-même (« guidance »).
+    Les élisions (l'homme, qu'il) sont décomposées : les morceaux de moins de 3 lettres sont acceptés."""
+    morceaux = [m for m in re.split(r"[’']", mot) if m]
+    if not morceaux:
+        return False
+    return all(len(m) < 3 or not est_suspect(m, dico, freq, seuil_frequent=2) for m in morceaux)
+
+
+def fusionner(ancien: str, propose: str, dico, freq: Counter, similarite_min: float = 0.5, rayon: int = 4) -> tuple[str, list[tuple[str, str]]]:
     """Corrige `ancien` (corps lu par Tesseract) avec `propose` (corps relu par le modèle), mot suspect par mot suspect.
+    Chaque mot suspect de Tesseract est comparé aux mots du modèle situés à la même place (± `rayon` mots, position estimée par alignement) :
+    on adopte le plus ressemblant (≥ 0,5) s'il est connu. Les différences adjacentes (ponctuation, coupures) n'empêchent plus la correction.
     -> (texte corrigé, [(ancien mot, nouveau mot), …]). Si rien n'est adopté, `ancien` est rendu tel quel."""
     a, b = ancien.split(), propose.split()
     if not a or not b:
         return ancien, []
     sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    pos = [0.0] * len(a)                                  # position estimée de chaque mot de `a` dans `b`
+    utilises: set[int] = set()                            # mots de `b` déjà appariés à l'identique
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        for k in range(i1, i2):
+            pos[k] = j1 + (k - i1) * (j2 - j1) / max(1, i2 - i1)
+        if op == "equal":
+            utilises.update(range(j1, j2))
     changes: list[tuple[str, str]] = []
     sortie = list(a)
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op != "replace" or (i2 - i1) != (j2 - j1):                 # on ne traite que les remplacements mot pour mot
+    for i, av in enumerate(a):
+        pre, cur_a, suf = _coeur(av)
+        if len(cur_a) < 4 or not cur_a.islower() or not est_suspect(cur_a, dico, freq):
             continue
-        for k in range(i2 - i1):
-            av, nv = a[i1 + k], b[j1 + k]
-            pre, cur_a, suf = _coeur(av)
-            _p, cur_b, _s = _coeur(nv)
-            if not cur_a or not cur_b or cur_a == cur_b or cur_a.replace("’", "'") == cur_b.replace("’", "'"):
-                continue                                              # identiques, ou seule l'apostrophe typographique diffère
-            if len(cur_a) < 4:
-                continue                                              # mots courts : trop ambigus pour un remplacement automatique
-            if not (cur_a.islower() and est_suspect(cur_a, dico, freq)):
-                continue                                              # le mot de Tesseract n'était pas suspect : on le garde
-            if cur_b.lower() != cur_b or est_suspect(cur_b, dico, freq) or len(cur_b) < 3:
-                continue                                              # le mot du modèle doit être connu (ou fréquent)
-            if difflib.SequenceMatcher(None, cur_a, cur_b).ratio() < similarite_min:
+        meilleur = None
+        centre = int(round(pos[i]))
+        for j in range(max(0, centre - rayon), min(len(b), centre + rayon + 1)):
+            if j in utilises:
                 continue
-            sortie[i1 + k] = f"{pre}{cur_b}{suf}"
-            changes.append((cur_a, cur_b))
+            _p, cur_b, _s = _coeur(b[j])
+            if not cur_b or cur_b == cur_a or cur_b.replace("’", "'") == cur_a.replace("’", "'") or cur_b.lower() != cur_b or len(cur_b) < 3:
+                continue
+            if not mot_connu(cur_b, dico, freq):
+                continue
+            r = difflib.SequenceMatcher(None, cur_a, cur_b).ratio()
+            if r >= similarite_min and (meilleur is None or r > meilleur[0]):
+                meilleur = (r, j, cur_b)
+        if meilleur:
+            utilises.add(meilleur[1])
+            sortie[i] = f"{pre}{meilleur[2]}{suf}"
+            changes.append((cur_a, meilleur[2]))
     return " ".join(sortie), changes

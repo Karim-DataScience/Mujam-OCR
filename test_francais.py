@@ -46,9 +46,22 @@ class TestFusionConservatrice(unittest.TestCase):
         self.assertFalse(VF.est_suspect("sourate", self.dico, freq))
         self.assertTrue(VF.est_suspect("seroiteur", self.dico, freq))
 
-    def test_modele_qui_reecrit_tout_n_a_aucun_effet_hors_mots_suspects(self):
+    def test_modele_qui_reecrit_n_a_aucun_effet_hors_mots_suspects(self):
+        # le modèle insère « grand » et remplace « très » par « fort » : seul le mot suspect est emprunté, le reste de Tesseract est intact
         nouveau, ch = VF.fusionner("Le seroiteur est très aimé", "Le grand serviteur est fort aimé", self.dico, self.freq)
-        self.assertEqual(nouveau, "Le seroiteur est très aimé")                                          # insertion / remplacements non alignés : rien
+        self.assertEqual(nouveau, "Le serviteur est très aimé")
+        self.assertEqual(ch, [("seroiteur", "serviteur")])
+
+    def test_differences_adjacentes_et_elisions(self):
+        nouveau, ch = VF.fusionner("une fennne belle et « lhomnie » est", "une femme belle et l'homme est", FauxDico(self.dico | {"homme", "l"}), self.freq)
+        self.assertIn("femme", nouveau)
+        self.assertIn("l'homme", nouveau)
+        self.assertEqual(len(ch), 2)
+
+    def test_mot_present_deux_fois_dans_le_corpus_est_accepte_comme_correction(self):
+        freq = VF.Counter({"guidance": 2})
+        nouveau, ch = VF.fusionner("la quidance du bonheur", "la guidance du bonheur", self.dico, freq)
+        self.assertEqual(ch, [("quidance", "guidance")])
 
     def test_corps_et_tete(self):
         self.assertEqual(VF.corps("Khalîl-Allâh : l'ami de Dieu."), ("Khalîl-Allâh", "l'ami de Dieu."))
