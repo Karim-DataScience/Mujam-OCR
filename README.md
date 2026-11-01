@@ -222,7 +222,7 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 - **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
 - Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).
 
-## Comparer et combiner plusieurs modèles automatiquement (v4.5.0) : `comparer_modeles.py`
+## Comparer et combiner plusieurs modèles automatiquement (v4.5.1) : `comparer_modeles.py`
 
 Charge chaque modèle avec le bon contexte via la CLI `lms` de LM Studio (Settings > Developer > « Install the lms CLI »), lance les tâches, décharge, et écrit `comparaison/comparaison_modeles.md`.
 **Attention : chaque chargement est précédé de `lms unload --all`** (les modèles déjà chargés sont déchargés).

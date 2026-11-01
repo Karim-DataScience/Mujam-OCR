@@ -87,6 +87,42 @@ class TestRelireCorps(unittest.TestCase):
         self.assertEqual(apres["entrees"][1]["description"], "Nûr : lumière pour le Vivant.")
 
 
+class TestDisjoncteurSilence(unittest.TestCase):
+    def test_deux_silences_de_suite_arretent_la_passe(self):
+        from PIL import Image
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = X.Config(pdf="faux.pdf", sortie=tmp, pages=[60, 61], essais=3)
+        ent = lambda nom, desc: {"prenoms": [{"genre": "MASCULIN", "orthographes": [nom], "arabe": "عَبْد"}], "description": desc, "description_incomplete": False}
+        for p in (60, 61):
+            d = {"page": p, "bande": 1, "decoupe": 1, "empreinte": X.empreinte(cfg), "statut": "ok", "avertissements": [],
+                 "entrees": [ent("Nom", "Nûr : le seroiteur du Vivant.")]}
+            X.ecrire_atomique(X.chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False))
+        mk = lambda: LH.PageLue(entrees=[LH.EntreeLue(blocs=[LH.BlocLu(genre="MASCULIN", orthographes=["Nom"], arabe=(0, 0, 10, 10))],
+                                                      description="Nûr : le seroiteur du Vivant.", def_box=(0, 0, 200, 40))], problemes=[], page_texte=False)
+        appels = []
+
+        def muet(cfg_, info, png, systeme, texte, **kw):
+            appels.append(1)
+            return {"content": "", "reasoning": "", "abandon": "silence", "finish": "", "tokens": 0, "tokens_reflexion": 0, "tokens_entree": 0,
+                    "tps": 0.0, "ttft": 0.0, "erreur": ""}
+
+        dico = FauxDico(CONNUS | {"nûr"})
+        with mock.patch.object(VF, "charger_dictionnaire", return_value=dico), mock.patch.object(X, "resoudre_modele", return_value=X.InfoModele(id="faux")), \
+                mock.patch.object(X, "afficher_info"), mock.patch.object(X, "image_native", return_value=Image.new("RGB", (50, 50), "white")), \
+                mock.patch.object(X, "nettoyer_page", side_effect=lambda im, *a, **k: im), mock.patch.object(LH, "lire_page", side_effect=lambda net: mk()), \
+                mock.patch.object(LH, "disponible", return_value=(True, "ok")), mock.patch.object(X, "appeler_llm", side_effect=muet):
+            with self.assertRaises(X.ErreurFatale) as ctx:
+                X.relire_corps(cfg)
+        self.assertEqual(len(appels), 2)                           # arrêt dès le 2e silence, pas 3 essais × N pages
+        self.assertIn("ne répond plus", str(ctx.exception))
+
+    def test_apostrophe_et_mots_courts_non_remplaces(self):
+        dico = FauxDico(CONNUS | {"aujourd", "hui", "son"})
+        nouveau, ch = VF.fusionner("le sen d’aujourd’hui", "le son d'aujourd'hui", dico, VF.Counter())
+        self.assertEqual(ch, [])
+
+
 class TestMixte(unittest.TestCase):
     def test_colonne_mixte_et_drapeau_de_genre(self):
         e = {"id": 1, "page": 84, "partiel": False, "description_incomplete": False,

@@ -165,3 +165,10 @@ Audit de la sortie finale gemma (3 165 lignes, 116 « à vérifier ») : structu
 Ajouts : `verif_francais.py` (suspect = hors dictionnaire fr + rare dans le corpus + hors lexique du domaine ; fusion mot à mot conservatrice), `--relire-corps` (feuille de paragraphes D1…, `EntreeLue.def_box`),
 colonne `mixte`, drapeau de genre neutralisé pour les mixtes (167 entrées mixtes = 205 des 211 « doublons »). Les définitions déjà relues par le modèle ne sont pas réessayées (mots identiques = légitimes).
 Reste : 5 suites de définition orphelines (p. 63, 93, 96, 228, 320), 11 pages à < 3 entrées, 44 `genre_a_verifier` non mixtes, 2 corrections manuelles à revoir (p191-e7-b1, p153-e7-b1), qualité réelle de `--relire-corps` à mesurer sur ton LM Studio.
+
+## 17. v4.5.1 — premier run de `--relire-corps` (1er nov. 2026)
+Run : 285 définitions ciblées, 198 mots corrigés, durée 2 h 04 dont ≈ 1 h 30 PERDUES : à partir de p. 332, LM Studio est resté muet (`stall` 300 s × 3 essais ≈ 909 s par page, 6 pages : 332, 334-338) sans aucun avertissement
+(le code ne journalisait pas l'abandon « silence »). Correctif : `_garde_silence` (2 silences de suite -> ErreurFatale claire, pages déjà traitées conservées) dans `--relire-arabe/-tetes/-corps`.
+Qualité (liste des 198 changements relue) : très majoritairement justes (seroiteur→serviteur, lunnière→lumière, fennne→femme, bonlieur→bonheur, intriédiatement→immédiatement…) ; ratés possibles sur les mots courts (sen→son, bou→bon, sir→sûr, nine→mine) et une apostrophe typographique redressée (aujourd’hui) :
+corrigés (mots < 4 lettres jamais remplacés ; apostrophes ignorées). Définitions avec ≥ 1 mot suspect : 300 (18,0 %) -> 146 (8,8 %) ; mots suspects 370 -> 176 (5,3 % -> 2,5 %) ; le reste = translittérations en italique légitimes + pages 332-338 non traitées.
+À refaire : relancer `--relire-corps` (ne traite que ce qui reste, quelques minutes). Export final : 3 165 lignes, 79 « à vérifier » (42 genre_a_verifier non mixtes, 26 sans_point_final, 5 description_coupee, 4 caracteres_suspects…).

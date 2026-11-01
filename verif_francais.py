@@ -75,8 +75,10 @@ def fusionner(ancien: str, propose: str, dico, freq: Counter, similarite_min: fl
             av, nv = a[i1 + k], b[j1 + k]
             pre, cur_a, suf = _coeur(av)
             _p, cur_b, _s = _coeur(nv)
-            if not cur_a or not cur_b or cur_a == cur_b:
-                continue
+            if not cur_a or not cur_b or cur_a == cur_b or cur_a.replace("’", "'") == cur_b.replace("’", "'"):
+                continue                                              # identiques, ou seule l'apostrophe typographique diffère
+            if len(cur_a) < 4:
+                continue                                              # mots courts : trop ambigus pour un remplacement automatique
             if not (cur_a.islower() and est_suspect(cur_a, dico, freq)):
                 continue                                              # le mot de Tesseract n'était pas suspect : on le garde
             if cur_b.lower() != cur_b or est_suspect(cur_b, dico, freq) or len(cur_b) < 3:

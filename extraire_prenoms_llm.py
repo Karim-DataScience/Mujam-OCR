@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.5.0"
+VERSION = "4.5.1"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -1388,6 +1388,7 @@ class Etat:
         self.peut_couper = info.peut_couper_reflexion
         self.penser = cfg.reflexion == "oui" or (cfg.reflexion == "auto" and not self.peut_couper)
         self.coupures_ignorees = 0
+        self.silences = 0                    # requêtes de suite restées sans réponse (voir _garde_silence)
         self.attendus: dict = {}             # page -> nombre d'entrées vu par la mise en page (contrôle de complétude)
         self.hybride = False                 # lecture hybride (mise en page + Tesseract) disponible et demandée
 
@@ -2588,6 +2589,19 @@ def diagnostic(cfg: Config) -> None:
 # 11 bis) RELECTURE CIBLÉE DE L'ARABE (v4.3) : le modèle propose, le vérificateur tranche
 # ============================================================================
 
+def _garde_silence(etat: "Etat", rep: dict, ident: str) -> None:
+    """LM Studio muet (silence max atteint) : le 2e silence de suite arrête la passe au lieu de réessayer page après page
+    (run du 1er nov. 2026 : 6 pages × 15 min de silence = 1 h 30 perdues, sans un seul avertissement)."""
+    if rep.get("abandon") in ("silence", "delai"):
+        etat.silences += 1
+        log(f"  {ident} : LM Studio n'a rien rendu ({rep['abandon']} : aucune réponse depuis {etat.cfg.stall if rep['abandon'] == 'silence' else etat.cfg.timeout} s)", "WARN")
+        if etat.silences >= 2:
+            raise ErreurFatale("LM Studio ne répond plus (2 requêtes de suite sans aucune réponse). Les pages déjà traitées sont enregistrées : "
+                               "recharge le modèle (ou redémarre LM Studio) puis relance la même commande, elle reprendra là où elle s'est arrêtée.")
+    else:
+        etat.silences = 0
+
+
 def relire_arabe(cfg: Config) -> dict:
     """Relit, AVEC réflexion, uniquement les mots arabes dont la lecture est incohérente avec la translittération de la tête.
     Pour chaque page du cache : mise en page recalculée (CPU), feuille réduite aux recadrages suspects, indice « première lecture
@@ -2680,6 +2694,7 @@ def relire_arabe(cfg: Config) -> dict:
                 continue
             if rep["abandon"] == "interruption":
                 raise Interrompu()
+            _garde_silence(etat, rep, ident)
             _journaliser_essai(ident + "-relecture", essai, penser, temp, 0.95, etat, rep, tampon.getvalue())
             if rep["abandon"] == "budget_reflexion":
                 log(f"  {ident} relecture, essai {essai} : réflexion épuisée ({budget} jetons) sans réponse : augmente --budget-reflexion ou retire --reflexion oui", "WARN")
@@ -2892,6 +2907,7 @@ def relire_tetes(cfg: Config) -> dict:
                 continue
             if rep["abandon"] == "interruption":
                 raise Interrompu()
+            _garde_silence(etat, rep, ident)
             stats["requetes"] += 1
             dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
             for rp, (_k, i, _j) in reperes.items():
@@ -2996,6 +3012,7 @@ def relire_corps(cfg: Config) -> dict:
                 continue
             if rep["abandon"] == "interruption":
                 raise Interrompu()
+            _garde_silence(etat, rep, ident)
             stats["requetes"] += 1
             dico_rep = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
             for rp, (_k, i, _j) in reperes.items():
