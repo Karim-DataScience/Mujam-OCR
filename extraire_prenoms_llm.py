@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.5.2"
+VERSION = "4.5.3"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -3040,6 +3040,32 @@ def relire_corps(cfg: Config) -> dict:
     return stats
 
 
+def completer_pages(cfg: Config) -> list[int]:
+    """Repère les pages lues en hybride dont le cache a MOINS d'entrées que la mise en page actuelle (v4.5.3 : lignes de nom « collées » ou à arabe très haut,
+    ex. Abdelmoumine p. 96, Ousfour p. 320 : entrées perdues sans aucun avertissement), sauvegarde leur cache dans <sortie>/cache_avant_completude/ puis le supprime :
+    la relecture normale qui suit les retraite. -> liste des pages à refaire."""
+    import mise_en_page as MP
+    sauve = os.path.join(cfg.sortie, "cache_avant_completude")
+    a_refaire = []
+    for p in cfg.pages:
+        d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        if not d or d.get("methode") != "hybride" or not d.get("entrees"):
+            continue
+        n_cache = sum(1 for e in d["entrees"] if e["prenoms"])
+        m = MP.analyser(nettoyer_page(image_native(cfg.pdf, p)))
+        n_mise = 0 if m.page_texte else sum(1 for e in m.entrees if e.blocs)
+        if n_mise > n_cache:
+            a_refaire.append((p, n_cache, n_mise))
+    os.makedirs(sauve, exist_ok=True) if a_refaire else None
+    for p, n_cache, n_mise in a_refaire:
+        src = chemin_cache(cfg, p, 1)
+        shutil.copy2(src, os.path.join(sauve, os.path.basename(src)))
+        os.remove(src)
+        log(f"  p{p:03d} : {n_cache} entrée(s) en cache, {n_mise} vue(s) par la mise en page : cache sauvegardé et supprimé (page à relire)")
+    log(f"COMPLÉTUDE : {len(a_refaire)} page(s) incomplète(s) sur {len(cfg.pages)} examinée(s)" + (f" ; sauvegardes dans {sauve}" if a_refaire else "") + ".")
+    return [p for p, _, _ in a_refaire]
+
+
 def autotest(cfg: Config) -> None:
     import verite_terrain as vt
     cfg.pages = list(vt.PAGES)
@@ -3117,6 +3143,8 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
     ap.add_argument("--relire-arabe", action="store_true", dest="relire_arabe",
                     help="relit AVEC réflexion les seuls mots arabes incohérents avec la translittération (cache existant), puis ré-exporte")
+    ap.add_argument("--completer-pages", action="store_true", dest="completer_pages",
+                    help="repère les pages hybrides dont le cache a moins d'entrées que la mise en page (entrées perdues), les sauvegarde et les relit")
     ap.add_argument("--relire-corps", action="store_true", dest="relire_corps",
                     help="corrige le français des définitions (mots suspects relus par le modèle de vision, remplacement conservateur), puis ré-exporte")
     ap.add_argument("--relire-tetes", action="store_true", dest="relire_tetes",
@@ -3379,6 +3407,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.appliquer_corrections:
             appliquer_corrections_cli(cfg, a.appliquer_corrections)
             cfg.sans_llm = True
+        if a.completer_pages:
+            completer_pages(cfg)                       # puis extraction normale : seules les pages dont le cache a été retiré sont relues
         if a.relire_tetes:
             relire_tetes(cfg)
             cfg.sans_llm = True

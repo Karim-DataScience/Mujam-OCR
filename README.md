@@ -222,7 +222,7 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 - **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
 - Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).
 
-## Comparer et combiner plusieurs modèles automatiquement (v4.5.2) : `comparer_modeles.py`
+## Comparer et combiner plusieurs modèles automatiquement (v4.5.3) : `comparer_modeles.py`
 
 Charge chaque modèle avec le bon contexte via la CLI `lms` de LM Studio (Settings > Developer > « Install the lms CLI »), lance les tâches, décharge, et écrit `comparaison/comparaison_modeles.md`.
 **Attention : chaque chargement est précédé de `lms unload --all`** (les modèles déjà chargés sont déchargés).
@@ -271,3 +271,12 @@ python extraire_prenoms_llm.py --appliquer-corrections corrections.csv --sortie 
   `python extraire_prenoms_llm.py lelivredesprenom0000geof.pdf --relire-corps --modele google/gemma-4-12b-qat --sortie sortie_llm_googlegemma-4-12b-qat`
 - **Prénoms « mixtes »** : les entrées notées « (mixte) » dans le livre sont exportées dans les deux genres (une ligne MASCULIN, une ligne FEMININ). Nouvelle colonne **`mixte`** (« oui ») pour les repérer / dédoublonner,
   et le drapeau `genre_a_verifier` n'est plus posé sur un masculin en ة quand la définition dit « (mixte) » ou « selon l'usage ».
+
+## Entrées perdues par la mise en page : `--completer-pages` (v4.5.3)
+
+L'analyse d'image classait parfois une ligne de nom comme « suite de définition » : (1) français et arabe NOIRS collés en un seul amas (« Abdelmoumine » p. 96, noms en « Abd… » à arabe allongé) ;
+(2) arabe très haut (« Ousfour / Ousfoura » p. 320 : 97 px pour un seuil de 95, désormais 110). Ces entrées disparaissaient de l'export sans avertissement (8 contrôlées à l'œil : Balqis p. 60, Qounout p. 88, Abdelmoumine p. 96, Abdelmoughni p. 101,
+Salaheddine p. 157, Khéireddine p. 224, Loutfi p. 229, Ousfour p. 320 ; ≈ 20 pages concernées, 1 708 → 1 720 entrées pour tout le livre).
+`--completer-pages` compare, pour chaque page lue en hybride, le nombre d'entrées en cache à celui de la mise en page corrigée ; les pages incomplètes sont sauvegardées dans `<sortie>/cache_avant_completude/`, retirées du cache, puis relues par l'extraction normale (LM Studio requis).
+Les relectures automatiques (`--relire-arabe/-tetes/-corps`) de ces pages sont à relancer ensuite ; tes corrections manuelles ne sont pas concernées (aucune page commune).
+`python extraire_prenoms_llm.py lelivredesprenom0000geof.pdf --completer-pages --modele google/gemma-4-12b-qat --sortie sortie_llm_googlegemma-4-12b-qat`

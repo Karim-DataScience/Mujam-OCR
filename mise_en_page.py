@@ -25,7 +25,7 @@ FRAGMENT_H = 30            # px : un groupe plus bas et plus étroit que ça est
 ECART_AMAS = 50            # px : écart horizontal qui sépare le nom français de l'arabe
 HAUT_MIN_BANDE = 12        # px : hauteur minimale d'une bande de texte
 ECART_DEFINITIONS = 48     # px : deux groupes « définition » plus proches ne forment qu'un paragraphe
-HAUT_MAX_NOM = 95          # px : hauteur maximale d'une ligne de nom (arabe avec points et voyelles compris)
+HAUT_MAX_NOM = 110         # px : hauteur maximale d'une ligne de nom (arabe avec points et voyelles compris ; 95 ratait « Ousfoura » p. 320, 97 px)
 LARG_MAX_NOM = 1480        # px : largeur maximale d'une ligne de nom (deux blocs côte à côte compris) ; une ligne de paragraphe justifié fait ~1490
 
 
@@ -337,6 +337,8 @@ def _classer(m: Mise) -> None:
             g.type, prec_nom = "nom", g
         elif g.rouge > 0.85 and 330 <= g.l <= LARG_MAX_NOM and g.h <= HAUT_MAX_NOM:
             g.type, prec_nom = "nom", g                   # français et arabe rouges collés : le plus grand vide les séparera
+        elif (prec_nom is None and len(g.amas) == 1 and g.rouge < 0.1 and g.epaisseur >= 1.6 and 560 <= g.l <= 900 and g.h <= HAUT_MAX_NOM):
+            g.type, prec_nom = "nom", g                   # français et arabe NOIRS collés en un seul amas (« Abdelmoumine » + arabe allongé) : trait épais = ligne de nom
         else:
             g.type, prec_nom = "definition", None
 

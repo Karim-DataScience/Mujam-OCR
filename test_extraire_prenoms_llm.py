@@ -50,6 +50,32 @@ def rep(content="", reasoning="", finish="stop"):
     return {"content": content, "reasoning": reasoning, "finish": finish, "tokens": 10}
 
 
+class TestCompleterPages(unittest.TestCase):
+    def test_pages_hybrides_incompletes_sont_sauvegardees_et_retirees(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = X.Config(pdf="faux.pdf", sortie=tmp, pages=[60, 61, 62])
+        ent = lambda nom: {"prenoms": [{"genre": "MASCULIN", "orthographes": [nom], "arabe": "عَبْد"}], "description": f"{nom} : x.", "description_incomplete": False}
+        for p, meth, n in ((60, "hybride", 4), (61, "hybride", 5), (62, "vlm", 2)):
+            d = {"page": p, "bande": 1, "decoupe": 1, "empreinte": X.empreinte(cfg), "statut": "ok", "methode": meth, "avertissements": [],
+                 "entrees": [ent(f"N{i}") for i in range(n)] + ([{"prenoms": [], "description": "suite", "description_incomplete": False}] if p == 60 else [])}
+            X.ecrire_atomique(X.chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False))
+
+        class FausseMise:
+            def __init__(self, n):
+                self.page_texte = False
+                self.entrees = [mock.Mock(blocs=[1]) for _ in range(n)]
+
+        comptes = {60: 5, 61: 5, 62: 9}                       # p. 60 : 4 en cache, 5 vues ; p. 61 : complète ; p. 62 : pas hybride, ignorée
+        with mock.patch.object(X, "image_native", return_value=None), mock.patch.object(X, "nettoyer_page", side_effect=lambda im, *a, **k: im):
+            with mock.patch("mise_en_page.analyser", side_effect=[FausseMise(comptes[60]), FausseMise(comptes[61])]):
+                refaire = X.completer_pages(cfg)
+        self.assertEqual(refaire, [60])
+        self.assertFalse(os.path.exists(X.chemin_cache(cfg, 60, 1)))
+        self.assertTrue(os.path.exists(X.chemin_cache(cfg, 61, 1)))
+        self.assertTrue(os.path.exists(os.path.join(tmp, "cache_avant_completude", os.path.basename(X.chemin_cache(cfg, 60, 1)))))
+
+
 class TestAuditV43(unittest.TestCase):
     """Défauts trouvés à l'audit du 20 oct. 2026 : boucle non détectée (p. 98), doublons exportés, relecture ciblée."""
 
@@ -1012,6 +1038,17 @@ class TestMiseEnPage(unittest.TestCase):
     @staticmethod
     def analyser(page):
         return MP.analyser(X.nettoyer_page(X.image_native(PDF, page)))
+
+    def test_lignes_de_nom_collees_ou_hautes_ne_sont_plus_perdues(self):
+        """v4.5.3 : « Abdelmoumine » (p. 96, français + arabe noirs collés en un amas) et « Ousfour / Ousfoura » (p. 320, arabe de 97 px) étaient classés
+        « suite de définition » : entrées perdues sans avertissement."""
+        m96 = self.analyser(96)
+        self.assertTrue(m96.entrees[0].blocs)
+        self.assertTrue(m96.entrees[0].blocs[0].arabe)
+        m320 = self.analyser(320)
+        self.assertEqual([b.genre[0] for b in m320.entrees[0].blocs], ["M", "F"])
+        self.assertEqual(len([e for e in self.analyser(60).entrees if e.blocs]), 5)             # Balqis / Bilqis, perdu avant
+        self.assertEqual(len([e for e in self.analyser(88).entrees if e.blocs]), 7)             # Qounout, perdu avant
 
     def test_page_55_prophetes(self):
         m = self.analyser(55)

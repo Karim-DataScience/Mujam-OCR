@@ -178,3 +178,9 @@ corrigés (mots < 4 lettres jamais remplacés ; apostrophes ignorées). Définit
 (≈ 130 : translittérations en italique, mots rares : jujube, houri, gnose…), soit des fautes (≈ 35 : fennne, femine, lunnère, honime, oinbre, nuilieu, parfun, forrnée…) que l'ancienne fusion ne pouvait pas corriger : (1) alignement `difflib` mot pour mot
 (une différence voisine fusionnait les blocs et bloquait le remplacement) ; (2) un mot proposé avec élision (l'homme, l'hyacinthe) était jugé « inconnu » ; (3) « guidance » (2 occurrences) refusé car seuil de fréquence 3.
 Corrigé : alignement par fenêtre de ± 4 mots autour de la position estimée, élisions décomposées, mot du modèle accepté s'il apparaît ≥ 2 fois dans le corpus. À relancer : `--relire-corps` (≈ 10 min). Les ≈ 130 mots légitimes resteront « suspects » (aucun effet).
+
+## 19. v4.5.3 — entrées perdues par la mise en page (1er nov. 2026)
+3ᵉ passe `--relire-corps` (v4.5.2 confirmée) : 17 mots corrigés sur 151 suspects (540 s) ; le français a convergé (reste ≈ 134 mots, surtout légitimes).
+Investigation des « suites orphelines » : p. 63 et 93 = vrais paragraphes de texte (à ignorer) ; **p. 96 (Abdelmoumine), p. 320 (Ousfour/Ousfoura) = vraies entrées perdues**, et ≈ 18 autres pages perdaient 1 entrée sans signalement.
+Causes : `HAUT_MAX_NOM` 95 < arabe de 97 px ; ligne de nom noire en un seul amas (trait épais ≥ 1,6, largeur 560-900 px). Corrections dans `mise_en_page.py` ; total du livre 1 708 → 1 720 entrées.
+À faire : `--completer-pages` (relit les ≈ 20 pages concernées), puis relancer `--relire-tetes`, `--relire-arabe`, `--relire-corps` (7 pages avaient déjà des relectures auto : 60, 96, 105, 157, 183, 229, 293), puis `--exporter-problemes` pour les nouvelles entrées.

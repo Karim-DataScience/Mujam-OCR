@@ -44,3 +44,8 @@ Non mesuré : couverture de tests chiffrée, TUI sous Windows, LM Studio réel (
 
 ## E. Correctif d'audit du 28 oct. 2026
 L'audit initial avait conclu à tort (A2) que le modèle « perdait » des entrées sur 6-7 pages. Le run gemma l'a réfuté : 11 pages « locales » = toutes des pages de titre (53, 81, 111, 135, 163, 197, 221, 249, 279, 289, 329). Leçon : vérifier l'image avant de conclure à une perte. Corrigé en 4.3.4 (voir REPRISE §13).
+
+## F. Entrées réellement perdues (trouvées le 1er nov. 2026)
+Contrairement aux pages de titre (E), **≈ 20 entrées étaient bien perdues** sur ≈ 20 pages lues en hybride : la mise en page classait leur ligne de nom comme « suite de définition » (amas français+arabe collés, ou arabe de plus de 95 px).
+Aucun avertissement (seules 3 « suites orphelines » étaient visibles). Recoupement : 8 entrées contrôlées à l'œil sur le scan, toutes absentes de l'export. Corrigé en 4.5.3 (`mise_en_page.py` + `--completer-pages`).
+Leçon : un contrôle par comptage (cache vs mise en page) aurait dû exister dès la v4.3.
