@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.5.3"
+VERSION = "4.5.4"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -2033,7 +2033,7 @@ def exploser(entrees: list[dict]) -> list[dict]:
             autre = " / ".join(s for j, x in enumerate(blocs) if j != i for s in x["orthographes"])
             for s in b["orthographes"]:
                 row = {"prénom_fr": s,
-                       "prénom_arab_diacritiques": (VA.retirer_tanwin_final(b["arabe"]) if VA is not None else b["arabe"]),
+                       "prénom_arab_diacritiques": (VA.normaliser_arabe_export(b["arabe"]) if VA is not None else b["arabe"]),
                        "genre": b["genre"],
                        "description_en_français": e["description"],
                        "prénoms_équivalents": " / ".join(x for x in b["orthographes"] if x != s),
@@ -2702,7 +2702,7 @@ def relire_arabe(cfg: Config) -> dict:
             stats["jetons_reflexion"] += int(rep.get("tokens_reflexion") or 0)
             dico = LH.extraire_feuille_json(rep["content"], "" if rep["abandon"] or rep["finish"] == "length" else rep["reasoning"]) or {}
             for rp, (_k, i, j) in reperes.items():
-                v = VA.retirer_tanwin_final(nettoyer_arabe(dico.get(rp, "")))
+                v = VA.normaliser_arabe_export(nettoyer_arabe(dico.get(rp, "")))
                 if not v or (i, j) not in restant:
                     continue
                 cible = restant[(i, j)]

@@ -210,6 +210,13 @@ class TestVerifArabe(unittest.TestCase):
         self.assertEqual(VA.retirer_tanwin_final("دُعَاءً"), "دُعَاء")
         self.assertEqual(VA.retirer_tanwin_final("مُحَمَّد"), "مُحَمَّد")
 
+    def test_voyelles_finales_de_declinaison_retirees(self):
+        """Le livre imprime « نُوح », « خَلِيل الله » : la damma/kasra finale ajoutée par le modèle est retirée (vérifié sur le scan) ; la fatha finale est conservée."""
+        import verif_arabe as VA
+        for avant, apres in [("نُوحُ", "نُوح"), ("إِبْرَاهِيمُ", "إِبْرَاهِيم"), ("خَلِيلُ اللهِ", "خَلِيل الله"), ("رَحْمَةُ اللهِ", "رَحْمَة الله"),
+                             ("عَبْدُ الْمُغْنِيِّ", "عَبْد الْمُغْنِيّ"), ("يَعْقُوبٌ", "يَعْقُوب"), ("طَهَ", "طَهَ"), ("مُحَمَّد", "مُحَمَّد"), ("عَلِيّ", "عَلِيّ")]:
+            self.assertEqual(VA.normaliser_arabe_export(avant), apres, avant)
+
     def test_exploser_pose_le_drapeau_et_retire_le_tanwin(self):
         e = {"id": 1, "page": 58, "description": "Ya'qūb (Jacob) : fils d'Ishâq, petit-fils d'Ibrâhîm.", "description_incomplete": False, "partiel": False,
              "prenoms": [{"genre": "MASCULIN", "orthographes": ["Yaqoub"], "arabe": "يَقُوب"}]}

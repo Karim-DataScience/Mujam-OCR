@@ -23,6 +23,21 @@ def retirer_tanwin_final(ar: str) -> str:
     return "/".join(re.sub(r"[\u064B\u064C\u064D](?=[\u0651\u0652\u0670]*(?:\s|$))", "", p) for p in ar.split("/"))
 
 
+_MARQUE_FINALE = re.compile(r"[\u064F\u0650](?=\u0651?(?:\s|/|،|,|$))")
+
+
+def retirer_marques_finales(ar: str) -> str:
+    """Retire la damma / la kasra qui termine un mot (« نُوحُ » -> « نُوح », « خَلِيلُ اللهِ » -> « خَلِيل الله »). Le livre imprime les noms sous leur forme de
+    pause, sans voyelle de déclinaison ; le modèle en ajoutait sur ≈ 11 % des mots finaux et dans les annexions (vérifié sur le scan, p. 56 et 101 ; les 96 mots
+    saisis à la main par l'utilisateur n'en ont aucune). La fatha finale est conservée : certains mots du livre l'impriment (« طَهَ »)."""
+    return _MARQUE_FINALE.sub("", ar)
+
+
+def normaliser_arabe_export(ar: str) -> str:
+    """Tanwin final + damma/kasra finales retirés (voir retirer_tanwin_final et retirer_marques_finales)."""
+    return retirer_marques_finales(retirer_tanwin_final(ar))
+
+
 # ----------------------------------------------------------------------------- squelette lu
 _UNIF = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ئ": "ي", "ؤ": "و", "ة": "ه", "ک": "ك", "ی": "ي"})
 FAIBLES = set("اويء")

@@ -223,7 +223,7 @@ except ImportError:                                  # module facultatif
 
 
 PROMPT_FEUILLE = """Tu lis des extraits d'un livre de prénoms arabes. Chaque ligne de l'image porte un repère à gauche (A1, A2… = un mot arabe ; T1, T2… = un texte latin) suivi de l'extrait.
-- Repère A… : recopie le mot arabe avec TOUTES ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans les barres d'allongement (tatwil « ـ ») et SANS tanwin final (ً ٌ ٍ) : le mot est donné sous sa forme de dictionnaire. Ne complète rien : un signe absent de l'image reste absent. Illisible : "".
+- Repère A… : recopie le mot arabe avec TOUTES ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans les barres d'allongement (tatwil « ـ ») et SANS tanwin final (ً ٌ ٍ) : le mot est donné sous sa forme de dictionnaire. N'ajoute JAMAIS de voyelle de fin de mot (damma ُ ou kasra ِ de déclinaison sur la dernière lettre, même dans « عَبْد الله ») : le livre n'en imprime pas. Ne complète rien : un signe absent de l'image reste absent. Illisible : "".
 - Repère T… : recopie exactement le texte latin avec ses accents (â î û ê é è), ses points souscrits (ḥ ṣ ḍ ṭ ẓ), ses apostrophes (ʿ ʾ ’ ‘), ses tirets et ses parenthèses. Une lecture automatique approximative est donnée : corrige-la d'après l'image.
 Réponds UNIQUEMENT par un objet JSON de la forme {"A1": "…", "T1": "…"}, sans texte autour."""
 
@@ -390,7 +390,7 @@ PROMPT_RELECTURE = """Tu relis des mots arabes isolés, recadrés dans un dictio
 Pour chaque repère, une première lecture a été jugée INCOHÉRENTE avec la translittération latine du prénom : au moins une lettre est fausse, manquante ou en trop.
 Relis le mot sur l'image, lettre par lettre, de droite à gauche. La translittération aide pour les lettres de base (ʿ = ع, ḥ = ح, ṣ = ص, ḍ = ض, ṭ = ط, ẓ = ظ, dh = ذ, kh = خ, gh = غ, sh = ش, th = ث, q = ق, w = و, y = ي),
 mais l'IMAGE FAIT FOI : n'invente pas une lettre qu'on ne voit pas, ne « corrige » pas le mot d'après ce que tu connais du prénom.
-Recopie le mot avec toutes ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans tatwil et sans tanwin final.
+Recopie le mot avec toutes ses voyelles et tous ses signes visibles (fatha, damma, kasra, shadda, soukoun, madda, hamza), sans tatwil et sans tanwin final. N'ajoute jamais de voyelle de fin de mot (damma ُ / kasra ِ de déclinaison) : le livre n'en imprime pas.
 Réponds UNIQUEMENT par un objet JSON {"A1": "...", "A2": "..."} (un mot arabe par repère, "" si illisible), sans autre texte."""
 
 

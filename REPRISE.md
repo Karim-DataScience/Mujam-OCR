@@ -184,3 +184,8 @@ Corrigé : alignement par fenêtre de ± 4 mots autour de la position estimée, 
 Investigation des « suites orphelines » : p. 63 et 93 = vrais paragraphes de texte (à ignorer) ; **p. 96 (Abdelmoumine), p. 320 (Ousfour/Ousfoura) = vraies entrées perdues**, et ≈ 18 autres pages perdaient 1 entrée sans signalement.
 Causes : `HAUT_MAX_NOM` 95 < arabe de 97 px ; ligne de nom noire en un seul amas (trait épais ≥ 1,6, largeur 560-900 px). Corrections dans `mise_en_page.py` ; total du livre 1 708 → 1 720 entrées.
 À faire : `--completer-pages` (relit les ≈ 20 pages concernées), puis relancer `--relire-tetes`, `--relire-arabe`, `--relire-corps` (7 pages avaient déjà des relectures auto : 60, 96, 105, 157, 183, 229, 293), puis `--exporter-problemes` pour les nouvelles entrées.
+
+## 20. v4.5.4 — `--completer-pages` appliqué, voyelles finales (2 nov. 2026)
+`--completer-pages` : 19 pages refaites en 5 min, 3 165 -> 3 201 lignes (1 665 -> 1 684 entrées), les 8 entrées contrôlées sont récupérées avec un arabe juste ; seule 1 des 264 lignes de ces pages porte un drapeau (genre) ; 75 « à vérifier » au total.
+Constat sur le scan (p. 56, 59, 101) : le livre n'imprime AUCUNE voyelle de déclinaison finale (نُوح, إِبْرَاهِيم, خَلِيل الله) ; gemma en ajoutait 219 dammas + 111 kasras sur le dernier mot et 191 dammas dans les annexions (≈ 430 lignes, 13 %) ;
+les 96 mots saisis à la main n'ont aucune marque finale (sauf طَهَ : fatha, conservée). Correctif : `normaliser_arabe_export` à l'export + consigne dans les prompts. Reste : relancer `--relire-tetes/-arabe/-corps` sur les 19 pages refaites, `--exporter-problemes`.
