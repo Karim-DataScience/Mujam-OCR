@@ -1,0 +1,26 @@
+{
+ "description": "Treasury of Muslim Names : PHOTOGRAPHIES d'un livre ouvert (deux pages par image, de biais, doigts gantés)",
+ "motifs_fichier": [
+  "treasury"
+ ],
+ "langue": "en",
+ "pages": {
+  "debut": 1,
+  "fin": 0
+ },
+ "decalage_page_imprimee": 0,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "Treasury of Muslim Names",
+ "mise_en_page": "Chaque image est une PHOTOGRAPHIE d'un livre ouvert : DEUX pages côte à côte (parfois de biais, avec des doigts gantés sur les bords). Lis les deux pages, la page de gauche puis celle de droite. Chaque entrée : le nom en gras, son écriture arabe en petit à côté, puis la signification en anglais (souvent plusieurs lignes, en retrait). Une grande lettre isolée marque le début d'une section (ignore-la).",
+ "exemple": {
+  "orthographes": [
+   "Habeel"
+  ],
+  "arabe": "هابيل",
+  "genre": "MASCULIN",
+  "description": "Name of one of the sons of Sayyidina Aadam; his sacrifice was accepted by Allah but that of Qabeel, his brother, rejected."
+ },
+ "notes": "Qualité attendue plus faible (photos, perspective). Essaie --max-cote 2200 ; vérifie sur un échantillon.",
+ "nom": "treasury_of_muslim_names"
+}

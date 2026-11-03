@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "4.5.4"
+VERSION = "5.0.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -227,7 +227,8 @@ def infos_environnement() -> dict:
 #    Table « page imprimée -> chapitre / sous-thème », recopiée de la table des matières.
 # ============================================================================
 
-PAGE_OFFSET = 4  # page PDF = page imprimée + 4 (constant sur tout le livre)
+PAGE_OFFSET = 4  # page PDF = page imprimée + 4 (constant sur tout le livre ; remplacé par le profil du document, voir appliquer_profil)
+THEMES_ACTIFS = True   # table CHAPTERS propre au Livre des prénoms arabes ; False pour les autres documents
 
 CHAPTERS = [
     (1, "Les prophètes", 49, 76, [
@@ -282,6 +283,8 @@ DICT_END = CHAPTERS[-1][3] + PAGE_OFFSET     # 338
 def lookup_theme(pdf_page: int) -> tuple[str, str]:
     """(chapitre, sous-thème) d'une page PDF."""
     printed = pdf_page - PAGE_OFFSET
+    if not THEMES_ACTIFS:
+        return "", ""
     for num, title, start, end, subs in CHAPTERS:
         if start <= printed <= end:
             for letter, subtitle, s0, s1 in subs:
@@ -696,6 +699,10 @@ def resoudre_modele(cfg: Config) -> InfoModele:
         candidats = exact or flou
         charges = [m for m in candidats if m.get("loaded_instances")]
         choix = (charges or candidats or [None])[0]
+        seuls_charges = [m for m in llms if m.get("loaded_instances")]
+        if (choix is None or not choix.get("loaded_instances")) and cfg.modele == "prism-ml/bonsai-27b" and len(seuls_charges) == 1:
+            choix = seuls_charges[0]               # --modele non précisé : le seul modèle chargé est utilisé (au lieu d'exiger bonsai)
+            log(f"--modele non précisé : le seul modèle chargé est utilisé : « {choix.get('key')} »")
         if choix is None:
             seuls = [m for m in llms if m.get("loaded_instances")]
             if len(seuls) != 1:
@@ -3066,6 +3073,65 @@ def completer_pages(cfg: Config) -> list[int]:
     return [p for p, _, _ in a_refaire]
 
 
+# ============================================================================
+# 11 quater) PROFILS DE DOCUMENTS (v5.0)
+# ============================================================================
+
+def appliquer_profil(profil: dict, a, args: list[str]) -> None:
+    """Applique un profil (profils/*.json) : décalage de pagination, thèmes, exemple du prompt, et, SI L'UTILISATEUR NE LES A PAS DONNÉS, pages, méthode et dossier de sortie.
+    Le prompt du profil est posé par main() après construire_cfg (cfg.prompt)."""
+    import profils as PR
+    global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC
+    PAGE_OFFSET = int(profil.get("decalage_page_imprimee", PAGE_OFFSET))
+    THEMES_ACTIFS = bool(profil.get("themes", False))
+    ex = (profil.get("exemple") or {}).get("description")
+    if ex:
+        EXEMPLE_DESC = ex
+    pages = profil.get("pages") or {}
+    if not PR.explicite(args, "--pages"):
+        if "debut" in pages and not PR.explicite(args, "--debut"):
+            a.debut = int(pages["debut"])
+        if "fin" in pages and not PR.explicite(args, "--fin"):
+            fin = int(pages["fin"])
+            if fin <= 0 and a.pdf and os.path.isfile(a.pdf):
+                try:
+                    import fitz
+                    with fitz.open(a.pdf) as doc:
+                        fin = len(doc)
+                except Exception:                                    # PDF illisible : l'erreur sera signalée plus loin
+                    fin = a.debut
+            a.fin = max(a.debut, fin)
+    if profil.get("methode") and not PR.explicite(args, "--methode") and getattr(a, "methode", "auto") == "auto":
+        a.methode = profil["methode"]
+    if not a.sortie and profil["nom"] != "geoffroy_livre_des_prenoms_arabes":
+        a.sortie = os.path.join(os.path.dirname(os.path.abspath(__file__)), profil.get("sortie_defaut", "sortie_" + profil["nom"]))
+
+
+def choisir_profil(a, args: list[str]) -> dict | None:
+    """--profil explicite, sinon profil enregistré dans le dossier de sortie (export, relectures), sinon détection par le nom du PDF,
+    sinon profil « generique » (avec avertissement) pour un PDF inconnu. None = comportement historique (Livre des prénoms arabes)."""
+    import profils as PR
+    if a.profil:
+        return PR.charger(a.profil)
+    sortie = a.sortie or os.path.join(os.path.dirname(os.path.abspath(__file__)), "sortie_llm")
+    fichier = os.path.join(sortie, "profil_utilise.json")
+    if os.path.isfile(fichier) and not (a.pdf and PR.detecter(a.pdf)):
+        try:
+            with open(fichier, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    if a.pdf:
+        p = PR.detecter(a.pdf)
+        if p:
+            return p
+        if os.path.isfile(a.pdf) and (a.autotest or a.relire_arabe or a.relire_tetes or a.relire_corps or a.completer_pages or a.exporter_problemes or not a.export):
+            log(f"aucun profil ne correspond à « {os.path.basename(a.pdf)} » : profil « generique » (le modèle lit chaque page entière). "
+                "Crée profils/mon_document.json (voir profils/generique.json) et choisis-le avec --profil.", "WARN")
+            return PR.charger(PR.PROFIL_GENERIQUE)
+    return None
+
+
 def autotest(cfg: Config) -> None:
     import verite_terrain as vt
     cfg.pages = list(vt.PAGES)
@@ -3143,6 +3209,8 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
     ap.add_argument("--relire-arabe", action="store_true", dest="relire_arabe",
                     help="relit AVEC réflexion les seuls mots arabes incohérents avec la translittération (cache existant), puis ré-exporte")
+    ap.add_argument("--profil", default="", help="profil du document (nom dans profils/ ou chemin .json) ; détecté d'après le nom du PDF sinon")
+    ap.add_argument("--lister-profils", action="store_true", dest="lister_profils", help="liste les profils de documents disponibles")
     ap.add_argument("--completer-pages", action="store_true", dest="completer_pages",
                     help="repère les pages hybrides dont le cache a moins d'entrées que la mise en page (entrées perdues), les sauvegarde et les relit")
     ap.add_argument("--relire-corps", action="store_true", dest="relire_corps",
@@ -3372,12 +3440,31 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv == ["--cli"]:
         ap.print_help()                                        # rien à faire : l'aide plutôt qu'une erreur d'usage
         return 0
+    if a.lister_profils:
+        import profils as PR
+        for p in PR.liste_profils():
+            print(f"{p['nom']:44s} {p.get('langue', '?'):2s}  pages {p.get('pages', {}).get('debut', '?')}-{p.get('pages', {}).get('fin') or 'fin'}  {p.get('methode', '')}  {p.get('description', '')}")
+        return 0
     if not (a.export or a.statut or a.diagnostic or a.rapport or a.ecrire_config or a.appliquer_corrections):
         a.pdf = trouver_pdf(a.pdf)
+    try:
+        profil = choisir_profil(a, argv)
+    except ValueError as e:
+        ap.error(str(e))
+    if profil:
+        appliquer_profil(profil, a, argv)
+        log(f"profil : {profil['nom']}")
     try:
         cfg = construire_cfg(a)
     except (ValueError, OSError) as e:
         ap.error(str(e))
+    if profil:
+        import profils as PR
+        prompt_profil = PR.prompt_de(profil)
+        if prompt_profil and not a.prompt_fichier:
+            cfg.prompt = prompt_profil
+        os.makedirs(cfg.sortie, exist_ok=True)
+        ecrire_atomique(os.path.join(cfg.sortie, "profil_utilise.json"), json.dumps(profil, ensure_ascii=False, indent=1))
     if a.ecrire_config:
         ecrire_config(chemin_cfg, {k: getattr(a, k) for k in CLES_CONFIG})
         log(f"configuration enregistrée : {chemin_cfg}")

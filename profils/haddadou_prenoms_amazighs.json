@@ -1,0 +1,29 @@
+{
+ "description": "Recueil de prénoms amazighs (M. A. Haddadou) : entrées numérotées NOM, source, genre, sens ; index en fin de volume (à ignorer)",
+ "motifs_fichier": [
+  "haddadou",
+  "amazigh"
+ ],
+ "langue": "fr",
+ "pages": {
+  "debut": 21,
+  "fin": 178
+ },
+ "decalage_page_imprimee": 1,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "Recueil de prénoms amazighs (Haddadou)",
+ "mise_en_page": "Entrées numérotées de la forme « 0297- TEVIREYLET, To, fém. » : numéro, nom en capitales (alphabet latin avec caractères berbères spéciaux : ɣ ɛ ḥ ṭ ṣ ẓ č…), source (abréviations : Ant. = antique, To = touareg, K = kabyle…), genre « msc. » ou « fém. », puis le sens entre guillemets ‘’…’’ et des renvois (« cf. B. : … »). Au-dessus de chaque entrée une ligne de graphie berbère déformée (tifinagh mal rendu) : IGNORE-la. Il n'y a PAS d'écriture arabe.",
+ "regle_genre": "\"MASCULIN\" pour « msc. », \"FEMININ\" pour « fém. », \"\" si non indiqué.",
+ "regle_arabe": "toujours \"\" (le document n'en contient pas).",
+ "exemple": {
+  "orthographes": [
+   "TEVIREYLET"
+  ],
+  "arabe": "",
+  "genre": "FEMININ",
+  "description": "To, fém."
+ },
+ "notes": "Le numéro d'entrée n'est pas conservé ; l'index des pages 179-193 est exclu.",
+ "nom": "haddadou_prenoms_amazighs"
+}

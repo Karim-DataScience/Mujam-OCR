@@ -1,0 +1,28 @@
+{
+ "description": "A Dictionary of Muslim Names (Hakim) : tableau à 4 colonnes soulignées Nom | variante | sens | arabe",
+ "motifs_fichier": [
+  "haki"
+ ],
+ "langue": "en",
+ "pages": {
+  "debut": 19,
+  "fin": 161
+ },
+ "decalage_page_imprimee": 2,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "A Dictionary of Muslim Names (Hakim)",
+ "mise_en_page": "Tableau à quatre colonnes : (1) le nom en gras souligné, (2) une variante d'orthographe (souvent identique au nom), (3) la signification en anglais, (4) le nom en écriture arabe à l'extrême droite. Titre courant « A Dictionary of Muslim Names » en haut de page. Ordre alphabétique.",
+ "regle_genre": "\"MASCULIN\" ou \"FEMININ\" seulement si un titre de section de la page le dit (Male / Female) ; sinon \"\".",
+ "regle_arabe": "l'écriture arabe de la 4e colonne, telle qu'imprimée (avec les voyelles si elles y sont) ; \"\" si absente.",
+ "exemple": {
+  "orthographes": [
+   "Khuzam"
+  ],
+  "arabe": "خُزام",
+  "genre": "",
+  "description": "Plant with fragrant blossoms"
+ },
+ "notes": "« orthographes » = nom puis variante seulement si elle DIFFÈRE du nom.",
+ "nom": "hakim_dictionary_of_muslim_names"
+}

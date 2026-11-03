@@ -1,0 +1,16 @@
+{
+ "description": "Profil par défaut pour un dictionnaire de prénoms inconnu : le modèle de vision lit chaque page entière",
+ "motifs_fichier": [],
+ "langue": "?",
+ "pages": {
+  "debut": 1,
+  "fin": 0
+ },
+ "decalage_page_imprimee": 0,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "dictionnaire de prénoms",
+ "mise_en_page": "Chaque entrée associe un prénom (souvent en gras, parfois accompagné de son écriture arabe) à sa signification ou définition. La disposition varie (tableau à colonnes, liste, texte continu) : repère le nom, son éventuelle écriture arabe, sa signification, et le genre quand la page l'indique par un titre de section ou une mention.",
+ "notes": "Point de départ pour un document sans profil : essaie 3-4 pages (--pages 40-43), regarde le résultat, puis copie ce fichier en profils/mon_document.json et précise la mise en page.",
+ "nom": "generique"
+}

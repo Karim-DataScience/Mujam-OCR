@@ -1,0 +1,28 @@
+{
+ "description": "A Dictionary of Muslim Names (Prof. Abdur Rahman) : tableaux Nom | arabe | sens, rubriques MALE NAMES / FEMALE NAMES",
+ "motifs_fichier": [
+  "abdur"
+ ],
+ "langue": "en",
+ "pages": {
+  "debut": 7,
+  "fin": 147
+ },
+ "decalage_page_imprimee": -2,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "A Dictionary of Muslim Names (Abdur Rahman)",
+ "mise_en_page": "Tableau à trois colonnes : (1) le nom en alphabet latin, (2) le même nom en écriture arabe, (3) sa signification en anglais, sur 1 à 3 lignes. Le titre « MALE NAMES » ou « FEMALE NAMES » en haut de page donne le genre de TOUTES les entrées de la page. Les noms sont par ordre alphabétique.",
+ "regle_genre": "\"MASCULIN\" sous le titre MALE NAMES, \"FEMININ\" sous FEMALE NAMES.",
+ "regle_arabe": "l'écriture arabe de la colonne du milieu, recopiée telle qu'imprimée (en général sans voyelles) ; \"\" si absente.",
+ "exemple": {
+  "orthographes": [
+   "Nazim"
+  ],
+  "arabe": "ناظم",
+  "genre": "MASCULIN",
+  "description": "organiser, governor, arranger, adjuster, administrator, director, a composer of verses"
+ },
+ "notes": "Le texte intégré du PDF est exploitable pour le latin mais pas pour l'arabe : lecture par le modèle de vision.",
+ "nom": "abdur_rahman_dictionary_of_muslim_names"
+}

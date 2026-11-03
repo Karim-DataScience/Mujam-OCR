@@ -189,3 +189,23 @@ Causes : `HAUT_MAX_NOM` 95 < arabe de 97 px ; ligne de nom noire en un seul amas
 `--completer-pages` : 19 pages refaites en 5 min, 3 165 -> 3 201 lignes (1 665 -> 1 684 entrées), les 8 entrées contrôlées sont récupérées avec un arabe juste ; seule 1 des 264 lignes de ces pages porte un drapeau (genre) ; 75 « à vérifier » au total.
 Constat sur le scan (p. 56, 59, 101) : le livre n'imprime AUCUNE voyelle de déclinaison finale (نُوح, إِبْرَاهِيم, خَلِيل الله) ; gemma en ajoutait 219 dammas + 111 kasras sur le dernier mot et 191 dammas dans les annexions (≈ 430 lignes, 13 %) ;
 les 96 mots saisis à la main n'ont aucune marque finale (sauf طَهَ : fatha, conservée). Correctif : `normaliser_arabe_export` à l'export + consigne dans les prompts. Reste : relancer `--relire-tetes/-arabe/-corps` sur les 19 pages refaites, `--exporter-problemes`.
+
+## 21. v5.0.0 — profils de documents (3 nov. 2026) — ÉTAT DE FIN DE DISCUSSION
+Livré dans ce zip : `profils.py`, `profils/*.json` (9 profils), options `--profil` / `--lister-profils`, détection du PDF par son nom, `profil_utilise.json` écrit dans le dossier de sortie, repli sur le seul modèle chargé quand `--modele` n'est pas précisé,
+`THEMES_ACTIFS` (thèmes du Livre des prénoms arabes désactivés pour les autres documents), tests `test_profils.py`. Un reset du bac à sable a effacé une première version de ce travail : refaite à partir du zip 4.5.4.
+**Jamais testé avec un vrai LM Studio** : les 7 profils autres que Geoffroy (prompts écrits d'après des captures de pages : Abdur Rahman tableau 3 colonnes ; Hakim 4 colonnes ; Usmani liste « Nom : arabe / sens » avec Male/Female Names ; Pénoncourt « Nom (arabe) : définition » par sections Masculin/Féminin ;
+Hareeri noms d'Allah puis prénoms ; Haddadou entrées numérotées « 0297- NOM, To, fém. » sans arabe ; Treasury = PHOTOS de livre ouvert, deux pages par image).
+Plages de pages (PDF) : Abdur 7-147 (décalage -2) ; Hakim 19-161 (+2) ; Usmani 1-fin (-1, non vérifié) ; Pénoncourt 17-241 (+2) ; Hareeri 17-237 (0) ; Haddadou 21-178 (+1, index 179-193 exclu) ; Treasury 1-fin (0).
+Le livre « Le livre des prénoms arabes » est TERMINÉ pour l'essentiel (3 201 lignes, 1 684 entrées, 75 lignes « à vérifier » ; relecture du français convergée ; 19 pages complétées ; voyelles finales de déclinaison retirées à l'export) ; restent mineurs :
+2 corrections manuelles à revoir (p191-e7-b1 كُحَيْلَاء ?, p153-e7-b1 مُجِير ?), `--relire-corps` à relancer avec `--modele google/gemma-4-12b-qat` sur les 19 pages refaites (124 définitions suspectes dont la plupart légitimes), 42 genre_a_verifier non mixtes, 11 pages courtes non examinées.
+
+## 22. Prompt à coller dans la nouvelle discussion
+```
+Je reprends un projet d'extraction de dictionnaires de prénoms (PDF -> CSV/Excel/JSON) avec LM Studio. Je joins extraction_prenoms_llm_v5_0_0.zip (code complet, README.md, REPRISE.md, AUDIT.md, profils/) et, si utile, les PDF et le dossier de sortie du livre déjà traité.
+Lis REPRISE.md en premier (surtout les §13 à §21) : contexte, constats chiffrés, décisions et état exact.
+Je suis sous Windows (Ryzen 9 9955HX, RTX 5070 Ti 12 Go, 32 Go), LM Studio avec google/gemma-4-12b-qat (retenu après comparaison : bien meilleur que bonsai-27b et ornith-1.0-9b pour l'arabe), Tesseract 5.5 installé. Tout est en français.
+Situation : « Le livre des prénoms arabes » est terminé pour l'essentiel (voir §21). Le script est maintenant piloté par des profils de documents (profils/*.json) ; les 7 autres profils (Abdur Rahman, Hakim, Usmani, Pénoncourt, Hareeri, Haddadou/amazigh, Treasury) n'ont JAMAIS été testés avec un vrai modèle.
+Prochaine étape : <ex. « voici le résultat de --profil usmani_islamic_names --pages 40-43 : analyse-le et corrige le profil » ou « finis les points mineurs du livre »>.
+Règles de travail : le bac à sable peut être réinitialisé -> travaille depuis le zip, relance les tests (python test_extraire_prenoms_llm.py, test_prenoms_tui.py, python -m unittest test_profils test_revue_manuelle test_comparer_modeles test_francais) et re-livre un zip complet à la fin sous un NOUVEAU nom de version.
+Sois honnête sur ce qui n'est pas testé ; vérifie sur l'image avant de conclure à une perte de données (une erreur d'audit passée venait de là).
+```

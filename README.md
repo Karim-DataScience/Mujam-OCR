@@ -222,7 +222,7 @@ Codes de sortie : 0 ok · 1 erreur inattendue (trace dans le log) · 2 erreur fa
 - **Garde-fous** (audit du 20 oct. 2026) : boucle de noms répétés détectée en quelques centaines de jetons ; entrées en double supprimées ; si le modèle rend 0 entrée (ou un nombre aberrant) alors que la mise en page en voit, la page est reprise en « lecture locale seule » (arabe vide, drapeau) au lieu d'être perdue.
 - Autres options : `--modele NOM` (modèle chargé, ex. `google/gemma-4-12b-qat`), `--tui` (interface plein écran), `--version`. Une option répétée en ligne de commande affiche maintenant un avertissement (seule la dernière compte).
 
-## Comparer et combiner plusieurs modèles automatiquement (v4.5.4) : `comparer_modeles.py`
+## Comparer et combiner plusieurs modèles automatiquement (v5.0.0) : `comparer_modeles.py`
 
 Charge chaque modèle avec le bon contexte via la CLI `lms` de LM Studio (Settings > Developer > « Install the lms CLI »), lance les tâches, décharge, et écrit `comparaison/comparaison_modeles.md`.
 **Attention : chaque chargement est précédé de `lms unload --all`** (les modèles déjà chargés sont déchargés).
@@ -272,7 +272,7 @@ python extraire_prenoms_llm.py --appliquer-corrections corrections.csv --sortie 
 - **Prénoms « mixtes »** : les entrées notées « (mixte) » dans le livre sont exportées dans les deux genres (une ligne MASCULIN, une ligne FEMININ). Nouvelle colonne **`mixte`** (« oui ») pour les repérer / dédoublonner,
   et le drapeau `genre_a_verifier` n'est plus posé sur un masculin en ة quand la définition dit « (mixte) » ou « selon l'usage ».
 
-## Entrées perdues par la mise en page : `--completer-pages` (v4.5.4)
+## Entrées perdues par la mise en page : `--completer-pages` (v5.0.0)
 
 L'analyse d'image classait parfois une ligne de nom comme « suite de définition » : (1) français et arabe NOIRS collés en un seul amas (« Abdelmoumine » p. 96, noms en « Abd… » à arabe allongé) ;
 (2) arabe très haut (« Ousfour / Ousfoura » p. 320 : 97 px pour un seuil de 95, désormais 110). Ces entrées disparaissaient de l'export sans avertissement (8 contrôlées à l'œil : Balqis p. 60, Qounout p. 88, Abdelmoumine p. 96, Abdelmoughni p. 101,
@@ -281,6 +281,14 @@ Salaheddine p. 157, Khéireddine p. 224, Loutfi p. 229, Ousfour p. 320 ; ≈ 20 
 Les relectures automatiques (`--relire-arabe/-tetes/-corps`) de ces pages sont à relancer ensuite ; tes corrections manuelles ne sont pas concernées (aucune page commune).
 `python extraire_prenoms_llm.py lelivredesprenom0000geof.pdf --completer-pages --modele google/gemma-4-12b-qat --sortie sortie_llm_googlegemma-4-12b-qat`
 
-## Voyelles finales (v4.5.4)
+## Voyelles finales (v5.0.0)
 Le livre imprime les noms arabes sous leur forme de pause : « نُوح », « إِبْرَاهِيم », « خَلِيل الله » (vérifié sur le scan). Le modèle ajoutait une damma / kasra de déclinaison sur ≈ 13 % des lignes (« نُوحُ », « خَلِيلُ اللهِ »).
 L'export les retire (`verif_arabe.normaliser_arabe_export`, avec le tanwin) et les consignes envoyées au modèle l'interdisent. La fatha finale est conservée (« طَهَ »). Aucune relecture nécessaire : c'est appliqué à l'export, sur le cache existant.
+
+## Plusieurs documents : les profils (v5.0)
+Le moteur est commun ; ce qui est propre à un livre vit dans `profils/<nom>.json` (pages utiles, décalage de pagination, description de la mise en page envoyée au modèle, règles de genre et d'arabe, méthode de lecture).
+`python extraire_prenoms_llm.py --lister-profils` ; le profil est détecté d'après le nom du PDF, ou choisi avec `--profil NOM`. Un PDF inconnu utilise le profil `generique` (le modèle lit chaque page entière).
+Le profil appliqué est enregistré dans `<sortie>/profil_utilise.json` : l'export et les relectures le retrouvent. Les options données en ligne de commande (`--debut`, `--fin`, `--pages`, `--methode`, `--sortie`) l'emportent sur le profil.
+Profils fournis : geoffroy (Livre des prénoms arabes, seul à utiliser la lecture hybride), abdur_rahman, hakim, usmani, penoncourt, hareeri, haddadou (amazigh), treasury (photos), generique.
+**Non testés avec un vrai modèle** : les prompts des 7 autres profils ont été écrits d'après l'aspect des pages ; essaie 3-4 pages (`--pages 40-43`) avant de lancer un document entier. Les passes de relecture (`--relire-*`, `--completer-pages`) ne valent que pour le profil Geoffroy.
+Document écarté : `indexconcordance0000hard_1.pdf` (996 pages) n'est pas un dictionnaire de prénoms.

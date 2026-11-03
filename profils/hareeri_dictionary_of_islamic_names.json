@@ -1,0 +1,28 @@
+{
+ "description": "Dictionary of Islamic Names (Hafiz Shaukat Ali Hareeri) : noms d'Allah puis prénoms masculins / féminins, arabe entre parenthèses",
+ "motifs_fichier": [
+  "islamic-names-dictionary",
+  "hareeri"
+ ],
+ "langue": "en",
+ "pages": {
+  "debut": 17,
+  "fin": 237
+ },
+ "decalage_page_imprimee": 0,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "Dictionary of Islamic Names (Hareeri)",
+ "mise_en_page": "Entrées : le nom latin en gras (translittération), puis son écriture arabe entre parenthèses, puis la signification en anglais, parfois suivie d'une note entre crochets (« [This attributive Name is mentioned 4 times in the Qur'an…] »). Le titre courant donne la rubrique : « Attributive Names of Allah Almighty » (noms d'Allah), « Islamic Names for the Muslim Males », « … Females ».",
+ "regle_genre": "\"MASCULIN\" / \"FEMININ\" d'après le titre courant (Males / Females) ; \"\" pour les noms d'Allah ou sans indication.",
+ "exemple": {
+  "orthographes": [
+   "Al-'Alîm"
+  ],
+  "arabe": "الْعَلِيم",
+  "genre": "",
+  "description": "The All Knower [This attributive Name is mentioned 153 times in the Noble Qur'an.]"
+ },
+ "notes": "Les pages de noms d'Allah (≈ 55-130) sont d'un genre différent des prénoms : filtre-les sur la colonne genre vide si besoin.",
+ "nom": "hareeri_dictionary_of_islamic_names"
+}

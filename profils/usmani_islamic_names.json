@@ -1,0 +1,28 @@
+{
+ "description": "Islamic Names (Shaykh Imran Ashraf Usmani) : liste Nom : arabe / sens, rubriques Male Names / Female Names, scan sans texte",
+ "motifs_fichier": [
+  "usmani",
+  "shaykhimran"
+ ],
+ "langue": "en",
+ "pages": {
+  "debut": 1,
+  "fin": 0
+ },
+ "decalage_page_imprimee": -1,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "Islamic Names (Usmani)",
+ "mise_en_page": "Liste d'entrées : le nom en gras suivi de « : », puis son écriture arabe (petite), puis la signification en anglais sur la ligne suivante, souvent précédée de l'origine entre parenthèses « (Persian) ». Le titre « Male Names » ou « Female Names » (en italique, en haut de page) donne le genre de TOUTES les entrées de la page. Les pages d'introduction ne contiennent pas d'entrées.",
+ "regle_genre": "\"MASCULIN\" sous « Male Names », \"FEMININ\" sous « Female Names » ; \"\" sur une page sans titre de ce type.",
+ "exemple": {
+  "orthographes": [
+   "Gulaab"
+  ],
+  "arabe": "گلاب",
+  "genre": "FEMININ",
+  "description": "(Persian): Rose."
+ },
+ "notes": "Plage non vérifiée (aucun texte intégré) : les pages sans entrée rendent {\"entrees\":[]} ; resserre --debut/--fin après un essai.",
+ "nom": "usmani_islamic_names"
+}

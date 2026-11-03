@@ -1,0 +1,28 @@
+{
+ "description": "Le dictionnaire des prénoms (arabes) : entrées Nom (arabe) : définition, sections Masculin / Féminin par lettre",
+ "motifs_fichier": [
+  "peno"
+ ],
+ "langue": "fr",
+ "pages": {
+  "debut": 17,
+  "fin": 241
+ },
+ "decalage_page_imprimee": 2,
+ "methode": "vlm",
+ "themes": false,
+ "titre": "Le dictionnaire des prénoms (prénoms arabes)",
+ "mise_en_page": "Entrées en ordre alphabétique : le nom latin en gras (translittération savante avec signes diacritiques : â î û ḥ ṣ ḍ ṭ ẓ ʿ), puis son écriture arabe entre parenthèses (avec voyelles), puis « : » et la définition en français, parfois suivie de « Ex : » (personnages portant ce nom) et de la forme féminine (« Féminin : Zâhida »). Des titres « Masculin » / « Féminin » (ou « Mixte ») séparent les sections ; une page de titre avec une grande lettre ouvre chaque lettre (ignore-la).",
+ "regle_genre": "\"MASCULIN\" sous le titre Masculin, \"FEMININ\" sous Féminin ; \"\" sous Mixte ou sans titre.",
+ "regle_arabe": "l'écriture arabe entre parenthèses, avec TOUTES les voyelles imprimées ; \"\" si absente.",
+ "exemple": {
+  "orthographes": [
+   "Zâhir"
+  ],
+  "arabe": "زَاهِر",
+  "genre": "MASCULIN",
+  "description": "Zâhir : Brillant, éclatant, florissant. Ex : Zâhir b. al-Aswad, compagnon du Prophète."
+ },
+ "notes": "La description commence par le nom suivi de « : » comme dans le Livre des prénoms arabes : le contrôle arabe/translittération (arabe_incoherent_translit) s'applique. Le texte intégré du PDF est corrompu (« ? »).",
+ "nom": "penoncourt_dictionnaire_des_prenoms"
+}

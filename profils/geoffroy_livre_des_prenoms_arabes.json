@@ -1,0 +1,18 @@
+{
+ "description": "Le livre des prénoms arabes (Y. et N. Geoffroy) : scan sans texte, dictionnaire thématique en deux colonnes MASCULIN (noir) / FEMININ (rouge)",
+ "motifs_fichier": [
+  "geof",
+  "livredesprenom",
+  "pr[ée]noms?.?arabes"
+ ],
+ "langue": "fr",
+ "pages": {
+  "debut": 53,
+  "fin": 338
+ },
+ "decalage_page_imprimee": 4,
+ "methode": "auto",
+ "themes": true,
+ "notes": "Seul profil à utiliser la lecture hybride (mise en page par traitement d'image + Tesseract) : toutes les passes de relecture (--relire-arabe/-tetes/-corps, --completer-pages) en dépendent.",
+ "nom": "geoffroy_livre_des_prenoms_arabes"
+}
