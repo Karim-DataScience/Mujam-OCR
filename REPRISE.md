@@ -199,6 +199,13 @@ Plages de pages (PDF) : Abdur 7-147 (décalage -2) ; Hakim 19-161 (+2) ; Usmani 
 Le livre « Le livre des prénoms arabes » est TERMINÉ pour l'essentiel (3 201 lignes, 1 684 entrées, 75 lignes « à vérifier » ; relecture du français convergée ; 19 pages complétées ; voyelles finales de déclinaison retirées à l'export) ; restent mineurs :
 2 corrections manuelles à revoir (p191-e7-b1 كُحَيْلَاء ?, p153-e7-b1 مُجِير ?), `--relire-corps` à relancer avec `--modele google/gemma-4-12b-qat` sur les 19 pages refaites (124 définitions suspectes dont la plupart légitimes), 42 genre_a_verifier non mixtes, 11 pages courtes non examinées.
 
+## 21 bis. v5.1.0 — la TUI applique les profils (4 nov. 2026)
+- **Bug** : `choisir_profil` / `appliquer_profil` n'étaient appelés que par `main()` ; la TUI appelait `construire_cfg` directement -> toujours pages 53-338, prompt de Geoffroy, `sortie_llm`, quel que soit le PDF.
+- **Correctif** : `cfg_avec_profil(a, args)` (moteur) = chemin unique CLI + TUI ; `memoriser_profil` ; `reinitialiser_profil` (changer de profil sans relancer ne garde plus le décalage / l'exemple du précédent) ; champ « Profil du document » dans Réglages (clé `profil` de la configuration) ; l'Accueil affiche le profil.
+- **Garde-fous** : `controler_dossier_profil` refuse de mélanger deux documents dans un dossier ; `--autotest` refusé hors profil Geoffroy.
+- **Testé** : `test_profil_choix.py` (14 tests : PDF synthétique + TUI headless), `--statut` et TUI headless sur les 7 PDF réels (profil, plages, nb de pages). 53 tests rapides OK ; moteur 148 OK dont 55 ignorés et TUI 23 ignorés **faute du PDF de Geoffroy dans ce bac à sable** (non rejoués ici : à relancer chez toi).
+- **Toujours non testé** : les 7 profils avec un vrai modèle.
+
 ## 22. Prompt à coller dans la nouvelle discussion
 ```
 Je reprends un projet d'extraction de dictionnaires de prénoms (PDF -> CSV/Excel/JSON) avec LM Studio. Je joins extraction_prenoms_llm_v5_0_0.zip (code complet, README.md, REPRISE.md, AUDIT.md, profils/) et, si utile, les PDF et le dossier de sortie du livre déjà traité.

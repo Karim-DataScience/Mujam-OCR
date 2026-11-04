@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -227,7 +227,8 @@ def infos_environnement() -> dict:
 #    Table « page imprimée -> chapitre / sous-thème », recopiée de la table des matières.
 # ============================================================================
 
-PAGE_OFFSET = 4  # page PDF = page imprimée + 4 (constant sur tout le livre ; remplacé par le profil du document, voir appliquer_profil)
+PAGE_OFFSET_DEFAUT = 4
+PAGE_OFFSET = PAGE_OFFSET_DEFAUT  # page PDF = page imprimée + 4 (constant sur tout le livre ; remplacé par le profil du document, voir appliquer_profil)
 THEMES_ACTIFS = True   # table CHAPTERS propre au Livre des prénoms arabes ; False pour les autres documents
 
 CHAPTERS = [
@@ -328,7 +329,8 @@ NOTE_BANDE = {
 }
 
 # description de l'exemple du prompt : si TOUTES les entrées renvoyées l'ont, le modèle a recopié l'exemple
-EXEMPLE_DESC = "Karîm / Karîma : généreux."
+EXEMPLE_DESC_DEFAUT = "Karîm / Karîma : généreux."
+EXEMPLE_DESC = EXEMPLE_DESC_DEFAUT
 
 
 # ============================================================================
@@ -372,6 +374,7 @@ class Config:
     refaire: bool = False
     sauver_images: bool = False
     ancien: str = ""
+    profil_nom: str = ""           # profil de document appliqué (renseigné par cfg_avec_profil)
     export_tous: int = 10          # export intermédiaire tous les N pages terminées (0 = seulement à la fin)
     sans_llm: bool = False         # --export : reconstruit les fichiers depuis le cache, sans contacter LM Studio
     cle_api: str = ""
@@ -3077,11 +3080,21 @@ def completer_pages(cfg: Config) -> list[int]:
 # 11 quater) PROFILS DE DOCUMENTS (v5.0)
 # ============================================================================
 
+PROFIL_HISTORIQUE = "geoffroy_livre_des_prenoms_arabes"
+
+
+def reinitialiser_profil() -> None:
+    """Remet les réglages globaux propres à un document à leurs valeurs historiques (Livre des prénoms arabes)."""
+    global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC
+    PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC = PAGE_OFFSET_DEFAUT, True, EXEMPLE_DESC_DEFAUT
+
+
 def appliquer_profil(profil: dict, a, args: list[str]) -> None:
     """Applique un profil (profils/*.json) : décalage de pagination, thèmes, exemple du prompt, et, SI L'UTILISATEUR NE LES A PAS DONNÉS, pages, méthode et dossier de sortie.
     Le prompt du profil est posé par main() après construire_cfg (cfg.prompt)."""
     import profils as PR
     global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC
+    reinitialiser_profil()                                     # sinon un profil sans « exemple » hériterait de celui d'avant (TUI : on change de document sans relancer)
     PAGE_OFFSET = int(profil.get("decalage_page_imprimee", PAGE_OFFSET))
     THEMES_ACTIFS = bool(profil.get("themes", False))
     ex = (profil.get("exemple") or {}).get("description")
@@ -3103,7 +3116,7 @@ def appliquer_profil(profil: dict, a, args: list[str]) -> None:
             a.fin = max(a.debut, fin)
     if profil.get("methode") and not PR.explicite(args, "--methode") and getattr(a, "methode", "auto") == "auto":
         a.methode = profil["methode"]
-    if not a.sortie and profil["nom"] != "geoffroy_livre_des_prenoms_arabes":
+    if not a.sortie and profil["nom"] != PROFIL_HISTORIQUE:
         a.sortie = os.path.join(os.path.dirname(os.path.abspath(__file__)), profil.get("sortie_defaut", "sortie_" + profil["nom"]))
 
 
@@ -3132,8 +3145,55 @@ def choisir_profil(a, args: list[str]) -> dict | None:
     return None
 
 
+def controler_dossier_profil(cfg: Config, profil: dict | None) -> None:
+    """Refuse de mélanger deux documents dans un même dossier de sortie (le cache et les exports seraient mêlés ou écrasés)."""
+    nom = profil["nom"] if profil else PROFIL_HISTORIQUE
+    fichier = os.path.join(cfg.sortie, "profil_utilise.json")
+    cache = os.path.join(cfg.sortie, "cache")
+    if not os.path.isfile(fichier) or not (os.path.isdir(cache) and os.listdir(cache)):
+        return
+    try:
+        with open(fichier, encoding="utf-8") as f:
+            ancien = json.load(f).get("nom")
+    except (OSError, ValueError, AttributeError):
+        return
+    if ancien and ancien != nom:
+        raise ValueError(f"le dossier de sortie « {cfg.sortie} » contient déjà l'extraction du profil « {ancien} » ; le profil choisi est « {nom} ». "
+                         "Laisse le dossier de sortie vide (chaque profil a le sien) ou indique un autre dossier.")
+
+
+def cfg_avec_profil(a, args: list[str]) -> tuple[Config, dict | None]:
+    """Chemin commun à la ligne de commande et à la TUI : choisit le profil, applique ses pages / décalage / méthode / sortie, construit la
+    configuration, pose le prompt du profil. `args` = options que l'utilisateur a données lui-même (celles-ci priment sur le profil).
+    Lève ValueError (profil introuvable, option invalide, dossier de sortie d'un autre document)."""
+    import profils as PR
+    profil = choisir_profil(a, args)
+    if profil:
+        appliquer_profil(profil, a, args)
+    else:
+        reinitialiser_profil()
+    cfg = construire_cfg(a)
+    if profil:
+        prompt_profil = PR.prompt_de(profil)
+        if prompt_profil and not a.prompt_fichier:
+            cfg.prompt = prompt_profil
+    controler_dossier_profil(cfg, profil)
+    cfg.profil_nom = profil["nom"] if profil else PROFIL_HISTORIQUE
+    return cfg, profil
+
+
+def memoriser_profil(cfg: Config, profil: dict | None) -> None:
+    """Écrit profil_utilise.json dans le dossier de sortie (les exports et relectures retrouvent ainsi le profil)."""
+    if profil:
+        os.makedirs(cfg.sortie, exist_ok=True)
+        ecrire_atomique(os.path.join(cfg.sortie, "profil_utilise.json"), json.dumps(profil, ensure_ascii=False, indent=1))
+
+
 def autotest(cfg: Config) -> None:
     import verite_terrain as vt
+    if cfg.profil_nom and cfg.profil_nom != PROFIL_HISTORIQUE:
+        raise ErreurFatale(f"l'autotest compare à la vérité terrain du Livre des prénoms arabes (pages 55, 56, 100, 150) : il n'a pas de sens pour le profil « {cfg.profil_nom} ». "
+                           "Pour un autre document, lance quelques pages (--pages 40-43) et regarde le résultat.")
     cfg.pages = list(vt.PAGES)
     cfg.sortie = os.path.join(cfg.sortie, "autotest")
     rows, infos, avert = run_pipeline(cfg)
@@ -3167,7 +3227,7 @@ CONFIG_DEFAUT = os.environ.get("PRENOMS_CONFIG") or os.path.join(os.path.dirname
 CLES_CONFIG = ("pdf", "url", "modele", "api", "cle_api", "sortie", "pages", "debut", "fin", "paralleles", "decoupe", "nettoyage",
                "tokens_image", "max_cote", "reflexion", "budget_reflexion", "temperature", "top_p", "top_k", "repeat_penalty",
                "max_tokens", "timeout", "stall", "attente", "suivi", "essais", "export_tous", "corps_extra", "prompt_fichier",
-               "ancien", "log_niveau", "methode", "tesseract", "tessdata", "tess_lang")
+               "ancien", "log_niveau", "methode", "tesseract", "tessdata", "tess_lang", "profil")
 
 
 def creer_parser() -> argparse.ArgumentParser:
@@ -3448,23 +3508,12 @@ def main(argv: list[str] | None = None) -> int:
     if not (a.export or a.statut or a.diagnostic or a.rapport or a.ecrire_config or a.appliquer_corrections):
         a.pdf = trouver_pdf(a.pdf)
     try:
-        profil = choisir_profil(a, argv)
+        cfg, profil = cfg_avec_profil(a, argv)
     except ValueError as e:
         ap.error(str(e))
     if profil:
-        appliquer_profil(profil, a, argv)
         log(f"profil : {profil['nom']}")
-    try:
-        cfg = construire_cfg(a)
-    except (ValueError, OSError) as e:
-        ap.error(str(e))
-    if profil:
-        import profils as PR
-        prompt_profil = PR.prompt_de(profil)
-        if prompt_profil and not a.prompt_fichier:
-            cfg.prompt = prompt_profil
-        os.makedirs(cfg.sortie, exist_ok=True)
-        ecrire_atomique(os.path.join(cfg.sortie, "profil_utilise.json"), json.dumps(profil, ensure_ascii=False, indent=1))
+        memoriser_profil(cfg, profil)
     if a.ecrire_config:
         ecrire_config(chemin_cfg, {k: getattr(a, k) for k in CLES_CONFIG})
         log(f"configuration enregistrée : {chemin_cfg}")

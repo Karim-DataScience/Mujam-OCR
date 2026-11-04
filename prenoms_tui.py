@@ -33,15 +33,25 @@ from textual.screen import ModalScreen
 from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, ProgressBar, RichLog, Select, Static, Switch,
                              TabbedContent, TabPane)
 
+def noms_profils() -> tuple:
+    """« auto » (profil détecté d'après le nom du PDF) puis les profils de profils/*.json."""
+    try:
+        import profils as PR
+        return ("auto",) + tuple(p["nom"] for p in PR.liste_profils())
+    except Exception:                                           # noqa: BLE001 : la TUI doit s'ouvrir même si un profil est abîmé
+        return ("auto",)
+
+
 # réglages éditables : (clé, libellé, genre, options)
 CHAMPS = [
-    ("pdf", "Fichier PDF du livre", "texte", None),
+    ("pdf", "Fichier PDF du document", "texte", None),
+    ("profil", "Profil du document (auto = reconnu d'après le nom du PDF ; il fixe pages, décalage, méthode, prompt et dossier de sortie)", "choix", noms_profils()),
     ("url", "URL de LM Studio", "texte", None),
     ("modele", "Modèle (nom ou identifiant)", "texte", None),
     ("api", "API", "choix", ("auto", "natif", "openai")),
     ("cle_api", "Jeton d'API (si l'authentification est activée)", "secret", None),
-    ("sortie", "Dossier de sortie (vide = sortie_llm à côté du script)", "texte", None),
-    ("pages", "Pages (vide = 53-338 ; ex. 55,56,100-104)", "texte", None),
+    ("sortie", "Dossier de sortie (vide = celui du profil, ex. sortie_<profil> ; sortie_llm pour le livre de Geoffroy)", "texte", None),
+    ("pages", "Pages (vide = pages du profil ; ex. 55,56,100-104)", "texte", None),
     ("methode", "Méthode de lecture (auto = hybride si Tesseract est installé)", "choix", ("auto", "hybride", "vlm")),
     ("tesseract", "Chemin de tesseract (vide = automatique)", "texte", None),
     ("tessdata", "Dossier des modèles Tesseract, ex. tessdata_best (vide = défaut)", "texte", None),
@@ -221,7 +231,7 @@ class PrenomsApp(App):
         with Onglets(initial="accueil", id="onglets"):
             with TabPane("Accueil", id="accueil"):
                 with VerticalScroll():
-                    yield Static(Text("Étapes : 1) Réglages (F5) : PDF, URL de LM Studio, modèle · 2) « Tester LM Studio » puis « Diagnostic complet » · "
+                    yield Static(Text("Étapes : 1) Réglages (F5) : PDF (profil reconnu d'après son nom, sinon à choisir), URL de LM Studio, modèle · 2) « Tester LM Studio » puis « Diagnostic complet » · "
                                       "3) « Lancer / reprendre » (reprise automatique) · 4) Pages (F3) et Résultats (F4) · "
                                       "En cas de souci : « Rapport de debug » crée un zip à envoyer."), id="carte-guide", classes="carte", markup=False)
                     with Horizontal(classes="boutons"):
@@ -237,8 +247,8 @@ class PrenomsApp(App):
             with TabPane("Extraction", id="extraction"):
                 with Horizontal():
                     with Vertical(id="form-extraction"):
-                        yield Label("Pages (53-338, 55,56, 100-104…)")
-                        yield Input(id="e-pages", placeholder="vide = réglages")
+                        yield Label("Pages (55,56, 100-104… ; vide = pages du profil)")
+                        yield Input(id="e-pages", placeholder="vide = pages du profil")
                         yield Label("Réflexion")
                         yield Select([("auto", "auto"), ("non (rapide)", "non"), ("oui (bornée)", "oui")], value="auto",
                                      allow_blank=False, id="e-reflexion")
@@ -299,12 +309,27 @@ class PrenomsApp(App):
         yield Footer()
 
     # ------------------------------------------------------------------ cycle de vie
+    @staticmethod
+    def options_explicites(d: dict) -> list[str]:
+        """Options que l'utilisateur a données lui-même (elles priment sur le profil), au format de la ligne de commande."""
+        args = []
+        if str(d.get("pages") or "").strip():
+            args.append("--pages")
+        if str(d.get("methode") or "auto") != "auto":
+            args.append("--methode")
+        return args
+
+    def cfg_et_profil(self, d: dict) -> X.Config:
+        """Configuration + profil du document, par le même chemin que la ligne de commande (X.cfg_avec_profil)."""
+        cfg, self.profil_courant = X.cfg_avec_profil(argparse.Namespace(**d), self.options_explicites(d))
+        return cfg
+
     def on_mount(self) -> None:
         X.MUET = True
         X.ECOUTEURS.append(self._ecouteur)
         X.installer_hooks()
         try:
-            cfg = X.construire_cfg(argparse.Namespace(**self.reglages))
+            cfg = self.cfg_et_profil(self.reglages)
             X.JOURNAL.ouvrir(os.path.join(cfg.sortie, "logs"), "tui", cfg.log_niveau)
         except (ValueError, OSError) as e:
             self.notify(f"Journal indisponible : {e}", severity="warning")
@@ -315,7 +340,7 @@ class PrenomsApp(App):
         self.set_interval(5.0, self.rafraichir_lent)
         X.log(f"interface prête — version {X.VERSION} — journal : {X.JOURNAL.chemin}")
         try:
-            cfg0 = X.construire_cfg(argparse.Namespace(**self.reglages))
+            cfg0 = self.cfg_et_profil(self.reglages)
             self.run_worker(lambda: X.journaliser_demarrage("tui", sys.argv[1:], cfg0), thread=True, name="env", exit_on_error=False)
         except (ValueError, OSError):
             pass
@@ -352,6 +377,8 @@ class PrenomsApp(App):
     def remplir_reglages(self) -> None:
         for cle, _, genre, options in CHAMPS:
             v = self.reglages.get(cle)
+            if cle == "profil" and not v:
+                v = "auto"
             w = self.champ(cle)
             if genre == "choix":
                 fixer_select(w, v, options)
@@ -375,7 +402,7 @@ class PrenomsApp(App):
                 except ValueError:
                     raise ValueError(f"« {libelle} » : un nombre entier est attendu")
             elif genre == "choix":
-                d[cle] = int(w.value) if cle == "decoupe" else str(w.value)
+                d[cle] = int(w.value) if cle == "decoupe" else ("" if cle == "profil" and str(w.value) == "auto" else str(w.value))
             else:
                 d[cle] = str(w.value).strip()
         return d
@@ -384,7 +411,7 @@ class PrenomsApp(App):
     def enregistrer_reglages(self) -> None:
         try:
             d = self.lire_reglages()
-            X.construire_cfg(argparse.Namespace(**d))                    # valide l'ensemble avant d'écrire
+            self.cfg_et_profil(d)                                        # valide l'ensemble (profil compris) avant d'écrire
         except (ValueError, OSError) as e:
             self.notify(str(e), severity="error", timeout=8)
             return
@@ -417,7 +444,7 @@ class PrenomsApp(App):
             d["paralleles"] = int(para)
         d["refaire"] = bool(self.q("#e-refaire", Switch).value)
         d.update(surcharges)
-        cfg = X.construire_cfg(argparse.Namespace(**d))
+        cfg = self.cfg_et_profil(d)
         cfg.suivi_ui = 1.0
         return cfg
 
@@ -452,7 +479,7 @@ class PrenomsApp(App):
             lignes.append(f"  durée moyenne {e['moyenne']:.0f} s par page → reste ≈ {fmt_duree(e['reste_s'])}")
         self.q("#carte-cache", Static).update(Text("\n".join(lignes)))
         pdf_ok = "✔" if cfg.pdf and os.path.exists(cfg.pdf) else "✘ à renseigner dans Réglages (F5)"
-        chemins = [f"PDF : {cfg.pdf or '—'}  {pdf_ok}", f"Sortie : {cfg.sortie}", f"Cache : {os.path.join(cfg.sortie, 'cache')}",
+        chemins = [f"PDF : {cfg.pdf or '—'}  {pdf_ok}", f"Profil : {cfg.profil_nom} (méthode {cfg.methode})", f"Sortie : {cfg.sortie}", f"Cache : {os.path.join(cfg.sortie, 'cache')}",
                    f"Journal : {X.JOURNAL.chemin or '—'}", f"Configuration : {self.chemin_config}"]
         self.q("#carte-chemins", Static).update(Text("\n".join(chemins)))
 
@@ -564,6 +591,7 @@ class PrenomsApp(App):
             if basculer:
                 self.action_onglet("reglages")
             return
+        X.memoriser_profil(cfg, self.profil_courant)
         controle = X.Controle()
         self.controle, self.en_cours, self.derniere_issue = controle, True, ""
         if basculer:

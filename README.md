@@ -292,3 +292,9 @@ Le profil appliqué est enregistré dans `<sortie>/profil_utilise.json` : l'expo
 Profils fournis : geoffroy (Livre des prénoms arabes, seul à utiliser la lecture hybride), abdur_rahman, hakim, usmani, penoncourt, hareeri, haddadou (amazigh), treasury (photos), generique.
 **Non testés avec un vrai modèle** : les prompts des 7 autres profils ont été écrits d'après l'aspect des pages ; essaie 3-4 pages (`--pages 40-43`) avant de lancer un document entier. Les passes de relecture (`--relire-*`, `--completer-pages`) ne valent que pour le profil Geoffroy.
 Document écarté : `indexconcordance0000hard_1.pdf` (996 pages) n'est pas un dictionnaire de prénoms.
+
+### Changer de document dans la TUI (v5.1.0)
+Avant la v5.1.0, seule la ligne de commande appliquait les profils : la TUI restait sur les réglages du Livre des prénoms arabes (pages 53-338, son prompt, `sortie_llm`). Désormais la TUI passe par le même code que la ligne de commande (`cfg_avec_profil`).
+Pour changer de document : **Réglages (F5)** → champ *Fichier PDF* → champ *Profil du document* (`auto` = reconnu d'après le nom du PDF, sinon choisis-le dans la liste) → **Enregistrer**. L'Accueil affiche le profil actif et les pages ; l'onglet Pages liste les pages du profil. Laisse *Pages* et *Dossier de sortie* **vides** pour utiliser ceux du profil (chaque document a son dossier `sortie_<profil>`). Ce que tu saisis dans *Pages* ou *Méthode* l'emporte sur le profil.
+Garde-fous : un dossier de sortie qui contient déjà un autre document est refusé (message clair) ; `--autotest` est refusé hors du Livre de Geoffroy (sa vérité terrain n'existe que pour lui).
+Nouveau document : copie `profils/generique.json` en `profils/mon_document.json`, renseigne `motifs_fichier`, `pages`, `decalage_page_imprimee`, `mise_en_page`, puis relance la TUI (la liste est relue au démarrage).
