@@ -206,6 +206,13 @@ Le livre « Le livre des prénoms arabes » est TERMINÉ pour l'essentiel (3 201
 - **Testé** : `test_profil_choix.py` (14 tests : PDF synthétique + TUI headless), `--statut` et TUI headless sur les 7 PDF réels (profil, plages, nb de pages). 53 tests rapides OK ; moteur 148 OK dont 55 ignorés et TUI 23 ignorés **faute du PDF de Geoffroy dans ce bac à sable** (non rejoués ici : à relancer chez toi).
 - **Toujours non testé** : les 7 profils avec un vrai modèle.
 
+## 21 ter. v5.2.0 — benchmark de la lecture de l'arabe (4 nov. 2026)
+- **Constats sur la sortie réelle du profil Abdur Rahman** (81 pages en cache, 1 418 lignes) : 7 pages sur 80 n'ont AUCUN arabe (pages PDF 8, 17, 20, 21, 36, 63, 72 : échec « tout ou rien » du modèle, pas du bruit) alors que l'arabe est bien visible (colonne du milieu) ; 73 pages sont complètes. Non corrigé : correctif envisagé = relance automatique d'une page « entrées sans arabe » avec un prompt ciblé, ou lecture de la colonne arabe par un lecteur dédié (voir benchmark).
+- **Tesseract n'est pas utilisé pour l'arabe par le moteur** (hybride Geoffroy : Tesseract = français ; arabe = modèle de vision ; 7 autres profils : modèle seul, pas de Tesseract).
+- **`benchmark_arabe.py` + `benchmark/`** (vérité terrain 64 zones / 5 pages, images, `test_benchmark_arabe.py` 18 tests). Mesuré : Tesseract arabe `fast` psm7 ×3 binarisé = 6,1 % de CER sur zones isolées ; 0 % de rappel sur page entière => le maillon faible est le REPÉRAGE des zones, pas la lecture seule. Détecteur générique « forme de mot » essayé et ABANDONNÉ (1/9 et 4/13 zones trouvées sur les pages à arabe en ligne ; parfait seulement sur colonne) : privilégier des zones déclarées par profil (colonne, couleur, position après « : » ou entre parenthèses).
+- **À faire chez l'utilisateur** : lancer `benchmark_arabe.py` avec les modèles LM Studio (Gemma actuel, Qwen3-VL, etc.), avec et sans `:indice`, puis décider du lecteur d'arabe et du zonage par profil.
+- **Non testé** : tout lecteur VLM réel, EasyOCR, PaddleOCR (code défensif, API PaddleOCR variable selon version).
+
 ## 22. Prompt à coller dans la nouvelle discussion
 ```
 Je reprends un projet d'extraction de dictionnaires de prénoms (PDF -> CSV/Excel/JSON) avec LM Studio. Je joins extraction_prenoms_llm_v5_0_0.zip (code complet, README.md, REPRISE.md, AUDIT.md, profils/) et, si utile, les PDF et le dossier de sortie du livre déjà traité.

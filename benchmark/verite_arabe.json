@@ -1,0 +1,616 @@
+{
+ "_note": "Vérité terrain établie par Claude en lisant les images (non vérifiée par un arabophone). Les zones (bbox) sont dans le repère de l'image. Les voyelles (img1, img3) sont données au mieux : le score principal les ignore. Les images sont des captures (≈ 520-650 px de large), moins définies que le rendu du PDF par le moteur : les erreurs absolues sont donc PESSIMISTES, le classement relatif des moteurs reste valable. À enrichir avec tes propres pages (voir README).",
+ "pages": [
+  {
+   "id": "img1_fr",
+   "description": "Livre français (type Pénoncourt / Geoffroy) : arabe voyellé entre parenthèses, noir",
+   "image": "pages/img1_fr.png",
+   "items": [
+    {
+     "bbox": [
+      131,
+      80,
+      208,
+      112
+     ],
+     "texte": "أَشْهَل"
+    },
+    {
+     "bbox": [
+      131,
+      141,
+      208,
+      173
+     ],
+     "texte": "أَشْيَم"
+    },
+    {
+     "bbox": [
+      134,
+      192,
+      210,
+      225
+     ],
+     "texte": "أَشْجَع"
+    },
+    {
+     "bbox": [
+      117,
+      258,
+      204,
+      289
+     ],
+     "texte": "أَشْرَف"
+    },
+    {
+     "bbox": [
+      97,
+      294,
+      177,
+      326
+     ],
+     "texte": "أَسْلَع"
+    },
+    {
+     "bbox": [
+      116,
+      353,
+      204,
+      385
+     ],
+     "texte": "أَسْلَم"
+    },
+    {
+     "bbox": [
+      113,
+      440,
+      212,
+      470
+     ],
+     "texte": "أَسْمَاء"
+    },
+    {
+     "bbox": [
+      116,
+      500,
+      211,
+      531
+     ],
+     "texte": "أَسْمَر"
+    },
+    {
+     "bbox": [
+      98,
+      560,
+      195,
+      592
+     ],
+     "texte": "أَسْقَع"
+    },
+    {
+     "bbox": [
+      113,
+      618,
+      208,
+      652
+     ],
+     "texte": "أَصْمَع"
+    },
+    {
+     "bbox": [
+      116,
+      703,
+      208,
+      736
+     ],
+     "texte": "أَصْرَم"
+    },
+    {
+     "bbox": [
+      106,
+      739,
+      195,
+      771
+     ],
+     "texte": "أَصْيَد"
+    },
+    {
+     "bbox": [
+      110,
+      801,
+      177,
+      834
+     ],
+     "texte": "أَثَجّ"
+    }
+   ]
+  },
+  {
+   "id": "img2_usmani",
+   "description": "Usmani : arabe minuscule, juste après « Nom : »",
+   "image": "pages/img2_usmani.png",
+   "items": [
+    {
+     "bbox": [
+      50,
+      93,
+      112,
+      116
+     ],
+     "texte": "عالي"
+    },
+    {
+     "bbox": [
+      74,
+      169,
+      131,
+      192
+     ],
+     "texte": "عالم"
+    },
+    {
+     "bbox": [
+      68,
+      247,
+      128,
+      271
+     ],
+     "texte": "عامل"
+    },
+    {
+     "bbox": [
+      76,
+      327,
+      127,
+      348
+     ],
+     "texte": "عامر"
+    },
+    {
+     "bbox": [
+      73,
+      456,
+      130,
+      476
+     ],
+     "texte": "عاقب"
+    },
+    {
+     "bbox": [
+      74,
+      536,
+      127,
+      556
+     ],
+     "texte": "عاقل"
+    },
+    {
+     "bbox": [
+      77,
+      612,
+      130,
+      636
+     ],
+     "texte": "عارف"
+    },
+    {
+     "bbox": [
+      88,
+      693,
+      142,
+      716
+     ],
+     "texte": "عاشق"
+    },
+    {
+     "bbox": [
+      80,
+      772,
+      139,
+      792
+     ],
+     "texte": "عاشر"
+    }
+   ]
+  },
+  {
+   "id": "img3_attrib",
+   "description": "Noms attributifs d'Allah (type Hareeri) : arabe rose voyellé entre parenthèses",
+   "image": "pages/img3_attrib.png",
+   "items": [
+    {
+     "bbox": [
+      122,
+      77,
+      178,
+      101
+     ],
+     "texte": "الْكَبِيرُ"
+    },
+    {
+     "bbox": [
+      141,
+      144,
+      202,
+      169
+     ],
+     "texte": "الْكَرِيمُ"
+    },
+    {
+     "bbox": [
+      124,
+      211,
+      186,
+      240
+     ],
+     "texte": "الْكَفِيلُ"
+    },
+    {
+     "bbox": [
+      118,
+      309,
+      185,
+      332
+     ],
+     "texte": "اللَّطِيفُ"
+    },
+    {
+     "bbox": [
+      130,
+      407,
+      193,
+      427
+     ],
+     "texte": "الْمَاجِدُ"
+    },
+    {
+     "bbox": [
+      128,
+      474,
+      191,
+      494
+     ],
+     "texte": "الْمَالِكُ"
+    },
+    {
+     "bbox": [
+      132,
+      541,
+      189,
+      570
+     ],
+     "texte": "الْمَانِعُ"
+    },
+    {
+     "bbox": [
+      182,
+      609,
+      248,
+      634
+     ],
+     "texte": "الْمُؤَخِّرُ"
+    },
+    {
+     "bbox": [
+      140,
+      643,
+      204,
+      674
+     ],
+     "texte": "الْمُؤْمِنُ"
+    },
+    {
+     "bbox": [
+      162,
+      710,
+      227,
+      736
+     ],
+     "texte": "الْمُبْدِئُ"
+    },
+    {
+     "bbox": [
+      147,
+      780,
+      213,
+      801
+     ],
+     "texte": "الْمُتَعَالُ"
+    },
+    {
+     "bbox": [
+      136,
+      842,
+      209,
+      875
+     ],
+     "texte": "الْمُتَعَالِي"
+    }
+   ]
+  },
+  {
+   "id": "img4_treasury",
+   "description": "Dictionnaire de noms musulmans : colonne arabe à droite, gras",
+   "image": "pages/img4_treasury.png",
+   "items": [
+    {
+     "bbox": [
+      478,
+      287,
+      563,
+      315
+     ],
+     "texte": "عبد الرحمن"
+    },
+    {
+     "bbox": [
+      474,
+      327,
+      561,
+      357
+     ],
+     "texte": "عبد الرحيم"
+    },
+    {
+     "bbox": [
+      481,
+      367,
+      556,
+      391
+     ],
+     "texte": "عبد الملك"
+    },
+    {
+     "bbox": [
+      466,
+      406,
+      561,
+      434
+     ],
+     "texte": "عبد القدوس"
+    },
+    {
+     "bbox": [
+      471,
+      447,
+      556,
+      472
+     ],
+     "texte": "عبد السلام"
+    },
+    {
+     "bbox": [
+      480,
+      506,
+      561,
+      534
+     ],
+     "texte": "عبد المؤمن"
+    },
+    {
+     "bbox": [
+      468,
+      540,
+      556,
+      575
+     ],
+     "texte": "عبد المهيمن"
+    },
+    {
+     "bbox": [
+      470,
+      586,
+      550,
+      613
+     ],
+     "texte": "عبد العزيز"
+    },
+    {
+     "bbox": [
+      463,
+      626,
+      551,
+      652
+     ],
+     "texte": "عبد الجبار"
+    },
+    {
+     "bbox": [
+      473,
+      663,
+      554,
+      694
+     ],
+     "texte": "عبد المتكبر"
+    },
+    {
+     "bbox": [
+      471,
+      705,
+      551,
+      733
+     ],
+     "texte": "عبد الخالق"
+    },
+    {
+     "bbox": [
+      471,
+      746,
+      554,
+      773
+     ],
+     "texte": "عبد البارئ"
+    },
+    {
+     "bbox": [
+      467,
+      786,
+      552,
+      814
+     ],
+     "texte": "عبد المصور"
+    }
+   ]
+  },
+  {
+   "id": "img5_abdur",
+   "description": "Abdur Rahman : colonne arabe au milieu, sans voyelles",
+   "image": "pages/img5_abdur.png",
+   "items": [
+    {
+     "bbox": [
+      194,
+      91,
+      256,
+      110
+     ],
+     "texte": "عبد الاحد"
+    },
+    {
+     "bbox": [
+      212,
+      124,
+      257,
+      142
+     ],
+     "texte": "أهداف"
+    },
+    {
+     "bbox": [
+      216,
+      162,
+      252,
+      178
+     ],
+     "texte": "أحمد"
+    },
+    {
+     "bbox": [
+      198,
+      236,
+      257,
+      256
+     ],
+     "texte": "أحمد الله"
+    },
+    {
+     "bbox": [
+      211,
+      277,
+      257,
+      291
+     ],
+     "texte": "احسب"
+    },
+    {
+     "bbox": [
+      217,
+      310,
+      258,
+      330
+     ],
+     "texte": "أحسن"
+    },
+    {
+     "bbox": [
+      214,
+      341,
+      258,
+      365
+     ],
+     "texte": "أجاويد"
+    },
+    {
+     "bbox": [
+      219,
+      398,
+      259,
+      422
+     ],
+     "texte": "أجمل"
+    },
+    {
+     "bbox": [
+      224,
+      458,
+      258,
+      478
+     ],
+     "texte": "أجود"
+    },
+    {
+     "bbox": [
+      227,
+      488,
+      259,
+      512
+     ],
+     "texte": "أكبر"
+    },
+    {
+     "bbox": [
+      217,
+      545,
+      260,
+      566
+     ],
+     "texte": "أخلاق"
+    },
+    {
+     "bbox": [
+      228,
+      584,
+      260,
+      604
+     ],
+     "texte": "أختر"
+    },
+    {
+     "bbox": [
+      221,
+      619,
+      259,
+      635
+     ],
+     "texte": "اخوند"
+    },
+    {
+     "bbox": [
+      192,
+      676,
+      260,
+      696
+     ],
+     "texte": "اخوند زاده"
+    },
+    {
+     "bbox": [
+      217,
+      708,
+      261,
+      727
+     ],
+     "texte": "عاكف"
+    },
+    {
+     "bbox": [
+      222,
+      763,
+      262,
+      787
+     ],
+     "texte": "أكمل"
+    },
+    {
+     "bbox": [
+      228,
+      798,
+      261,
+      822
+     ],
+     "texte": "أكرم"
+    }
+   ]
+  }
+ ]
+}
