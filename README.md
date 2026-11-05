@@ -299,18 +299,23 @@ Pour changer de document : **Réglages (F5)** → champ *Fichier PDF* → champ 
 Garde-fous : un dossier de sortie qui contient déjà un autre document est refusé (message clair) ; `--autotest` est refusé hors du Livre de Geoffroy (sa vérité terrain n'existe que pour lui).
 Nouveau document : copie `profils/generique.json` en `profils/mon_document.json`, renseigne `motifs_fichier`, `pages`, `decalage_page_imprimee`, `mise_en_page`, puis relance la TUI (la liste est relue au démarrage).
 
-## Benchmark de la lecture de l'arabe : `benchmark_arabe.py` (v5.3.0)
+## Benchmark de la lecture de l'arabe : `benchmark_arabe.py` (v5.4.0)
 Compare, sur une vérité terrain (`benchmark/verite_arabe.json`, 64 zones arabes sur 5 pages de livres différents), Tesseract (variantes), EasyOCR, PaddleOCR et **tous les modèles de vision de LM Studio**, seuls ou combinés. Deux niveaux : **recadrage** (le lecteur reçoit une zone arabe isolée) et **page** (page entière : repérage + lecture). Il sépare les **réponses vides** (le modèle se tait) des **erreurs de lecture** (il répond faux), accord entre deux lecteurs, vote majoritaire, « oracle », et `lm:<modèle>:indice[=tess|easyocr]` (le VLM corrige la lecture d'un OCR).
 ```
-python benchmark_arabe.py --telecharger-tessdata                     (ara.traineddata fast + best -> benchmark/tessdata ; plus rien à configurer)
-python benchmark_arabe.py --lister-lmstudio                          (identifiants exacts + type llm / vlm)
-python benchmark_arabe.py --complet --echantillon 2 --reprendre      (Tesseract + EasyOCR + PaddleOCR + TOUS les modèles de vision ; 1 zone sur 2 ; reprise possible)
-python benchmark_arabe.py --complet --sans-crop --reprendre          (page entière seulement : ~1 min par modèle)
-python benchmark_arabe.py --vlm qwen gemma internvl lfm --exclure 31b
-python benchmark_arabe.py --candidats lm:google/gemma-4-12b-qat lm:google/gemma-4-12b-qat:indice=easyocr
+python benchmark_arabe.py --cites                      (UNIQUEMENT les outils/modèles cités ; démarre LM Studio ; annonce puis installe ce qui manque)
+python benchmark_arabe.py --cites --oui                (idem sans poser de question)
+python benchmark_arabe.py --preparer-seulement --oui   (installe / vérifie, sans mesurer)
+python benchmark_arabe.py --cites --sans-crop          (page entière seulement : rapide)
+python benchmark_arabe.py --cites --echantillon 2 --reprendre   (1 zone sur 2 ; reprend là où une exécution interrompue s'est arrêtée)
+python benchmark_arabe.py --lister-lmstudio            (identifiants exacts + type llm / vlm)
+python benchmark_arabe.py --candidats lm:google/gemma-4-26b-a4b lm:google/gemma-4-12b-qat:indice=easyocr   (modèles choisis à la main)
+python benchmark_arabe.py --complet                    (TOUT ce qui est sur la machine, y compris les très gros modèles : long)
 ```
+`--cites` teste : Tesseract (fast, best), EasyOCR, PaddleOCR, Gemma 4 12B QAT, Qwen3-VL 8B et 2B, Melaraby/qwen_vlm_arabic_ocr, InternVL, olmOCR 2, LFM3-VL 2B, Qwen2-VL, Qari-OCR. Rien d'autre (pas de 31B, pas de modèles hors liste). Ce qui manque est installé après accord : paquets Python par `pip`, `ara.traineddata` par téléchargement, modèles par `lms get` (CLI de LM Studio ; le serveur est démarré par `lms server start` s'il est éteint). Un modèle introuvable en GGUF est signalé dans le rapport (à installer à la main : LM Studio → Discover). Si un modèle cité n'est pas là mais qu'une version voisine l'est (InternVL 3.5 pour 2.5, Qwen2.5-VL pour Qwen2-VL), c'est elle qui est testée et le rapport le dit. Le rapport ne montre que la sélection de l'exécution ; le JSON garde toutes les mesures (`--tout-afficher` pour tout montrer).
+Tesseract sous Windows : si le dossier du projet contient des accents (ex. `D:\Téléchargements`), les langues sont copiées automatiquement dans un dossier ASCII (le chargement échouait sinon : cause probable, non vérifiée sous Windows, de « langue absente »).
 Ne copie jamais un texte entre `< >` tel quel : remplace-le par un identifiant de `--lister-lmstudio`. Résultats écrits après chaque candidat (`benchmark/sortie/rapport_benchmark.md` + `resultats_benchmark.json`) ; un modèle sans vision est abandonné après 3 erreurs ; `--budget-min` limite le temps par modèle ; `--decharger` appelle `lms unload --all` entre deux modèles. Les modèles chargés à la demande par LM Studio sont « échauffés » hors mesure.
 **Mesures** (64 zones, CER « léger », voyelles ignorées) :
 - *Tesseract 5.3.4 (bac à sable)* : `tess:ara:fast:psm7:x3:bin` 6,1 % (79,7 % exacts) ; `best` 8,9 % ; sans agrandissement ×3 ni binarisation 17,8 %. Page entière : 0 % des zones retrouvées.
 - *Chez l'utilisateur (RTX 5070 Ti)* : `google/gemma-4-12b-qat` en recadrage = 36,3 % MAIS **23 réponses vides sur 64** ; sur les 41 réponses non vides le CER est de **0,6 %**. En page entière : rappel 96,9 %, précision 95,4 %, CER des zones trouvées 0-6 %. EasyOCR (CPU) : 37,1 % (fort sur arabe voyellé rose 8 %, faible sur colonnes sans voyelles 66 %), 0,08 s/zone. Mode `:indice` avec un indice Tesseract médiocre : pire (77 %, 49 vides) : un mauvais indice empoisonne le modèle. Accord Gemma + EasyOCR : 28 % des zones, 0,0 % d'erreur. Oracle 7,7 %.
 Limites : vérité terrain écrite par Claude d'après les images (à faire relire), captures peu définies, 64 zones (écarts de quelques points non significatifs), voyelles non évaluées, PaddleOCR non testé.
+- *Mesures page entière déjà obtenues par l'utilisateur (exécution `--complet`, 64 zones)* : `google/gemma-4-26b-a4b` rappel 100 % / précision 98,6 % / CER des zones trouvées 0,5 % ; `gemma-4-12b-qat` 96,9 % / 95,4 % / 2,0 % ; EasyOCR 92,2 % / 78,7 % / 6,7 % ; `gemma-3-12b` 90,6 % / 93,4 % / 4,8 % ; `gemma-4-12b` (hors QAT) 78,1 % / 76,9 % / 1,2 %.

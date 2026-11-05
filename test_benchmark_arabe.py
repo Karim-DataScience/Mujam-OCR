@@ -379,5 +379,162 @@ class TestTesseract(unittest.TestCase):
         self.assertLess(sum(c) / len(c), 0.35)
 
 
+class ServeurDyn(BaseHTTPRequestHandler):
+    """Faux LM Studio dont la liste de modèles change (un `lms get` simulé en ajoute)."""
+    modeles: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/api/v0/models"):
+            corps = json.dumps({"data": [{"id": m, "type": "vlm", "state": "not-loaded"} for m in ServeurDyn.modeles]}).encode()
+        else:
+            corps = json.dumps({"data": [{"id": m} for m in ServeurDyn.modeles]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(corps)
+
+
+class TestPreparation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), ServeurDyn)
+        cls.url = f"http://127.0.0.1:{cls.srv.server_port}/v1"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        import argparse
+        ServeurDyn.modeles = ["google/gemma-4-12b-qat", "qwen/qwen3-vl-8b", "internvl3_5-14b", "lfm3-vl-2b@f16", "lfm3-vl-2b@q4_0",
+                              "qwen/qwen2.5-vl-7b", "google/gemma-4-31b", "google/gemma-4-26b-a4b", "prism-ml/bonsai-27b"]
+        self.a = argparse.Namespace(url=self.url, oui=True, sans_installation=False, tessdata=[])
+        self.appels = []
+        self.sauve = (B._executer, B.trouver_lms, B.telecharger_tessdata, B.PAQUETS_PIP, B.tessdata_complet)
+        B._executer = self.faux_executer
+        B.trouver_lms = lambda: "/faux/lms"
+        B.telecharger_tessdata = lambda *a, **k: self.appels.append(("tessdata",)) or {}
+        B.tessdata_complet = lambda: False
+        B.PAQUETS_PIP = {"x": ("module_inexistant_xyz", ["paquet-bidon"])}
+        self.telechargeables = {"qwen/qwen3-vl-2b": "qwen/qwen3-vl-2b", "olmocr-2-7b": "allenai/olmocr-2-7b-1025"}
+
+    def tearDown(self):
+        B._executer, B.trouver_lms, B.telecharger_tessdata, B.PAQUETS_PIP, B.tessdata_complet = self.sauve
+
+    def faux_executer(self, cmd, **kw):
+        self.appels.append(tuple(cmd[1:]) if cmd[0] == "/faux/lms" else tuple(cmd[2:4]))
+        if len(cmd) > 2 and cmd[1] == "get" and cmd[2] in self.telechargeables:
+            ServeurDyn.modeles.append(self.telechargeables[cmd[2]])
+        return type("R", (), {"returncode": 0})()
+
+    def test_resoudre_modele(self):
+        e = {"ids": ["qwen2-vl", "qwen/qwen2.5-vl-7b"]}
+        self.assertEqual(B.resoudre_modele(e, ["qwen/qwen2.5-vl-7b", "qwen/qwen2-vl-7b-instruct"]), "qwen/qwen2-vl-7b-instruct")   # 1er choix prioritaire
+        self.assertEqual(B.resoudre_modele(e, ["qwen/qwen2.5-vl-7b"]), "qwen/qwen2.5-vl-7b")                                          # sinon voisin
+        self.assertIsNone(B.resoudre_modele(e, ["google/gemma-4-12b"]))
+        self.assertEqual(B.resoudre_modele({"ids": ["lfm3-vl-2b@f16", "lfm3-vl-2b"]}, ["lfm3-vl-2b@q4_0", "lfm3-vl-2b@f16"]), "lfm3-vl-2b@f16")
+
+    def test_cites_ne_teste_que_les_modeles_cites_et_installe_le_manque(self):
+        logs = []
+        cands, notes, abandons = B.preparer_cites(self.a, log=logs.append)
+        lm = [c for c in cands if c.startswith("lm:")]
+        self.assertIn("lm:google/gemma-4-12b-qat", lm)
+        self.assertIn("lm:qwen/qwen3-vl-8b", lm)
+        self.assertIn("lm:qwen/qwen3-vl-2b", lm)                                  # téléchargé
+        self.assertIn("lm:allenai/olmocr-2-7b-1025", lm)                          # téléchargé sous un autre nom
+        self.assertIn("lm:lfm3-vl-2b@f16", lm)
+        self.assertIn("lm:internvl3_5-14b", lm)                                   # voisin installé : pas de nouveau téléchargement
+        self.assertIn("lm:qwen/qwen2.5-vl-7b", lm)
+        for pas_cite in ("gemma-4-31b", "gemma-4-26b-a4b", "bonsai", "lfm3-vl-2b@q4_0"):
+            self.assertFalse(any(pas_cite in c for c in lm), pas_cite)
+        self.assertEqual(cands[:4], B.LECTEURS_CITES)
+        self.assertIn("Qari-OCR (arabe)", abandons)                              # introuvable : signalé, pas fatal
+        self.assertIn("Melaraby / qwen_vlm_arabic_ocr (GGUF)", abandons)
+        self.assertEqual(notes["Qwen3-VL 2B"], "téléchargé")
+        self.assertIn("remplacé", notes["Qwen2-VL (7B)"])
+        self.assertIn(("pip", "install"), [a[:2] for a in self.appels])           # paquet Python manquant installé
+        self.assertIn(("tessdata",), self.appels)                                 # langues Tesseract téléchargées
+        self.assertFalse(any(a[:2] == ("get", "google/gemma-4-31b") for a in self.appels))
+
+    def test_sans_accord_rien_n_est_installe(self):
+        self.a.oui = False                                                       # et pas de terminal interactif dans les tests
+        cands, notes, abandons = B.preparer_cites(self.a, log=lambda *x: None)
+        self.assertFalse(any(a[0] == "get" or a[:2] == ("pip", "install") or a == ("tessdata",) for a in self.appels))
+        self.assertNotIn("lm:qwen/qwen3-vl-2b", cands)
+        self.assertIn("Qwen3-VL 2B", abandons)
+
+    def test_sans_installation(self):
+        self.a.sans_installation = True
+        B.preparer_cites(self.a, log=lambda *x: None)
+        self.assertEqual(self.appels, [])
+
+    def test_telecharger_modele_essaie_les_termes_dans_l_ordre(self):
+        e = {"ids": ["qari"], "telecharger": ["introuvable", "qwen/qwen3-vl-2b"]}
+        res = B.telecharger_modele(e, lambda: list(ServeurDyn.modeles), log=lambda *x: None)
+        self.assertEqual(res, "qwen/qwen3-vl-2b")
+        self.assertEqual([a[1] for a in self.appels if a[0] == "get"], ["introuvable", "qwen/qwen3-vl-2b"])
+        self.assertIsNone(B.telecharger_modele({"ids": ["z"], "telecharger": ["rien"]}, lambda: list(ServeurDyn.modeles), log=lambda *x: None))
+        B.trouver_lms = lambda: ""
+        self.assertIsNone(B.telecharger_modele(e, lambda: [], log=lambda *x: None))
+
+    def test_serveur_deja_demarre_ne_lance_rien(self):
+        self.assertTrue(B.assurer_serveur(self.url, log=lambda *x: None))
+        self.assertEqual(self.appels, [])
+
+    def test_serveur_arrete_est_demarre_par_lms(self):
+        mort = "http://127.0.0.1:9/v1"
+        logs = []
+        self.assertFalse(B.assurer_serveur(mort, log=logs.append, attente=0.1))
+        self.assertIn(("server", "start"), self.appels)
+        B.trouver_lms = lambda: ""
+        logs.clear()
+        self.assertFalse(B.assurer_serveur(mort, log=logs.append))
+        self.assertTrue(any("Start Server" in l for l in logs))
+
+    def test_pas_de_serveur_les_modeles_de_vision_sont_ignores(self):
+        self.a.url = "http://127.0.0.1:9/v1"
+        B.trouver_lms = lambda: ""
+        cands, notes, abandons = B.preparer_cites(self.a, log=lambda *x: None)
+        self.assertEqual(cands, B.LECTEURS_CITES)
+
+    def test_dossier_ascii(self):
+        base = tempfile.mkdtemp()
+        try:
+            avec_accent = os.path.join(base, "Téléchargements", "fast")
+            os.makedirs(avec_accent)
+            with open(os.path.join(avec_accent, "ara.traineddata"), "wb") as f:
+                f.write(b"x" * 1000)
+            ok = B.dossier_ascii(avec_accent)
+            if tempfile.gettempdir().isascii():
+                self.assertTrue(ok.isascii())
+                self.assertEqual(os.path.getsize(os.path.join(ok, "ara.traineddata")), 1000)
+                self.assertEqual(B.dossier_ascii(avec_accent), ok)                  # déterministe, pas de nouvelle copie
+            sans = os.path.join(base, "simple")
+            os.makedirs(sans)
+            self.assertEqual(B.dossier_ascii(sans), sans)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_rapport_limite_a_la_selection(self):
+        pages = B.charger_verite(B.VERITE_DEFAUT)[:1]
+        res = {n: B.evaluer(Faux(n, lambda s, img: ""), pages, False) for n in ("garde", "ancien")}
+        synth = {n: B.synthese(r) for n, r in res.items()}
+        sortie = tempfile.mkdtemp()
+        try:
+            txt = B.ecrire_sorties(sortie, synth, {}, res, {}, 13, pages, 1, {}, {"X": "remarque"}, selection={"garde"})
+            self.assertIn("`garde`", txt)
+            self.assertNotIn("`ancien`", txt)
+            self.assertIn("remarque", txt)
+            with open(os.path.join(sortie, "resultats_benchmark.json"), encoding="utf-8") as f:
+                self.assertEqual(set(json.load(f)["detail"]), {"garde", "ancien"})   # le JSON garde tout
+        finally:
+            shutil.rmtree(sortie, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

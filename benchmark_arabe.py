@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -30,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -46,6 +49,7 @@ PROMPT_CROP = ("Recopie exactement le texte arabe écrit sur cette image. Répon
                "sans translittération, sans commentaire. Si tu hésites sur une lettre, donne ta meilleure lecture.")
 PROMPT_INDICE = ("Recopie exactement le texte arabe écrit sur cette image. Un OCR classique l'a lu « {indice} » (cette lecture peut contenir "
                  "des erreurs : corrige-la d'après l'image). Réponds uniquement par le texte arabe, sans traduction, sans commentaire.")
+_executer = subprocess.run                                          # remplaçable dans les tests (aucune commande réelle)
 DEPOTS_TESSDATA = {"fast": "tessdata", "best": "tessdata_best"}         # « fast » = dépôt `tessdata` (modèles par défaut des installeurs)
 PROMPT_PAGE = ("Liste, un par ligne, chaque mot ou groupe de mots écrit en alphabet arabe sur cette page, dans l'ordre de lecture "
                "(de haut en bas). Ne traduis pas, ne translittère pas, n'ajoute rien d'autre que le texte arabe.")
@@ -147,6 +151,7 @@ class LecteurTesseract(Lecteur):
                 raise ValueError(f"option Tesseract inconnue « {p} » dans {spec} (clés --tessdata connues : {sorted(tessdata)} ; "
                                  "lance --telecharger-tessdata pour obtenir fast et best)")
         self.cmd = cmd
+        self.dossier = dossier_ascii(self.dossier)
 
     def _poser_env(self):
         if self.dossier:
@@ -400,6 +405,28 @@ def tessdata_connus(a) -> dict:
     return d
 
 
+def dossier_ascii(dossier: str) -> str:
+    """Tesseract sous Windows ne charge pas toujours les langues depuis un chemin contenant des accents (ex. D:\\Téléchargements\\…). Si le
+    chemin n'est pas ASCII, les fichiers .traineddata sont copiés dans un dossier ASCII (temp, PUBLIC…) et c'est celui-là qui est utilisé."""
+    if not dossier or dossier.isascii() or not os.path.isdir(dossier):
+        return dossier
+    for base in (tempfile.gettempdir(), os.environ.get("PUBLIC", ""), os.environ.get("ALLUSERSPROFILE", "")):
+        if not base or not base.isascii():
+            continue
+        cible = os.path.join(base, "tessdata_arabe", hashlib.md5(dossier.encode("utf-8")).hexdigest()[:8])
+        try:
+            os.makedirs(cible, exist_ok=True)
+            for nom in os.listdir(dossier):
+                if nom.endswith(".traineddata"):
+                    src, dst = os.path.join(dossier, nom), os.path.join(cible, nom)
+                    if not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(src):
+                        shutil.copyfile(src, dst)
+            return cible
+        except OSError:
+            continue
+    return dossier
+
+
 def construire(spec: str, a: argparse.Namespace) -> list[Lecteur]:
     if "<" in spec or ">" in spec:
         raise ValueError(f"« {spec} » : remplace le texte entre < > par un vrai identifiant (liste exacte : python benchmark_arabe.py --lister-lmstudio)")
@@ -553,7 +580,7 @@ def pct(x, d=1):
     return "—" if x is None or x != x else f"{100 * x:.{d}f} %"
 
 
-def rapport(synth: dict, comb: dict, n_items: int, pages: list[dict], abandons: dict | None = None, pas: int = 1) -> str:
+def rapport(synth: dict, comb: dict, n_items: int, pages: list[dict], abandons: dict | None = None, pas: int = 1, notes: dict | None = None) -> str:
     L = [f"# Benchmark de lecture de l'arabe — {n_items} zones sur {len(pages)} pages" + (f" (échantillon : 1 zone sur {pas})" if pas > 1 else ""), "",
          "| Lecteur | CER léger | dont réponses vides | CER hors vides | Zones exactes | s / zone | Page : rappel | Page : précision | Page : CER des zones trouvées |",
          "|---|---|---|---|---|---|---|---|---|"]
@@ -565,6 +592,8 @@ def rapport(synth: dict, comb: dict, n_items: int, pages: list[dict], abandons: 
     L += ["", "*CER = erreurs de lettres / lettres attendues (plus bas = mieux). **Réponses vides** : le lecteur n'a rien rendu (compté comme 100 % d'erreur "
           "dans « CER léger ») ; « CER hors vides » mesure la qualité de lecture quand il répond. « Page » : le lecteur reçoit la page entière "
           "(repérage + lecture) ; rappel = part des zones attendues retrouvées (≤ 34 % d'erreur), précision = part des lignes rendues qui sont de vraies zones.*", ""]
+    if notes:
+        L += ["## Remarques sur les outils cités", ""] + [f"- {k} : {v}" for k, v in notes.items()] + [""]
     if abandons:
         L += ["## Candidats abandonnés ou ignorés", ""] + [f"- `{k}` : {v}" for k, v in abandons.items()] + [""]
     if comb.get("accords"):
@@ -595,22 +624,210 @@ def rapport(synth: dict, comb: dict, n_items: int, pages: list[dict], abandons: 
     return "\n".join(L)
 
 
-def ecrire_sorties(sortie: str, synth: dict, comb: dict, resultats: dict, abandons: dict, n_items: int, pages: list[dict], pas: int, partiels: dict) -> str:
-    texte = rapport(synth, comb, n_items, pages, abandons, pas)
+# ----------------------------------------------------------------------------------------------- les modèles et outils CITÉS + installation
+# Seuls ces outils / modèles sont testés avec --cites (liste de l'utilisateur) : « ids » = identifiants LM Studio acceptés (le premier trouvé gagne ;
+# comparaison exacte puis « contient »), « telecharger » = termes essayés avec `lms get` s'il manque. « remplacant » = présent sur la machine, version voisine.
+CATALOGUE_CITES = [
+    {"nom": "Gemma 4 12B QAT (référence actuelle)", "ids": ["google/gemma-4-12b-qat"], "telecharger": ["google/gemma-4-12b-qat"]},
+    {"nom": "Qwen3-VL 8B", "ids": ["qwen/qwen3-vl-8b"], "telecharger": ["qwen/qwen3-vl-8b"]},
+    {"nom": "Qwen3-VL 2B", "ids": ["qwen3-vl-2b"], "telecharger": ["qwen/qwen3-vl-2b", "Qwen3-VL-2B-Instruct"]},
+    {"nom": "Melaraby / qwen_vlm_arabic_ocr (GGUF)", "ids": ["qwen_vlm_arabic_ocr"], "telecharger": ["Melaraby/qwen_vlm_arabic_ocr-GGUF", "qwen_vlm_arabic_ocr"]},
+    {"nom": "InternVL (2.5 cité ; 3.5 installé)", "ids": ["internvl2_5", "internvl2.5", "internvl3_5-14b"], "telecharger": ["internvl2_5-8b", "internvl3_5-8b"]},
+    {"nom": "olmOCR 2 (7B)", "ids": ["olmocr"], "telecharger": ["olmocr-2-7b", "allenai/olmOCR-2-7B-1025"]},
+    {"nom": "LFM3-VL 2B", "ids": ["lfm3-vl-2b@f16", "lfm3-vl-2b"], "telecharger": ["lfm3-vl-2b"]},
+    {"nom": "Qwen2-VL (7B)", "ids": ["qwen2-vl", "qwen/qwen2.5-vl-7b"], "telecharger": ["qwen/qwen2-vl-7b", "qwen2-vl-7b-instruct"]},
+    {"nom": "Qari-OCR (arabe)", "ids": ["qari"], "telecharger": ["NAMAA-Space/Qari-OCR-0.1-VL-2B-Instruct", "Qari-OCR"]},
+]
+LECTEURS_CITES = ["tess:ara:fast:psm7:x3:bin", "tess:ara:best:psm7:x3:bin", "easyocr", "paddleocr"]
+PAQUETS_PIP = {"easyocr": ("easyocr", ["easyocr"]), "paddleocr": ("paddleocr", ["paddlepaddle", "paddleocr"]),
+               "pytesseract": ("pytesseract", ["pytesseract"]), "cv2": ("cv2", ["opencv-python-headless"])}
+
+
+def trouver_lms() -> str:
+    exe = shutil.which("lms")
+    if exe:
+        return exe
+    for nom in ("lms.exe", "lms"):
+        p = os.path.join(os.path.expanduser("~"), ".lmstudio", "bin", nom)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def serveur_ok(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/models", timeout=5):
+            return True
+    except Exception:                                                # noqa: BLE001
+        return False
+
+
+def assurer_serveur(url: str, log=print, attente: float = 60.0) -> bool:
+    if serveur_ok(url):
+        return True
+    exe = trouver_lms()
+    if not exe:
+        log("✘ LM Studio : serveur injoignable et commande `lms` introuvable. Ouvre LM Studio → onglet Developer → « Start Server » "
+            "(ou, une fois, dans un terminal : `~/.lmstudio/bin/lms bootstrap`), puis relance.")
+        return False
+    log("LM Studio : serveur injoignable, démarrage (`lms server start`) …")
+    try:
+        _executer([exe, "server", "start"], timeout=120, capture_output=True)
+    except Exception as e:                                           # noqa: BLE001
+        log(f"  démarrage impossible : {e}")
+    fin = time.time() + attente
+    while time.time() < fin:
+        if serveur_ok(url):
+            return True
+        time.sleep(2)
+    log("✘ LM Studio : le serveur ne répond toujours pas.")
+    return False
+
+
+def resoudre_modele(entree: dict, installes: list[str]) -> str | None:
+    for motif in entree["ids"]:
+        m = motif.lower()
+        exact = [i for i in installes if i.lower() == m]
+        if exact:
+            return exact[0]
+        contient = sorted(i for i in installes if m in i.lower())
+        if contient:
+            return contient[0]
+    return None
+
+
+def telecharger_modele(entree: dict, ids_actuels, log=print) -> str | None:
+    """`lms get <terme> --yes` pour chaque terme jusqu'à ce qu'un nouveau modèle apparaisse dans LM Studio ; rend son identifiant."""
+    exe = trouver_lms()
+    if not exe:
+        log("  ✘ commande `lms` introuvable : téléchargement impossible (LM Studio → onglet Discover, ou `lms bootstrap`).")
+        return None
+    for terme in entree["telecharger"]:
+        avant = set(ids_actuels())
+        log(f"  ↓ lms get {terme} (peut durer longtemps) …")
+        try:
+            _executer([exe, "get", terme, "--yes"], timeout=4 * 3600)
+        except Exception as e:                                       # noqa: BLE001
+            log(f"    échec : {type(e).__name__}: {e}")
+            continue
+        nouveaux = [i for i in ids_actuels() if i not in avant]
+        if nouveaux:
+            return resoudre_modele(entree, nouveaux) or nouveaux[0]
+        log(f"    « {terme} » : rien de nouveau dans LM Studio (introuvable, ou déjà présent sous un autre nom)")
+    return None
+
+
+def installer_pip(paquets: list[str], log=print) -> bool:
+    log(f"  pip install {' '.join(paquets)} …")
+    try:
+        r = _executer([sys.executable, "-m", "pip", "install", *paquets], timeout=3600)
+        importlib.invalidate_caches()
+        return getattr(r, "returncode", 0) == 0
+    except Exception as e:                                           # noqa: BLE001
+        log(f"    échec : {type(e).__name__}: {e}")
+        return False
+
+
+def tessdata_complet() -> bool:
+    return all(os.path.isfile(os.path.join(TESSDATA_LOCAL, c, "ara.traineddata")) for c in DEPOTS_TESSDATA)
+
+
+def preparer_cites(a, log=print, saisie=input) -> tuple[list[str], dict, dict]:
+    """Prépare le benchmark des outils CITÉS : démarre LM Studio, repère ce qui est présent, annonce ce qui manque, l'installe après accord
+    (--oui, ou réponse à la question ; sans terminal interactif et sans --oui : rien n'est installé). Rend (candidats, notes, abandons)."""
+    notes, abandons = {}, {}
+    candidats = []
+    serveur = assurer_serveur(a.url, log)
+    ids = (lambda: [m["id"] for m in modeles_lmstudio(a.url)]) if serveur else (lambda: [])
+    installes = ids()
+    manquants, modeles = [], {}
+    for e in CATALOGUE_CITES:
+        mid = resoudre_modele(e, installes)
+        modeles[e["nom"]] = mid
+        if mid is None:
+            manquants.append(e)
+    pip_manque = [(m, p) for m, p in PAQUETS_PIP.values() if importlib.util.find_spec(m) is None]
+    tess_manque = not tessdata_complet() and not a.tessdata
+    plan = []
+    if pip_manque:
+        plan.append("Python (pip) : " + ", ".join(p for _, ps in pip_manque for p in ps))
+    if tess_manque:
+        plan.append("Tesseract : ara.traineddata (fast + best, ~15 Mo) dans benchmark/tessdata")
+    if serveur and manquants:
+        plan.append("LM Studio (téléchargements, plusieurs Go chacun) : " + ", ".join(e["nom"] for e in manquants))
+    if not serveur:
+        log("→ Sans serveur LM Studio, les modèles de vision sont ignorés.")
+    if plan and not a.sans_installation:
+        log("\nCe qui manque et sera installé :")
+        for p in plan:
+            log("  • " + p)
+        ok = a.oui
+        if not ok and sys.stdin and sys.stdin.isatty():
+            ok = saisie("Installer maintenant ? [O/n] ").strip().lower() in ("", "o", "oui", "y", "yes")
+        if not ok:
+            log("→ Installation non faite (relance avec --oui, ou réponds O). Les outils manquants seront ignorés.")
+        else:
+            for m, ps in pip_manque:
+                if not installer_pip(ps, log):
+                    abandons[ps[-1]] = f"installation pip échouée ({' '.join(ps)}) : installe-le à la main"
+            if tess_manque:
+                try:
+                    telecharger_tessdata()
+                except Exception as e:                               # noqa: BLE001
+                    abandons["tessdata"] = f"téléchargement impossible : {e}"
+            if serveur:
+                for e in manquants:
+                    nouveau = telecharger_modele(e, ids, log)
+                    if nouveau:
+                        modeles[e["nom"]] = nouveau
+                        notes[e["nom"]] = "téléchargé"
+                    else:
+                        abandons[e["nom"]] = ("introuvable / non téléchargeable automatiquement : installe-le dans LM Studio (onglet Discover, "
+                                              "format GGUF), puis relance avec --reprendre")
+    candidats += LECTEURS_CITES
+    for e in CATALOGUE_CITES:
+        mid = modeles.get(e["nom"])
+        if mid:
+            candidats.append("lm:" + mid)
+            if not any(m.lower() in mid.lower() for m in e["ids"][:1]):
+                notes[e["nom"]] = f"remplacé par « {mid} » (version voisine déjà installée)" if e["nom"] not in notes else notes[e["nom"]]
+        elif serveur and e["nom"] not in abandons:
+            abandons[e["nom"]] = "absent de LM Studio (installation refusée ou non faite)"
+    return candidats, notes, abandons
+
+
+def vue(resultats: dict, synth: dict, selection: set | None) -> tuple[dict, dict]:
+    """Ne montre dans le rapport que la sélection de cette exécution (le JSON garde tout)."""
+    if selection is None:
+        return resultats, synth
+    return ({k: v for k, v in resultats.items() if k in selection}, {k: v for k, v in synth.items() if k in selection})
+
+
+def ecrire_sorties(sortie: str, synth: dict, comb: dict, resultats: dict, abandons: dict, n_items: int, pages: list[dict], pas: int, partiels: dict,
+                   notes: dict | None = None, selection: set | None = None, seuil: float = 0.2, sans_crop: bool = False) -> str:
+    res_v, synth_v = vue(resultats, synth, selection)
+    comb_v = combinaisons(res_v, seuil) if len(res_v) > 1 and not sans_crop else {"accords": [], "oracle": None, "votes": []}
+    texte = rapport(synth_v, comb_v, n_items, pages, abandons, pas, notes)
     with open(os.path.join(sortie, "rapport_benchmark.md"), "w", encoding="utf-8") as f:
         f.write(texte)
     with open(os.path.join(sortie, "resultats_benchmark.json"), "w", encoding="utf-8") as f:
-        json.dump({"pas": pas, "synthese": synth, "combinaisons": comb, "abandons": abandons, "detail": resultats, "partiels": partiels},
+        json.dump({"pas": pas, "synthese": synth, "combinaisons": comb_v, "abandons": abandons, "detail": resultats, "partiels": partiels, "notes": notes or {}},
                   f, ensure_ascii=False, indent=1)
     return texte
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Benchmark de lecture de l'arabe", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--cites", action="store_true", help="UNIQUEMENT les outils et modèles cités (Tesseract, EasyOCR, PaddleOCR, Gemma 4 12B QAT, Qwen3-VL 8B/2B, "
+                                                       "Melaraby, InternVL, olmOCR 2, LFM3-VL 2B, Qwen2-VL, Qari-OCR) ; démarre LM Studio et installe ce qui manque")
+    ap.add_argument("--oui", action="store_true", help="installe sans poser de question (pip, tessdata, modèles LM Studio)")
+    ap.add_argument("--sans-installation", action="store_true", help="n'installe rien (les outils manquants sont ignorés)")
+    ap.add_argument("--preparer-seulement", action="store_true", help="installe / vérifie les outils cités puis s'arrête (pas de mesure)")
     ap.add_argument("--candidats", nargs="*", default=[], help="tess[:ara[:best][:psm7][:x3][:bin]] | grille:tess | easyocr | paddleocr | lm:<modèle>[:indice[=tess|easyocr]]")
-    ap.add_argument("--complet", action="store_true", help="Tesseract (fast, best), EasyOCR, PaddleOCR et TOUS les modèles de vision de LM Studio")
+    ap.add_argument("--complet", action="store_true", help="TOUT ce qui est sur la machine : Tesseract, EasyOCR, PaddleOCR et TOUS les modèles de vision de LM Studio (long)")
     ap.add_argument("--vlm", nargs="*", default=None, help="ajoute les modèles de vision de LM Studio dont l'identifiant contient un de ces mots (sans mot : tous)")
     ap.add_argument("--exclure", nargs="*", default=[], help="retire les modèles dont l'identifiant contient un de ces mots (ex. 31b)")
+    ap.add_argument("--tout-afficher", action="store_true", help="le rapport montre aussi les mesures conservées d'exécutions précédentes (sinon : seulement la sélection)")
     ap.add_argument("--verite", default=VERITE_DEFAUT)
     ap.add_argument("--sortie", default=os.path.join(RACINE, "benchmark", "sortie"))
     ap.add_argument("--reprendre", action="store_true", help="ne refait pas les candidats déjà présents dans le dossier de sortie (mêmes options requises)")
@@ -632,6 +849,8 @@ def main(argv=None) -> int:
     ap.add_argument("--lister-lmstudio", action="store_true")
     a = ap.parse_args(argv)
     if a.lister_lmstudio:
+        if not assurer_serveur(a.url):
+            return 1
         try:
             for m in modeles_lmstudio(a.url):
                 print(f"{m['id']:50s} {m['type']:11s} {m['etat']}")
@@ -647,29 +866,46 @@ def main(argv=None) -> int:
             print(f"✘ téléchargement impossible : {e}")
             return 1
     candidats = list(a.candidats)
+    notes, abandons = {}, {}
+    if a.cites or a.preparer_seulement:
+        cites, notes, abandons = preparer_cites(a)
+        if a.preparer_seulement:
+            for k, v in {**{k: f"{v}" for k, v in notes.items()}, **abandons}.items():
+                print(f"  - {k} : {v}")
+            print("Préparation terminée." + (" Des outils restent manquants (voir ci-dessus)." if abandons else ""))
+            return 0
+        candidats += cites
     if a.complet:
         candidats += ["tess:ara:fast:psm7:x3:bin", "tess:ara:best:psm7:x3:bin", "easyocr", "paddleocr"]
     if a.complet or a.vlm is not None:
-        try:
-            candidats += ["lm:" + i for i in choisir_vlm(a.url, a.vlm or [], a.exclure)]
-        except Exception as e:                                       # noqa: BLE001
-            print(f"✘ modèles de vision de LM Studio : {e}")
-    candidats = list(dict.fromkeys(candidats))
+        if assurer_serveur(a.url):
+            try:
+                candidats += ["lm:" + i for i in choisir_vlm(a.url, a.vlm or [], a.exclure)]
+            except Exception as e:                                   # noqa: BLE001
+                print(f"✘ modèles de vision de LM Studio : {e}")
+    candidats = [c for c in dict.fromkeys(candidats) if not any(x.lower() in c.lower() for x in a.exclure if c.startswith("lm:"))]
     if not candidats:
-        ap.error("indique des candidats (--candidats …, --vlm …, --complet) ; --lister-lmstudio pour voir les modèles")
+        ap.error("indique des candidats (--cites, --candidats …, --vlm …, --complet) ; --lister-lmstudio pour voir les modèles")
+    if any(c.startswith("lm:") for c in candidats) and not serveur_ok(a.url):
+        assurer_serveur(a.url)
     pages = charger_verite(a.verite)
     n_items = sum(len(p["items"]) for p in pages)
     os.makedirs(a.sortie, exist_ok=True)
-    resultats, synth, abandons, partiels = {}, {}, {}, {}
+    resultats, synth, partiels = {}, {}, {}
     chemin_json = os.path.join(a.sortie, "resultats_benchmark.json")
     if a.reprendre and os.path.isfile(chemin_json):
         with open(chemin_json, encoding="utf-8") as f:
             ancien = json.load(f)
         if ancien.get("pas") == a.echantillon:
-            resultats, synth, abandons, partiels = ancien["detail"], ancien["synthese"], ancien.get("abandons", {}), ancien.get("partiels", {})
+            resultats, synth, partiels = ancien["detail"], ancien["synthese"], ancien.get("partiels", {})
             print(f"↻ reprise : {len(resultats)} candidat(s) déjà mesuré(s) conservé(s)")
         else:
             print("↻ reprise ignorée : --echantillon différent de l'exécution précédente")
+    selection: set | None = None if a.tout_afficher else set()
+    pas = max(1, a.echantillon)
+
+    def sauver():
+        return ecrire_sorties(a.sortie, synth, {}, resultats, abandons, n_items, pages, pas, partiels, notes, selection, a.seuil_accord, a.sans_crop)
     decharge_signale = False
     for spec in candidats:
         try:
@@ -679,6 +915,8 @@ def main(argv=None) -> int:
             abandons[spec] = str(e)
             continue
         for lec in lecteurs:
+            if selection is not None:
+                selection.add(lec.nom)
             if lec.nom in resultats:
                 print(f"↷ {lec.nom} déjà mesuré (reprise)")
                 continue
@@ -692,7 +930,7 @@ def main(argv=None) -> int:
                     print("  (commande `lms` introuvable : déchargement non fait ; LM Studio gère lui-même la mémoire)")
                     decharge_signale = True
             print(f"▶ {lec.nom} …", flush=True)
-            res = evaluer(lec, pages, not a.sans_page, pas=max(1, a.echantillon), budget_s=(a.budget_min * 60 or None), niveau_crop=not a.sans_crop)
+            res = evaluer(lec, pages, not a.sans_page, pas=pas, budget_s=(a.budget_min * 60 or None), niveau_crop=not a.sans_crop)
             if res["abandon"]:
                 print(f"   ✘ abandonné : {res['abandon']}")
                 abandons[lec.nom] = res["abandon"]
@@ -702,13 +940,15 @@ def main(argv=None) -> int:
                 s = synth[lec.nom]
                 print(f"   CER léger {pct(s['cer_leger'])} (vides {pct(s['vides'])}, hors vides {pct(s['cer_hors_vides'])}) · exact {pct(s['exact'])} · "
                       f"page rappel {pct(s['rappel_page'])}")
-            comb = combinaisons(resultats, a.seuil_accord) if len(resultats) > 1 and not a.sans_crop else {"accords": [], "oracle": None, "votes": []}
-            ecrire_sorties(a.sortie, synth, comb, resultats, abandons, n_items, pages, max(1, a.echantillon), partiels)     # sauvegarde à chaque candidat
+            sauver()                                                  # sauvegarde à chaque candidat
+    if selection is not None and not (selection & set(resultats)):
+        print("Aucun candidat n'a pu tourner.")
+        sauver()
+        return 2
     if not resultats:
         print("Aucun candidat n'a pu tourner.")
         return 2
-    comb = combinaisons(resultats, a.seuil_accord) if len(resultats) > 1 and not a.sans_crop else {"accords": [], "oracle": None, "votes": []}
-    texte = ecrire_sorties(a.sortie, synth, comb, resultats, abandons, n_items, pages, max(1, a.echantillon), partiels)
+    texte = sauver()
     print("\n" + texte)
     print(f"Rapport : {os.path.join(a.sortie, 'rapport_benchmark.md')}  ·  détail par zone : resultats_benchmark.json")
     return 0
