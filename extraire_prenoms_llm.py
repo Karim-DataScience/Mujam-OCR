@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "5.5.0"
+VERSION = "5.6.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -369,6 +369,7 @@ class Config:
     suivi_ui: float = 0            # intervalle (s) des mises à jour destinées à une interface (0 = aucune)
     log_niveau: str = "DEBUG"      # niveau écrit dans le fichier de log : DEBUG | INFO
     essais: int = 3
+    seuil_passe2: float = 0.2      # --completer-arabe : coût d'incohérence (verif_arabe) en dessous duquel une lecture est ADOPTÉE (0 = parfaitement cohérente)
     corps_extra: dict = field(default_factory=dict)
     prompt: str = PROMPT
     refaire: bool = False
@@ -2745,6 +2746,156 @@ def relire_arabe(cfg: Config) -> dict:
 
 
 # ============================================================================
+# 11 quater) DEUXIÈME PASSE ARABE (v5.6) : pages lues par le modèle de vision seul dont l'arabe est resté vide
+# ============================================================================
+# Constat (cache Abdur Rahman, 4 nov. 2026) : 7 pages sur 80 n'ont AUCUN arabe (`"arabe": ""` partout) alors que penser=False, 0 jeton de réflexion
+# et 1 100 jetons d'entrée comme les pages complètes : le modèle a omis la colonne arabe. Le benchmark (benchmark_arabe.py) montre que le même modèle
+# lit ces cellules avec une consigne courte (page de l'image 5 : 17/17). On lui redonne donc la liste NUMÉROTÉE des noms latins déjà lus et on lui
+# demande l'arabe de chaque numéro (l'alignement est explicite, pas déduit de l'ordre). Une lecture n'est ADOPTÉE que si le vérificateur
+# (verif_arabe) la juge cohérente avec la translittération (coût < seuil_passe2) : sinon le bloc reste vide (plutôt vide que faux) et la proposition est
+# gardée dans `propositions_arabe` pour la revue. Limite connue : le vérificateur laisse passer une substitution plausible (« عبد الواحد » pour
+# « Abd-ul-Ahad » coûte 0,25) ; le seuil par défaut (0,2) la refuse, mais il ne remplace pas une relecture humaine.
+
+PROMPT_PASSE_ARABE = ("Tu es un lecteur d'écriture arabe imprimée. Tu RECOPIES exactement ce qui est imprimé : tu ne corriges pas, tu ne complètes pas, "
+                      "tu ne traduis pas, tu ne remplaces pas un nom par un nom plus courant et tu n'ajoutes aucune voyelle absente de l'image.")
+_LIGNE_NUMEROTEE = re.compile(r"^\s*[\[(]?(\d{1,3})[\])]?\s*[.:)\-–—]\s*(.*?)\s*$")
+
+
+def texte_passe_arabe(noms: list[str]) -> str:
+    liste = "\n".join(f"{k}. {n}" for k, n in enumerate(noms, 1))
+    return ("Cette page d'un dictionnaire de prénoms contient, dans l'ordre, les noms suivants (alphabet latin) :\n" + liste
+            + "\n\nPour CHAQUE numéro, recopie l'écriture arabe imprimée sur la page pour ce nom (le même nom en lettres arabes). "
+            "Réponds uniquement par une ligne par numéro, au format « numéro. écriture arabe », sans aucun autre texte. "
+            "Si un nom n'a pas d'écriture arabe sur la page, écris « numéro. - ».")
+
+
+def lignes_numerotees(texte: str) -> dict[int, str]:
+    """« 3. أحمد » -> {3: 'أحمد'} ; ignore tout ce qui n'est pas une ligne numérotée ; la 1re occurrence d'un numéro l'emporte."""
+    out: dict[int, str] = {}
+    for ligne in (texte or "").splitlines():
+        m = _LIGNE_NUMEROTEE.match(ligne)
+        if m and int(m.group(1)) not in out:
+            out[int(m.group(1))] = m.group(2).strip().strip("«»\"'`*").strip()
+    return out
+
+
+def completer_arabe(cfg: Config) -> dict:
+    """Deuxième passe arabe sur le cache (voir l'en-tête de section). Pages lues par le seul modèle de vision (pas « hybride » / « local »),
+    ayant au moins un bloc sans arabe. Écrit dans le cache : `passe_arabe` (adoptions) et `propositions_arabe` (lectures refusées)."""
+    if VA is None:
+        raise ErreurFatale("verif_arabe.py introuvable : la deuxième passe arabe a besoin du vérificateur.")
+    stats = {"pages": 0, "blocs_vides": 0, "adoptes": 0, "refuses": 0, "non_lus": 0, "pages_douteuses": 0, "requetes": 0, "duree_s": 0.0}
+    if not ARABE_ATTENDU:
+        log("profil sans écriture arabe attendue (\"arabe_attendu\": false) : rien à compléter.")
+        return stats
+    t_debut = time.time()
+    revue: list[dict] = []                   # une ligne par lecture (adoptée ou refusée) -> passe_arabe.csv
+    a_faire = []
+    for p in cfg.pages:
+        d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        if not d or d.get("blanche") or not d.get("entrees") or d.get("methode") not in (None, "", "vlm"):
+            continue
+        blocs = [(i, j, b) for i, e in enumerate(d["entrees"]) for j, b in enumerate(e["prenoms"])]
+        vides = {(i, j) for i, j, b in blocs if not b.get("arabe") and not b.get("valide")}
+        if vides:
+            a_faire.append((p, d, blocs, vides))
+    log(f"deuxième passe arabe : {sum(len(v) for *_, v in a_faire)} bloc(s) sans arabe sur {len(a_faire)} page(s) du cache.")
+    if not a_faire:
+        return stats
+    info = resoudre_modele(cfg)
+    afficher_info(info, cfg)
+    etat = Etat(cfg, info, None)
+    penser = cfg.reflexion == "oui"          # même choix que relire_arabe : la réflexion épuise le budget sans rendre de réponse (mesuré le 28 oct. 2026)
+    budget = cfg.budget_reflexion or 3000
+    for p, d, blocs, vides in a_faire:
+        if etat.stop.is_set():
+            break
+        ident = id_chunk(p, 1, 1)
+        png, _encre = preparer_image(cfg, p, 1)
+        noms = [" / ".join(b.get("orthographes") or ["?"]) for _i, _j, b in blocs]
+        numeros_cibles = {k for k, (i, j, _b) in enumerate(blocs, 1) if (i, j) in vides}
+        lus: dict[int, str] = {}
+        for essai in range(1, min(2, max(1, cfg.essais)) + 1):
+            if etat.stop.is_set() or all(lus.get(k) for k in numeros_cibles):
+                break
+            temp = min(1.0, 0.2 + 0.2 * (essai - 1))
+            try:
+                rep = appeler_llm(cfg, info, png, PROMPT_PASSE_ARABE, texte_passe_arabe(noms), temperature=temp, top_p=0.8,
+                                  max_tokens=max(300, 120 + 45 * len(blocs)) if not penser else max(cfg.max_tokens, 1500), penser=penser,
+                                  budget=budget if penser else etat.budget(False), stop=etat.stop, suivi=None, pas_suivi=0)
+            except ErreurReflexion:
+                continue
+            except ErreurLLM as e:
+                log(f"  {ident} passe arabe, essai {essai} : {e}", "WARN")
+                continue
+            if rep["abandon"] == "interruption":
+                raise Interrompu()
+            _garde_silence(etat, rep, ident)
+            _journaliser_essai(ident + "-passe-arabe", essai, penser, temp, 0.8, etat, rep, png)
+            stats["requetes"] += 1
+            for k, v in lignes_numerotees(rep["content"]).items():
+                if k not in lus or not lus[k]:
+                    lus[k] = v
+        # contrôle d'ancrage : sur les blocs DÉJÀ lus de la page, la nouvelle lecture doit s'accorder avec l'ancienne
+        ancrages = accords = 0
+        for k, (i, j, b) in enumerate(blocs, 1):
+            if (i, j) in vides or not b.get("arabe") or not lus.get(k):
+                continue
+            ancrages += 1
+            a1, a2 = arab_norm(b["arabe"]), arab_norm(nettoyer_arabe(lus[k]))
+            accords += bool(a1 and a2 and difflib.SequenceMatcher(None, a1, a2).ratio() >= 0.8)
+        stats["pages"] += 1
+        stats["blocs_vides"] += len(vides)
+        if ancrages >= 3 and accords / ancrages < 0.7:
+            stats["pages_douteuses"] += 1
+            log(f"  {ident} : la nouvelle lecture ne s'accorde qu'avec {accords}/{ancrages} des blocs déjà lus : page douteuse, rien n'est écrit", "WARN")
+            evenement("passe_arabe", chunk=ident, cibles=len(vides), adoptes=0, refuses=0, ancrages=ancrages, accords=accords, douteuse=True)
+            continue
+        adoptes, refuses = [], []
+        for k in sorted(numeros_cibles):
+            i, j, b = blocs[k - 1]
+            brut = lus.get(k, "")
+            v = VA.normaliser_arabe_export(nettoyer_arabe(brut))
+            if not v or brut.strip() in ("-", "—", "–") or re.search(r"[A-Za-z0-9]", v) or not re.search(r"[\u0621-\u064A]", v):
+                stats["non_lus"] += 1
+                continue
+            translit = (b.get("orthographes") or [""])[0]
+            cout, indice = VA.coherence(translit, v) if translit else (9.0, "pas de translittération")
+            ligne = {"entree": i + 1, "bloc": j + 1, "nom": translit, "arabe": v, "cout": round(cout, 2), "source": "passe_arabe"}
+            if 0 <= cout < cfg.seuil_passe2:
+                d["entrees"][i]["prenoms"][j]["arabe"] = v
+                adoptes.append(ligne)
+                revue.append({"page": p, **ligne, "decision": "adoptée", "indice": ""})
+            else:
+                refuses.append({**ligne, "indice": indice})
+                revue.append({"page": p, **ligne, "decision": "refusée (à valider)", "indice": indice})
+        stats["adoptes"] += len(adoptes)
+        stats["refuses"] += len(refuses)
+        if adoptes or refuses:
+            if adoptes:
+                d.setdefault("passe_arabe", []).extend(adoptes)
+            if refuses:
+                d.setdefault("propositions_arabe", []).extend(refuses)
+            d.setdefault("avertissements", []).append(f"passe arabe : {len(adoptes)} lecture(s) adoptée(s), {len(refuses)} refusée(s) (incohérentes avec la translittération)")
+            ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
+        evenement("passe_arabe", chunk=ident, cibles=len(vides), adoptes=len(adoptes), refuses=len(refuses), ancrages=ancrages, accords=accords)
+        log(f"  {ident} : {len(vides)} bloc(s) sans arabe, {len(adoptes)} adopté(s), {len(refuses)} refusé(s)")
+    if revue:
+        import csv
+        chemin = os.path.join(cfg.sortie, "passe_arabe.csv")
+        with open(chemin, "w", encoding="utf-8-sig", newline="") as fcsv:
+            w = csv.DictWriter(fcsv, fieldnames=["page", "entree", "bloc", "nom", "arabe", "cout", "decision", "indice"], delimiter=";", extrasaction="ignore")
+            w.writeheader()
+            w.writerows(revue)
+        stats["csv"] = chemin
+        log(f"Revue : {chemin} ({sum(1 for r in revue if r['decision'].startswith('refus'))} lecture(s) refusée(s) à valider à la main)")
+    stats["duree_s"] = round(time.time() - t_debut, 1)
+    log(f"PASSE ARABE : {stats['adoptes']} lecture(s) adoptée(s) sur {stats['blocs_vides']} bloc(s) vide(s) ; {stats['refuses']} refusée(s) (incohérentes avec la translittération, "
+        f"gardées dans `propositions_arabe`) ; {stats['non_lus']} non lue(s) ; {stats['pages_douteuses']} page(s) douteuse(s).")
+    return stats
+
+
+# ============================================================================
 # 11 ter) REVUE MANUELLE (v4.4) : exporter les mots problématiques, appliquer les corrections
 # ============================================================================
 
@@ -3081,20 +3232,22 @@ def completer_pages(cfg: Config) -> list[int]:
 # ============================================================================
 
 PROFIL_HISTORIQUE = "geoffroy_livre_des_prenoms_arabes"
+ARABE_ATTENDU = True            # le document donne l'écriture arabe de chaque nom (profil : "arabe_attendu": false pour le désactiver)
 
 
 def reinitialiser_profil() -> None:
     """Remet les réglages globaux propres à un document à leurs valeurs historiques (Livre des prénoms arabes)."""
-    global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC
-    PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC = PAGE_OFFSET_DEFAUT, True, EXEMPLE_DESC_DEFAUT
+    global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC, ARABE_ATTENDU
+    PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC, ARABE_ATTENDU = PAGE_OFFSET_DEFAUT, True, EXEMPLE_DESC_DEFAUT, True
 
 
 def appliquer_profil(profil: dict, a, args: list[str]) -> None:
     """Applique un profil (profils/*.json) : décalage de pagination, thèmes, exemple du prompt, et, SI L'UTILISATEUR NE LES A PAS DONNÉS, pages, méthode et dossier de sortie.
     Le prompt du profil est posé par main() après construire_cfg (cfg.prompt)."""
     import profils as PR
-    global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC
-    reinitialiser_profil()                                     # sinon un profil sans « exemple » hériterait de celui d'avant (TUI : on change de document sans relancer)
+    global PAGE_OFFSET, THEMES_ACTIFS, EXEMPLE_DESC, ARABE_ATTENDU
+    reinitialiser_profil()
+    ARABE_ATTENDU = bool(profil.get("arabe_attendu", True))                                     # sinon un profil sans « exemple » hériterait de celui d'avant (TUI : on change de document sans relancer)
     PAGE_OFFSET = int(profil.get("decalage_page_imprimee", PAGE_OFFSET))
     THEMES_ACTIFS = bool(profil.get("themes", False))
     ex = (profil.get("exemple") or {}).get("description")
@@ -3138,7 +3291,7 @@ def choisir_profil(a, args: list[str]) -> dict | None:
         p = PR.detecter(a.pdf)
         if p:
             return p
-        if os.path.isfile(a.pdf) and (a.autotest or a.relire_arabe or a.relire_tetes or a.relire_corps or a.completer_pages or a.exporter_problemes or not a.export):
+        if os.path.isfile(a.pdf) and (a.autotest or a.relire_arabe or a.completer_arabe or a.relire_tetes or a.relire_corps or a.completer_pages or a.exporter_problemes or not a.export):
             log(f"aucun profil ne correspond à « {os.path.basename(a.pdf)} » : profil « generique » (le modèle lit chaque page entière). "
                 "Crée profils/mon_document.json (voir profils/generique.json) et choisis-le avec --profil.", "WARN")
             return PR.charger(PR.PROFIL_GENERIQUE)
@@ -3269,6 +3422,11 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--diagnostic", action="store_true", help="configuration chargée, vitesse, GPU, jetons d'entrée, réglages conseillés ; puis quitte")
     ap.add_argument("--relire-arabe", action="store_true", dest="relire_arabe",
                     help="relit AVEC réflexion les seuls mots arabes incohérents avec la translittération (cache existant), puis ré-exporte")
+    ap.add_argument("--completer-arabe", action="store_true", dest="completer_arabe",
+                    help="deuxième passe : redemande au modèle (sans réflexion, liste numérotée des noms) l'arabe des blocs restés vides, ne retient que les lectures "
+                         "cohérentes avec la translittération (cache existant, profils « modèle de vision seul »), puis ré-exporte")
+    ap.add_argument("--seuil-passe2", type=float, default=0.2, dest="seuil_passe2",
+                    help="coût d'incohérence (verif_arabe) sous lequel une lecture de --completer-arabe est adoptée (défaut 0,2 ; 0 = parfaitement cohérente)")
     ap.add_argument("--profil", default="", help="profil du document (nom dans profils/ ou chemin .json) ; détecté d'après le nom du PDF sinon")
     ap.add_argument("--lister-profils", action="store_true", dest="lister_profils", help="liste les profils de documents disponibles")
     ap.add_argument("--completer-pages", action="store_true", dest="completer_pages",
@@ -3338,7 +3496,7 @@ def construire_cfg(a) -> Config:
                  stall=int(a.stall), attente=int(a.attente), suivi=int(a.suivi), essais=max(1, int(a.essais)), refaire=bool(a.refaire),
                  sauver_images=bool(a.sauver_images), ancien=a.ancien, export_tous=int(a.export_tous), sans_llm=bool(a.export),
                  cle_api=a.cle_api, log_niveau=a.log_niveau, methode=a.methode, tesseract=a.tesseract,
-                 tessdata=a.tessdata, tess_lang=a.tess_lang)
+                 tessdata=a.tessdata, tess_lang=a.tess_lang, seuil_passe2=float(getattr(a, "seuil_passe2", 0.2)))
     if a.corps_extra:
         try:
             cfg.corps_extra = json.loads(a.corps_extra) if isinstance(a.corps_extra, str) else dict(a.corps_extra)
@@ -3521,7 +3679,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.rapport:
         log(f"rapport de debug : {creer_rapport(cfg, chemin_cfg)}")
         return 0
-    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe or a.relire_tetes or a.relire_corps else "problemes" if a.exporter_problemes else "corrections" if a.appliquer_corrections else "statut" if a.statut else "export" if a.export else "extraction"
+    mode = "diagnostic" if a.diagnostic else "autotest" if a.autotest else "relecture" if a.relire_arabe or a.completer_arabe or a.relire_tetes or a.relire_corps else "problemes" if a.exporter_problemes else "corrections" if a.appliquer_corrections else "statut" if a.statut else "export" if a.export else "extraction"
     JOURNAL.ouvrir(os.path.join(cfg.sortie, "logs"), mode, cfg.log_niveau)
     log(f"journal : {JOURNAL.chemin}")
     journaliser_demarrage(mode, argv, cfg)
@@ -3555,6 +3713,10 @@ def main(argv: list[str] | None = None) -> int:
             st_rel = relire_arabe(cfg)
             ecrire_atomique(os.path.join(cfg.sortie, "relecture_stats.json"), json.dumps({"modele": cfg.modele, **st_rel}, ensure_ascii=False, indent=1))
             cfg.sans_llm = True                                # ré-export depuis le cache (relectures comprises)
+        if a.completer_arabe:
+            st_p2 = completer_arabe(cfg)
+            ecrire_atomique(os.path.join(cfg.sortie, "passe_arabe_stats.json"), json.dumps({"modele": cfg.modele, "seuil": cfg.seuil_passe2, **st_p2}, ensure_ascii=False, indent=1))
+            cfg.sans_llm = True                                # ré-export depuis le cache (passe arabe comprise)
         rows, infos, avert = run_pipeline(cfg)
         if cfg.fatal and not rows:
             sys.exit(2)                                        # rien à exporter
