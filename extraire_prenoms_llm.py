@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "5.4.0"
+VERSION = "5.5.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)

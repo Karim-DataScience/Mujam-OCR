@@ -536,5 +536,227 @@ class TestPreparation(unittest.TestCase):
             shutil.rmtree(sortie, ignore_errors=True)
 
 
+class TestModeMoteur(unittest.TestCase):
+    """Mode « moteur » : API native de LM Studio, réflexion coupée, contexte explicite (mêmes conditions que extraire_prenoms_llm)."""
+
+    def setUp(self):
+        import comparer_modeles as C
+        import extraire_prenoms_llm as X
+        self.C, self.X = C, X
+        self.sauve = (C.trouver_lms, C.charger, X.resoudre_modele, X.appeler_llm)
+        self.charges, self.appels = [], []
+        C.trouver_lms = lambda: "/faux/lms"
+        C.charger = lambda ex, lms, mdl, url, delai=240: self.charges.append(mdl) or {"ok": True, "duree_s": 0, "cle": mdl["nom"], "message": ""}
+        self.info = type("I", (), {"ctx": 16384, "options_reflexion": ["off", "on"], "quant": "Q4_K_M", "taille_go": 5.0, "vision": True})()
+        X.resoudre_modele = lambda cfg: self.info
+
+        def faux_llm(cfg, info, png, systeme, texte, **kw):
+            self.appels.append({"png": png, "texte": texte, **kw})
+            return {"content": "<think>x</think>عالي", "finish": "stop", "tokens": 7, "tokens_reflexion": 0, "abandon": "", "erreur": ""}
+        X.appeler_llm = faux_llm
+        self.lec = B.LecteurLMStudio("lm:faux/modele", "http://127.0.0.1:1234/v1", None, contexte=12288)
+        self.lec.natif = True
+        self.img = Image.new("RGB", (60, 20), "white")
+
+    def tearDown(self):
+        self.C.trouver_lms, self.C.charger, self.X.resoudre_modele, self.X.appeler_llm = self.sauve
+
+    def test_charge_avec_le_contexte_demande_et_coupe_la_reflexion(self):
+        self.lec.echauffer()
+        self.assertEqual(self.charges, [{"nom": "faux/modele", "ctx": 12288, "gpu": "max", "parallel": 1}])
+        self.assertEqual(self.lec.lire_crop(self.img), "عالي")
+        self.assertIs(self.appels[-1]["penser"], False)                       # réflexion coupée comme dans le moteur
+        self.assertTrue(self.appels[-1]["png"].startswith(b"\x89PNG"))
+        self.assertEqual(self.lec.derniere["finish"], "stop")
+        self.assertEqual(self.lec.conditions["contexte"], 16384)
+        self.assertTrue(self.lec.conditions["reflexion_coupable"])
+        self.assertTrue(self.lec.conditions["charge_par_le_script"])
+
+    def test_sans_chargement_utilise_le_modele_tel_quel(self):
+        self.lec.charger_modele = False
+        self.lec.echauffer()
+        self.assertEqual(self.charges, [])
+        self.assertFalse(self.lec.conditions["charge_par_le_script"])
+
+    def test_contexte_trop_petit_signale(self):
+        self.info.ctx = 4096
+        self.lec.echauffer()
+        self.assertIn("4096", self.lec.conditions["alerte"])
+
+    def test_echec_du_chargement_leve_une_erreur_claire(self):
+        self.C.charger = lambda *a, **k: {"ok": False, "message": "`lms load` a échoué (code 1)"}
+        with self.assertRaises(RuntimeError) as e:
+            self.lec.echauffer()
+        self.assertIn("lms load", str(e.exception))
+
+    def test_erreur_du_serveur_comptee_comme_erreur(self):
+        self.lec.echauffer()
+        self.X.appeler_llm = lambda *a, **k: {"erreur": "HTTP 400", "content": ""}
+        with self.assertRaises(RuntimeError):
+            self.lec.lire_crop(self.img)
+
+    def test_evaluer_enregistre_les_conditions_et_la_reflexion(self):
+        r = B.evaluer(self.lec, B.charger_verite(B.VERITE_DEFAUT)[:1], False, pas=6)
+        self.assertEqual(r["conditions"]["contexte"], 16384)
+        s = B.synthese(r)
+        self.assertEqual(s["conditions"]["api"], "natif")
+        self.assertEqual(s["reflexion"], 0.0)
+
+    def test_sonde_de_l_api_native(self):
+        class Natif(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                corps = json.dumps({"models": []} if self.path.startswith("/api/v1/models") else {"data": []}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(corps)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Natif)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            self.assertTrue(B.LecteurLMStudio("lm:x", f"http://127.0.0.1:{srv.server_port}/v1", None)._sonder_natif())
+            self.assertFalse(B.LecteurLMStudio("lm:x", "http://127.0.0.1:9/v1", None)._sonder_natif())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class TestDiagnostics(unittest.TestCase):
+    def setUp(self):
+        self.pages = B.charger_verite(B.VERITE_DEFAUT)[:2]
+        self.vals = [it["texte"] for p in self.pages for it in p["items"]]
+
+    def lecteur(self, nom, f, meta=None):
+        class L(B.Lecteur):
+            def __init__(s):
+                s.nom, s.k, s.derniere = nom, 0, {}
+
+            def lire_crop(s, img):
+                s.k += 1
+                s.derniere = dict(meta or {})
+                return f(s.k - 1)
+        return L()
+
+    def test_synthese_reflexion_jetons_longueur(self):
+        r = B.evaluer(self.lecteur("pense", lambda k: self.vals[k], {"raisonnement": True, "tokens": 1500, "finish": "length"}), self.pages, False)
+        s = B.synthese(r)
+        self.assertEqual((s["reflexion"], s["jetons_moy"], s["longueur"]), (1.0, 1500, 1.0))
+
+    def test_resultat_invalide_detecte(self):
+        r = B.evaluer(self.lecteur("charabia", lambda k: "ظظظظظظ"), self.pages, False)
+        self.assertTrue(B.synthese(r)["invalide"])
+        r = B.evaluer(self.lecteur("bon", lambda k: self.vals[k]), self.pages, False)
+        self.assertFalse(B.synthese(r)["invalide"])
+        r = B.evaluer(self.lecteur("muet", lambda k: ""), self.pages, False)
+        self.assertFalse(B.synthese(r)["invalide"])                           # se taire n'est pas halluciner
+
+    def test_doublons_et_invalides_exclus_du_vote(self):
+        a = B.evaluer(self.lecteur("a", lambda k: self.vals[k]), self.pages, False)
+        b = B.evaluer(self.lecteur("b_copie_de_a", lambda k: self.vals[k]), self.pages, False)
+        c = B.evaluer(self.lecteur("c", lambda k: self.vals[k] if k % 2 else "ظظظظ"), self.pages, False)
+        d = B.evaluer(self.lecteur("d_invalide", lambda k: "ظظظظ"), self.pages, False)
+        comb = B.combinaisons({"a": a, "b_copie_de_a": b, "c": c, "d_invalide": d}, exclus={"d_invalide"})
+        self.assertEqual(comb["doublons"], {"b_copie_de_a": "a"})
+        noms = {x["a"] for x in comb["accords"]} | {x["b"] for x in comb["accords"]}
+        self.assertEqual(noms, {"a", "c"})
+        self.assertEqual(comb["votes"], [])                                   # il ne reste que 2 lecteurs distincts : pas de vote à 3
+
+    def test_rapport_conditions_invalides_doublons(self):
+        inv = B.evaluer(self.lecteur("lm:x", lambda k: "ظظظظظظ"), self.pages, False)
+        inv["conditions"] = {"api": "natif", "contexte": 16384, "reflexion_coupable": True, "quant": "Q4", "taille_go": 8.0}
+        ok = B.evaluer(self.lecteur("lm:y", lambda k: self.vals[k], {"raisonnement": True, "tokens": 900}), self.pages, False)
+        ok["conditions"] = {"api": "natif", "contexte": 4096, "alerte": "contexte chargé de 4096 jetons"}
+        sortie = tempfile.mkdtemp()
+        try:
+            res = {"lm:x": inv, "lm:y": ok}
+            synth = {k: B.synthese(v) for k, v in res.items()}
+            txt = B.ecrire_sorties(sortie, synth, {}, res, {}, 22, self.pages, 1, {}, None, None)
+            self.assertIn("Conditions de mesure", txt)
+            self.assertIn("16384", txt)
+            self.assertIn("jugés invalides", txt)
+            self.assertIn("contexte chargé de 4096", txt)
+            self.assertIn("réfléchissent à chaque réponse", txt)
+        finally:
+            shutil.rmtree(sortie, ignore_errors=True)
+
+
+class TestInstallationFiable(unittest.TestCase):
+    def test_un_telechargement_anterieur_n_est_pas_attribue_au_modele_demande(self):
+        """Cas réel : pendant `lms get Qari…` (introuvable), le téléchargement d'olmOCR lancé avant se termine : il ne doit pas devenir « Qari »."""
+        ids = ["a/b"]
+        sauve = (B._executer, B.trouver_lms)
+        B.trouver_lms = lambda: "/faux/lms"
+        B._executer = lambda cmd, **kw: ids.append("allenai/olmocr-2-7b") if cmd[1] == "get" else None
+        logs = []
+        try:
+            res = B.telecharger_modele({"ids": ["qari"], "telecharger": ["NAMAA-Space/Qari-OCR-0.1-VL-2B-Instruct"]}, lambda: list(ids), log=logs.append)
+        finally:
+            B._executer, B.trouver_lms = sauve
+        self.assertIsNone(res)
+        self.assertTrue(any("sans rapport" in l for l in logs))
+
+    def test_le_bon_modele_est_accepte_meme_avec_un_autre_nom(self):
+        ids = ["a/b"]
+        sauve = (B._executer, B.trouver_lms)
+        B.trouver_lms = lambda: "/faux/lms"
+        B._executer = lambda cmd, **kw: ids.append("NAMAA-Space/Qari-OCR-0.1-VL-2B-GGUF") if cmd[1] == "get" else None
+        try:
+            res = B.telecharger_modele({"ids": ["qari"], "telecharger": ["Qari-OCR"]}, lambda: list(ids), log=lambda *a: None)
+        finally:
+            B._executer, B.trouver_lms = sauve
+        self.assertEqual(res, "NAMAA-Space/Qari-OCR-0.1-VL-2B-GGUF")
+
+
+class TestAjoutManuel(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.sauve = B.FICHIER_MODELES_SUPP
+        B.FICHIER_MODELES_SUPP = os.path.join(self.dir, "benchmark", "modeles_supplementaires.json")
+
+    def tearDown(self):
+        B.FICHIER_MODELES_SUPP = self.sauve
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_ajouter_et_catalogue(self):
+        self.assertEqual(len(B.catalogue()), len(B.CATALOGUE_CITES))
+        B.ajouter_modeles(["qwen/qwen3-vl-4b"])
+        B.ajouter_modeles(["qwen/qwen3-vl-4b", "google/gemma-4-26b-a4b"])        # idempotent
+        noms = [e["nom"] for e in B.catalogue()]
+        self.assertEqual(noms[-2:], ["qwen/qwen3-vl-4b", "google/gemma-4-26b-a4b"])
+        self.assertEqual(len(noms), len(B.CATALOGUE_CITES) + 2)
+
+    def test_modele_ajoute_pris_en_compte_par_cites(self):
+        import argparse
+        B.ajouter_modeles(["google/gemma-4-26b-a4b"])
+        sauve = (B.serveur_ok, B.modeles_lmstudio, B.PAQUETS_PIP, B.tessdata_complet)
+        B.serveur_ok = lambda url: True
+        B.modeles_lmstudio = lambda url: [{"id": "google/gemma-4-26b-a4b", "type": "vlm"}, {"id": "google/gemma-4-12b-qat", "type": "vlm"}]
+        B.PAQUETS_PIP, B.tessdata_complet = {}, lambda: True
+        try:
+            a = argparse.Namespace(url="http://x/v1", oui=False, sans_installation=True, tessdata=[])
+            cands, notes, abandons = B.preparer_cites(a, log=lambda *x: None)
+        finally:
+            B.serveur_ok, B.modeles_lmstudio, B.PAQUETS_PIP, B.tessdata_complet = sauve
+        self.assertIn("lm:google/gemma-4-26b-a4b", cands)
+
+    def test_cli_ajouter(self):
+        self.assertEqual(B.main(["--ajouter", "qwen/qwen3-vl-4b"]), 0)
+        with open(B.FICHIER_MODELES_SUPP, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)[0]["ids"], ["qwen/qwen3-vl-4b"])
+
+
+class TestPaddle(unittest.TestCase):
+    def test_lecture_du_resultat_paddleocr_3(self):
+        class Res(dict):
+            pass
+        self.assertEqual(B.LecteurPaddle._textes([{"rec_texts": ["عالي", "عالم"]}]), ["عالي", "عالم"])
+        self.assertEqual(B.LecteurPaddle._textes([{"res": {"rec_texts": ["أحمد"]}}]), ["أحمد"])
+        obj = type("R", (), {"json": {"res": {"rec_texts": ["عامل"]}}})()
+        self.assertEqual(B.LecteurPaddle._textes([obj]), ["عامل"])
+        self.assertEqual(B.LecteurPaddle._textes(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()
