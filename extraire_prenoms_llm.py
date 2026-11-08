@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "5.6.0"
+VERSION = "5.6.1"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -540,22 +540,57 @@ def _norm_id(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
 
-def trouver_pdf(chemin: str) -> str:
-    """Le PDF donné n'existe pas (ex. « livre.pdf » alors que le fichier s'appelle lelivredesprenom0000geof.pdf) : on cherche un
-    PDF dans le dossier courant puis dans celui du script, en préférant un nom contenant « prenom » ou « livre »."""
-    if chemin and os.path.isfile(chemin):
-        return chemin
+def pdfs_du_dossier() -> list[str]:
+    """PDF du dossier courant puis de celui du script (sans doublon)."""
     trouves: list = []
     for dossier in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
         for f in sorted(glob.glob(os.path.join(dossier, "*.pdf"))):
             if f not in trouves:
                 trouves.append(f)
+    return trouves
+
+
+def trouver_pdf(chemin: str, profil: str = "") -> str:
+    """Le PDF donné n'existe pas : (1) avec --profil, on prend LE PDF du dossier dont le nom correspond au profil ; (2) sinon on cherche un
+    PDF dans le dossier courant puis dans celui du script, en préférant un nom contenant « prenom » ou « livre »."""
+    if chemin and os.path.isfile(chemin):
+        return chemin
+    trouves = pdfs_du_dossier()
+    if profil:
+        import profils as PR
+        try:
+            motifs = PR.charger(profil).get("motifs_fichier", [])
+        except ValueError:
+            motifs = []
+        if motifs:
+            lies = [f for f in trouves if any(re.search(m, os.path.basename(f), re.I) for m in motifs)]
+            if len(lies) == 1:
+                log(f"PDF du profil « {profil} » : {lies[0]}")
+                return lies[0]
+            if len(lies) > 1:
+                log(f"plusieurs PDF correspondent au profil « {profil} » ({', '.join(os.path.basename(x) for x in lies)}) : précise le fichier", "WARN")
+                return chemin
     preferes = [f for f in trouves if re.search(r"prenom|livre", os.path.basename(f), re.I)]
     choix = preferes if len(preferes) == 1 else trouves if len(trouves) == 1 else []
     if choix:
         log(f"PDF « {chemin or '(non précisé)'} » introuvable : utilisation de « {choix[0]} »", "WARN")
         return choix[0]
     return chemin
+
+
+def aide_pdf_introuvable(chemin: str) -> str:
+    """Message d'erreur qui dit quoi faire (texte d'exemple recopié, espaces non protégés, PDF présents dans le dossier)."""
+    msg = f"PDF introuvable : « {chemin or '(non précisé)'} »."
+    if re.search(r"[<>]", chemin or ""):
+        msg += " Le texte entre < > était un exemple : remplace-le par le vrai nom du fichier."
+    else:
+        msg += (" Si le nom contient des espaces ou des parenthèses, mets-le ENTRE GUILLEMETS, par ex. "
+                "python extraire_prenoms_llm.py \".\\mon fichier (1).pdf\" --completer-arabe")
+    import profils as PR
+    ici = [f"  - {os.path.basename(f)}  (profil : {(PR.detecter(f) or {}).get('nom', 'aucun')})" for f in pdfs_du_dossier()]
+    if ici:
+        msg += "\nPDF présents dans ce dossier :\n" + "\n".join(ici[:12]) + "\nAstuce : --profil <nom du profil> trouve le PDF correspondant tout seul."
+    return msg
 
 
 def commande_lms(cle: str, ctx: int, parallel: int = 1) -> str:
@@ -3572,6 +3607,10 @@ def creer_rapport(cfg: Config, chemin_config: str = "", brut_max: int = 25) -> s
         if chemin_config and os.path.exists(chemin_config):
             z.writestr("prenoms_config.json", masquer(_queue_fichier(chemin_config, 100_000).decode("utf-8", "replace")))
         z.writestr("pages.csv", resume_cache_csv(cfg))
+        for nom in ("passe_arabe.csv", "passe_arabe_stats.json"):         # deuxième passe arabe (--completer-arabe)
+            p = os.path.join(cfg.sortie, nom)
+            if os.path.exists(p):
+                z.writestr(nom, masquer(_queue_fichier(p, 500_000).decode("utf-8", "replace")))
         for f in dumps:
             z.writestr("brut/" + os.path.basename(f), masquer(_queue_fichier(f, 20_000).decode("utf-8", "replace")))
         z.writestr("LISEZMOI.txt", (
@@ -3581,6 +3620,7 @@ def creer_rapport(cfg: Config, chemin_config: str = "", brut_max: int = 25) -> s
             "environnement.json   Python, système, versions des paquets, GPU (nvidia-smi)\n"
             "configuration.json   réglages utilisés (prompt résumé par son empreinte, jeton d'API masqué)\n"
             "pages.csv       état de chaque page dans le cache (statut, durée, jetons, tok/s, avertissements)\n"
+            "passe_arabe.csv / passe_arabe_stats.json   résultat de --completer-arabe (lectures adoptées / refusées, coûts)\n"
             "brut/           dernières sorties brutes des essais ratés (fin des réponses et des réflexions)\n\n"
             "Le zip ne contient ni le PDF, ni les images des pages, ni de secret.\n"))
     return chemin
@@ -3664,7 +3704,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{p['nom']:44s} {p.get('langue', '?'):2s}  pages {p.get('pages', {}).get('debut', '?')}-{p.get('pages', {}).get('fin') or 'fin'}  {p.get('methode', '')}  {p.get('description', '')}")
         return 0
     if not (a.export or a.statut or a.diagnostic or a.rapport or a.ecrire_config or a.appliquer_corrections):
-        a.pdf = trouver_pdf(a.pdf)
+        a.pdf = trouver_pdf(a.pdf, a.profil)
     try:
         cfg, profil = cfg_avec_profil(a, argv)
     except ValueError as e:
@@ -3691,7 +3731,7 @@ def main(argv: list[str] | None = None) -> int:
             afficher_statut(cfg)
             return 0
         if not a.export and not a.appliquer_corrections and (not a.pdf or not os.path.exists(a.pdf)):
-            ap.error("indique le chemin du PDF (fichier introuvable)")
+            ap.error(aide_pdf_introuvable(a.pdf))
         if a.autotest:
             autotest(cfg)
             return 0

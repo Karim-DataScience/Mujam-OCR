@@ -119,6 +119,16 @@ class TestPasse(Base):
         self.assertEqual((len(refusee), refusee[0]["nom"], refusee[0]["arabe"], refusee[0]["page"]), (1, "Ajwad", "أجرد", "8"))
         self.assertEqual(sum(r["decision"] == "adoptée" for r in lignes), 5)
 
+    def test_le_rapport_zip_contient_les_fichiers_de_la_passe(self):
+        import zipfile
+        self.ecrire(8, page(8, list(NOMS)))
+        st = X.completer_arabe(self.cfg)
+        X.ecrire_atomique(os.path.join(self.tmp, "passe_arabe_stats.json"), json.dumps(st))
+        with zipfile.ZipFile(X.creer_rapport(self.cfg)) as z:
+            noms = z.namelist()
+        self.assertIn("passe_arabe.csv", noms)
+        self.assertIn("passe_arabe_stats.json", noms)
+
     def test_pas_de_csv_sans_lecture(self):
         self.lectures.clear()
         self.ecrire(8, page(8, list(NOMS)))
