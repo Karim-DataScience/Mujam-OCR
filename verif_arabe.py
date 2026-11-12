@@ -72,7 +72,7 @@ def _normaliser_translit(t: str) -> str:
 def variantes(translit: str) -> list[str]:
     """« Fâdil / Fâdila » -> ['Fâdil', 'Fâdila'] : l'arabe lu peut être celui de n'importe laquelle des formes."""
     t = re.sub(r"\([^)]*\)", " ", unicodedata.normalize("NFKC", translit).replace("ı", "i"))
-    return [v.strip() for v in re.split(r"\s*[/,]\s*|\s+(?:et|ou)\s+", t) if len(v.strip()) >= 2]
+    return [v.strip() for v in re.split(r"\s*[/,=]\s*|\s+(?:et|ou)\s+", t) if len(v.strip()) >= 2]
 
 
 def _unites(t: str, i: int) -> list[list[Unite]]:
@@ -123,6 +123,8 @@ def _unites(t: str, i: int) -> list[list[Unite]]:
         return [[("في", 0.8, "S")] + r for r in suite(i + 1)]
     if c == "\u0002":
         return [[("ا", 0.3, "F"), ("ل", 0.8, "S")] + r for r in suite(i + 1)]
+    if c == "\u0004":                                             # ع (ou alef) facultatif devant une voyelle initiale de mot
+        return [[("ع", 0.0, "F")] + r for r in suite(i + 1)]
     key = cm if cm in CONS else cl
     if cl == "t" and (i + 1 >= len(t) or t[i + 1] in " -/"):
         return [[("تطه", 1.0, "S")] + r for r in suite(i + 1)]       # « -t » final de mot (Rahmat-Allâh) : parfois ة
@@ -141,19 +143,24 @@ def squelettes_attendus(translit: str) -> list[list[Unite]]:
     ART = r"(?:a[lnrsdtzşṣṭḍẓ]|ash|adh|ath)"
     t = re.sub(rf"(^|[\s\-‑–]){ART}[-‑–]", lambda m: m.group(1) + "\u0002", t, flags=re.I)        # article assimilé : ال
     t = re.sub(r"(?<![A-Za-z])a[lhniI1]{1,3}[âaāàáä]h", "\u0003", t, flags=re.I)      # Allâh (et ses lectures OCR « AHâh », « ANHâh »)
+    # --- noms composés de la translittération anglaise (v5.7) : l'arabe écrit des lettres que « Ahmadullah », « Saifuddin », « Sajidur Rahman » n'ont pas
+    t = re.sub(r"(?<=[A-Za-z])[ui]ll[âaāàáä]h\b", "\u0003", t, flags=re.I)                 # -ullah / -illah : ... + الله
+    t = re.sub(r"\bAb[uûū]l(?=[\s\-‑–][A-Za-z])", "Abu\u0002", t, flags=re.I)                 # « Abul Barakat » = ابو البركات : « Abu » + article ال
+    t = re.sub(r"(?i)(?:(?<=[a-z]{2})|(?<=[a-z][\-‑–]))u(l|r|s|n|z|d|t|sh|dh|th)[\s\-‑–]*(?=\1[a-z]{2})", "\u0002", t)   # -ud-Din, -ur Rahman, -us Salam, -ul Latif : ال assimilé
+    t = re.sub(r"(?<=[A-Za-z]{2})\s(?=[AIUEaiue])", " \u0004", t)                              # voyelle initiale d'un 2e mot (« Saghir Ali » = صغير علي) : ع facultatif
     res = _unites(t, 0)
     # fusion des consonnes doublées identiques (shadda)
     propres = []
     for lecture in res[:12]:
         if lecture and lecture[0][2] == "F" and lecture[0][1] < 0.6 and not t.startswith("\u0002"):
-            lecture = [(lecture[0][0] + "ع", min(lecture[0][1], 0.4), "F")] + lecture[1:]   # initiale : أ ou ع
+            lecture = [(lecture[0][0] + "ع", min(lecture[0][1], 0.4), "F"), ("اع", 0.0, "F")] + lecture[1:]   # initiale : أ ou ع (et l'autre des deux, facultative : عا…, ا ع…)
         out = []
         for x in lecture:
             if out and x[2] in "SF" and out[-1][2] == x[2] and x[0] == out[-1][0] and x[1] != 0.8 and out[-1][1] != 0.8 and (x[2] == "S" or x[0] in ("ي", "و")):
                 continue
             out.append(x)
         if out and out[-1][2] == "F" and out[-1][0].startswith("ا") and t[-1:].lower() == "a" and t[-1:] not in _ACCENTS_LONGS:
-            out[-1] = ("هاة", 0.3, "F")                              # « -a » final = ة / ه
+            out[-1] = ("هاةي", 0.3, "F")                             # « -a » final = ة / ه / ى (ى est unifié en ي)
         if out and out[-1][2] == "F" and out[-1][1] == 0.2 and t[-1:] in "âäāàá":
             out[-1] = ("اهيى", 0.2, "F")                                   # « Ṣafwâ » : صَفْوَى / صَفْوَة
         propres.append(out)

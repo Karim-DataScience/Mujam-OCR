@@ -16,7 +16,8 @@ NOMS = {"Abd-ul-Ahad": "عبد الاحد", "Ahdaf": "أهداف", "Ahmad": "أ�
 def page(p, noms, arabe_deja=(), methode=None, blanche=False):
     entrees = [{"prenoms": [{"genre": "MASCULIN", "orthographes": [n], "arabe": NOMS[n] if n in arabe_deja else ""}],
                 "description": f"sens de {n}", "description_incomplete": False} for n in noms]
-    d = {"page": p, "bande": 1, "statut": "ok", "entrees": entrees, "avertissements": [], "penser": False}
+    d = {"page": p, "bande": 1, "decoupe": 1, "nettoyage": True, "modele": "faux", "max_tokens": 8000, "statut": "ok", "avertissements": [], "duree": 30.0,
+         "tokens": 1300, "tokens_reflexion": 0, "tokens_entree": 1100, "tps": 48.0, "ttft": 0.5, "penser": False, "entrees": entrees}
     if methode:
         d["methode"] = methode
     if blanche:
@@ -220,6 +221,88 @@ class TestPasse(Base):
             self.ecrire(p, page(p, list(NOMS)))
         with self.assertRaises(X.ErreurFatale):
             X.completer_arabe(self.cfg)
+
+
+class TestPasseAuto(Base):
+    def cfg_auto(self, **kw):
+        c = X.Config(sortie=self.tmp, pdf="faux.pdf", pages=[8], essais=2, **kw)
+        self.cfg = c
+        return c
+
+    def test_recharge_les_resultats_en_memoire(self):
+        cfg = self.cfg_auto()
+        self.ecrire(8, page(8, list(NOMS)))
+        resultats = {(8, 1): self.lire(8)}
+        st = X.passe_arabe_auto(cfg, resultats)
+        self.assertEqual(st["adoptes"], 6)
+        self.assertEqual([e["prenoms"][0]["arabe"] for e in resultats[(8, 1)]["entrees"]], list(NOMS.values()))    # l'export verra l'arabe
+        with open(os.path.join(self.tmp, "passe_arabe_stats.json"), encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["auto"])
+
+    def test_desactivable(self):
+        self.ecrire(8, page(8, list(NOMS)))
+        res = {(8, 1): self.lire(8)}
+        for kw in ({"passe_arabe_auto": False}, {"decoupe": 2}, {"sans_llm": True}):
+            self.assertEqual(X.passe_arabe_auto(self.cfg_auto(**kw), res), {})
+        X.ARABE_ATTENDU = False
+        self.assertEqual(X.passe_arabe_auto(self.cfg_auto(), res), {})
+        self.assertEqual(self.requetes, [])
+
+    def test_aucune_page_extraite_aucun_message_d_erreur(self):
+        self.assertEqual(X.passe_arabe_auto(self.cfg_auto(), {}), {})            # resultats vide : rien à compléter, pas de bruit
+        self.assertEqual(self.requetes, [])
+
+    def test_une_page_deja_tentee_n_est_pas_redemandee(self):
+        cfg = self.cfg_auto()
+        self.lectures["Ajwad"] = "أجرد"                                          # restera refusée (bloc vide)
+        self.ecrire(8, page(8, list(NOMS)))
+        res = {(8, 1): self.lire(8)}
+        X.passe_arabe_auto(cfg, res)
+        n = len(self.requetes)
+        self.assertTrue(self.lire(8)["passe_arabe_faite"])
+        X.passe_arabe_auto(cfg, res)                                             # 2e fin d'extraction : rien à refaire
+        self.assertEqual(len(self.requetes), n)
+        X.completer_arabe(cfg)                                                   # la commande explicite, elle, réessaie
+        self.assertGreater(len(self.requetes), n)
+
+    def test_un_echec_ne_bloque_jamais_l_export(self):
+        X.resoudre_modele.side_effect = X.ErreurFatale("LM Studio éteint")
+        self.ecrire(8, page(8, list(NOMS)))
+        res = {(8, 1): self.lire(8)}
+        self.assertEqual(X.passe_arabe_auto(self.cfg_auto(), res), {})
+        X.resoudre_modele.side_effect = RuntimeError("bug imprévu")
+        self.assertEqual(X.passe_arabe_auto(self.cfg_auto(), res), {})
+
+    def test_la_consigne_donne_le_sens_de_lecture(self):
+        self.assertIn("DROITE à GAUCHE", X.texte_passe_arabe(["Ahmad"]))
+        self.assertIn("espace à l'intérieur d'un mot", X.texte_passe_arabe(["Ahmad"]))
+
+    def test_option_sans_passe_arabe(self):
+        a = X.valeurs_effectives(os.path.join(tempfile.gettempdir(), "prenoms_aucune_config.json"))
+        import argparse
+        self.assertTrue(X.construire_cfg(argparse.Namespace(**a)).passe_arabe_auto)
+        a["passe_arabe_auto"] = False
+        self.assertFalse(X.construire_cfg(argparse.Namespace(**a)).passe_arabe_auto)
+
+    def test_a_travers_run_pipeline_l_export_contient_l_arabe(self):
+        """Toutes les pages sont déjà en cache : pas d'extraction, mais la passe tourne et l'export reçoit l'arabe ajouté."""
+        cfg = self.cfg_auto()
+        self.ecrire(8, page(8, list(NOMS)))
+        rows, infos, avert = X.run_pipeline(cfg)
+        arabes = [r["prénom_arab_diacritiques"] for r in rows]
+        self.assertEqual(len([a for a in arabes if a]), 6)
+        self.assertEqual(set(arabes), set(NOMS.values()))
+        self.requetes.clear()
+        rows2, _, _ = X.run_pipeline(cfg)                                        # 2e lancement : cache complet, passe déjà faite
+        self.assertEqual(self.requetes, [])
+        self.assertEqual(len(rows2), 6)
+
+    def test_run_pipeline_sans_passe_laisse_les_blocs_vides(self):
+        cfg = self.cfg_auto(passe_arabe_auto=False)
+        self.ecrire(8, page(8, list(NOMS)))
+        rows, _, _ = X.run_pipeline(cfg)
+        self.assertEqual([r["prénom_arab_diacritiques"] for r in rows], [""] * 6)
+        self.assertEqual(self.requetes, [])
 
 
 class TestProfilEtCLI(unittest.TestCase):

@@ -1,0 +1,957 @@
+{
+ "_note": "Vérité terrain de la passe arabe : 119 lectures de la 2e passe sur Abdur Rahman (pdf 8, 17, 20, 21, 36, 63, 72), jugées sur les images du PDF par Claude. 'juste' = lecture correcte au détail de voyelles / hamza / variante de ya près. Les erreurs listées sont celles vues ; il peut en rester.",
+ "lectures": [
+  {
+   "page": 8,
+   "entree": 1,
+   "nom": "Abd-ul-Ahad",
+   "arabe": "عبد الأحد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 2,
+   "nom": "Ahdaf",
+   "arabe": "أهداف",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 3,
+   "nom": "Ahmad",
+   "arabe": "أحمد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 4,
+   "nom": "Ahmadullah",
+   "arabe": "أحمد الله",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 5,
+   "nom": "Ahsab",
+   "arabe": "أحسب",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 6,
+   "nom": "Ahsan",
+   "arabe": "أحسن",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 7,
+   "nom": "Ajawid",
+   "arabe": "أجاويد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 8,
+   "nom": "Ajmal",
+   "arabe": "أجمل",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 9,
+   "nom": "Ajwad",
+   "arabe": "أجود",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 10,
+   "nom": "Akbar",
+   "arabe": "أكبر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 11,
+   "nom": "Akhlaq",
+   "arabe": "أخلاق",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 12,
+   "nom": "Akhtar (Per.)",
+   "arabe": "أختر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 13,
+   "nom": "Akhund",
+   "arabe": "أخوند",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 14,
+   "nom": "Akhund zada",
+   "arabe": "أخوند زاده",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 15,
+   "nom": "Akif",
+   "arabe": "عاكف",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 16,
+   "nom": "Akmal",
+   "arabe": "أكمل",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 8,
+   "entree": 17,
+   "nom": "Akram",
+   "arabe": "أكرم",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 1,
+   "nom": "Bakht (Per.)",
+   "arabe": "بحث",
+   "juste": false,
+   "erreur": "lu « بحث » au lieu de « بخت »"
+  },
+  {
+   "page": 17,
+   "entree": 2,
+   "nom": "Bakhtiyar (Per)",
+   "arabe": "بختیار",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 3,
+   "nom": "Bakur",
+   "arabe": "بكور",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 4,
+   "nom": "Baligh",
+   "arabe": "بليغ",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 5,
+   "nom": "Baqa",
+   "arabe": "بقاء",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 6,
+   "nom": "Baqi",
+   "arabe": "باقي",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 7,
+   "nom": "Abdul Baqi",
+   "arabe": "عبد الباقي",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 8,
+   "nom": "Baqir",
+   "arabe": "باقر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 9,
+   "nom": "Barakat",
+   "arabe": "بركات",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 10,
+   "nom": "Abul Barakat",
+   "arabe": "ابو البركات",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 11,
+   "nom": "Barakatullah",
+   "arabe": "بركات الله",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 12,
+   "nom": "Bareeq",
+   "arabe": "بريق",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 13,
+   "nom": "Barr",
+   "arabe": "بر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 14,
+   "nom": "Abdul Barr",
+   "arabe": "عبد البر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 15,
+   "nom": "Barraq",
+   "arabe": "برّاق",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 16,
+   "nom": "Bashar",
+   "arabe": "بشر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 17,
+   "nom": "Abul Bashar",
+   "arabe": "ابو البشر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 17,
+   "entree": 18,
+   "nom": "Khairul Bashar",
+   "arabe": "خير البشر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 1,
+   "nom": "Dawud",
+   "arabe": "داؤد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 2,
+   "nom": "Abu Dawud",
+   "arabe": "ابو داؤد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 3,
+   "nom": "Didar (Per)",
+   "arabe": "دیدار",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 4,
+   "nom": "Dil (Per)",
+   "arabe": "دل",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 5,
+   "nom": "Dil Nawaz (Per)",
+   "arabe": "دل نواز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 6,
+   "nom": "Dil-awar (Per)",
+   "arabe": "دل آور",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 7,
+   "nom": "Dilwar (Per)",
+   "arabe": "دلوار",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 8,
+   "nom": "Din",
+   "arabe": "دين",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 9,
+   "nom": "Saifuddin",
+   "arabe": "سيف الدين",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 10,
+   "nom": "Diwan",
+   "arabe": "ديوان",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 11,
+   "nom": "Diwan Muhammad",
+   "arabe": "محمد ديوان",
+   "juste": false,
+   "erreur": "ordre des mots inversé (livre : ديوان محمد)"
+  },
+  {
+   "page": 20,
+   "entree": 12,
+   "nom": "Dost Muhammad",
+   "arabe": "محمد دوست",
+   "juste": false,
+   "erreur": "ordre des mots inversé (livre : دوست محمد)"
+  },
+  {
+   "page": 20,
+   "entree": 13,
+   "nom": "Dost (Per)",
+   "arabe": "دوست",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 14,
+   "nom": "Duha",
+   "arabe": "ضحى",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 15,
+   "nom": "Ebrahim (Heb) =Ibrahim",
+   "arabe": "ابراهيم",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 16,
+   "nom": "Ehsan =Ihsan",
+   "arabe": "إحسان",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 20,
+   "entree": 17,
+   "nom": "Ehtesham =Ihtisham",
+   "arabe": "احتشام",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 1,
+   "nom": "Ejaz",
+   "arabe": "اعجاز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 2,
+   "nom": "Elias (Heb)",
+   "arabe": "إلياس",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 3,
+   "nom": "Emad",
+   "arabe": "عماد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 4,
+   "nom": "Emir",
+   "arabe": "أمير",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 5,
+   "nom": "Enam",
+   "arabe": "إنعام",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 6,
+   "nom": "Enayat",
+   "arabe": "عنايت",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 7,
+   "nom": "Faiz",
+   "arabe": "فائز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 8,
+   "nom": "Al-Faiz",
+   "arabe": "الفائز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 9,
+   "nom": "Farih",
+   "arabe": "فارح",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 10,
+   "nom": "Fadi",
+   "arabe": "فادى",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 11,
+   "nom": "Fahd",
+   "arabe": "فهيد",
+   "juste": false,
+   "erreur": "ي ajouté (livre : فهد)"
+  },
+  {
+   "page": 21,
+   "entree": 12,
+   "nom": "Faheem",
+   "arabe": "فهيم",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 13,
+   "nom": "Fahmi",
+   "arabe": "فه مى",
+   "juste": false,
+   "erreur": "espace parasite dans le mot (livre : فهمى)"
+  },
+  {
+   "page": 21,
+   "entree": 14,
+   "nom": "Faid",
+   "arabe": "فائد/فائد",
+   "juste": false,
+   "erreur": "2e variante fausse (livre : فائد/فايد)"
+  },
+  {
+   "page": 21,
+   "entree": 15,
+   "nom": "Faiq",
+   "arabe": "فائق",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 16,
+   "nom": "Fajr",
+   "arabe": "فجر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 17,
+   "nom": "Fikhar",
+   "arabe": "فخار",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 21,
+   "entree": 18,
+   "nom": "Fakhir",
+   "arabe": "فاخر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 1,
+   "nom": "Ismail (Heb)",
+   "arabe": "إسماعيل",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 2,
+   "nom": "Ismat",
+   "arabe": "عصمت",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 3,
+   "nom": "Isra",
+   "arabe": "إسرائيل",
+   "juste": false,
+   "erreur": "lu « إسرائيل » au lieu de « إسراء »"
+  },
+  {
+   "page": 36,
+   "entree": 4,
+   "nom": "Israr",
+   "arabe": "إسرار",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 5,
+   "nom": "Israil",
+   "arabe": "إسرائيل",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 6,
+   "nom": "Istifa’",
+   "arabe": "اصطفاء",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 7,
+   "nom": "Itidal",
+   "arabe": "إعتدال",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 8,
+   "nom": "Itimad",
+   "arabe": "إعتماد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 9,
+   "nom": "Iyad",
+   "arabe": "إياد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 10,
+   "nom": "Izaz",
+   "arabe": "إعزاز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 11,
+   "nom": "Izazuddawlah",
+   "arabe": "إعزازالدولة",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 12,
+   "nom": "Izz",
+   "arabe": "عز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 13,
+   "nom": "Izzuddin",
+   "arabe": "عزالدين",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 14,
+   "nom": "Izzat",
+   "arabe": "عزة",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 15,
+   "nom": "Jabbar",
+   "arabe": "جبار",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 36,
+   "entree": 16,
+   "nom": "Jabir",
+   "arabe": "جابر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 1,
+   "nom": "Pasha (Tur)",
+   "arabe": "باشا",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 2,
+   "nom": "Parvez (Per)",
+   "arabe": "پرویز",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 3,
+   "nom": "Pir (Per)",
+   "arabe": "پیر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 4,
+   "nom": "Qadir",
+   "arabe": "قادر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 5,
+   "nom": "Abdul Qadir",
+   "arabe": "عبد القادر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 6,
+   "nom": "Qabil",
+   "arabe": "قبیل",
+   "juste": false,
+   "erreur": "alef manquant (livre : قابيل)"
+  },
+  {
+   "page": 63,
+   "entree": 7,
+   "nom": "Qadir",
+   "arabe": "قدیر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 8,
+   "nom": "Qahir",
+   "arabe": "قاهر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 9,
+   "nom": "Abdul Qahir",
+   "arabe": "عبد القاهر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 10,
+   "nom": "Qaid",
+   "arabe": "قائد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 11,
+   "nom": "Qaim",
+   "arabe": "قائم",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 12,
+   "nom": "Qais",
+   "arabe": "قیس",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 13,
+   "nom": "Qaiser",
+   "arabe": "قیصر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 63,
+   "entree": 14,
+   "nom": "Qamar",
+   "arabe": "قمر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 1,
+   "nom": "Sadruddin",
+   "arabe": "صدر الدين",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 2,
+   "nom": "Saduh",
+   "arabe": "صدوح",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 3,
+   "nom": "Sadooq",
+   "arabe": "صدوق",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 4,
+   "nom": "Safdar",
+   "arabe": "صفدر",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 5,
+   "nom": "Saffah",
+   "arabe": "سفاح",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 6,
+   "nom": "Safi",
+   "arabe": "صفي",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 7,
+   "nom": "Safiullah",
+   "arabe": "صفي الله",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 8,
+   "nom": "Safiuddin",
+   "arabe": "صفي الدين",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 9,
+   "nom": "Safir",
+   "arabe": "سفير",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 10,
+   "nom": "Safwan",
+   "arabe": "صفوان",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 11,
+   "nom": "Saghir",
+   "arabe": "صغير",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 12,
+   "nom": "Saghir Ali",
+   "arabe": "صغير علي",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 13,
+   "nom": "Sahab",
+   "arabe": "سحاب",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 14,
+   "nom": "Sahl",
+   "arabe": "سهل",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 15,
+   "nom": "Sajid",
+   "arabe": "ساجد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 16,
+   "nom": "Sajidur Rahman",
+   "arabe": "ساجد الرحمن",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 17,
+   "nom": "Sajjad",
+   "arabe": "سجاد",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 18,
+   "nom": "Sakha",
+   "arabe": "سخاء",
+   "juste": true,
+   "erreur": ""
+  },
+  {
+   "page": 72,
+   "entree": 19,
+   "nom": "Sakhawat",
+   "arabe": "سخاوت",
+   "juste": true,
+   "erreur": ""
+  }
+ ]
+}

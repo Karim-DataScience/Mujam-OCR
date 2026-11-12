@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
-VERSION = "5.6.1"
+VERSION = "5.7.0"
 T0 = time.time()
 
 MUET = False            # True : rien sur la console (interface plein écran)
@@ -369,6 +369,7 @@ class Config:
     suivi_ui: float = 0            # intervalle (s) des mises à jour destinées à une interface (0 = aucune)
     log_niveau: str = "DEBUG"      # niveau écrit dans le fichier de log : DEBUG | INFO
     essais: int = 3
+    passe_arabe_auto: bool = True  # après une extraction, complète automatiquement l'arabe des blocs restés vides (completer_arabe) ; --sans-passe-arabe pour l'éviter
     seuil_passe2: float = 0.2      # --completer-arabe : coût d'incohérence (verif_arabe) en dessous duquel une lecture est ADOPTÉE (0 = parfaitement cohérente)
     corps_extra: dict = field(default_factory=dict)
     prompt: str = PROMPT
@@ -2349,6 +2350,8 @@ def _run_pipeline(cfg: Config, controle: Controle | None = None):
         if etat.stop.is_set() and not cfg.fatal and not cfg.interrompu:
             cfg.interrompu = True
             log("arrêt demandé : export de ce qui est déjà calculé (relance la même commande pour reprendre).")
+    if not cfg.sans_llm and not cfg.interrompu and not cfg.fatal:
+        passe_arabe_auto(cfg, resultats)
     return construire(cfg, resultats, echecs, cfg.interrompu)
 
 
@@ -2800,6 +2803,8 @@ def texte_passe_arabe(noms: list[str]) -> str:
     liste = "\n".join(f"{k}. {n}" for k, n in enumerate(noms, 1))
     return ("Cette page d'un dictionnaire de prénoms contient, dans l'ordre, les noms suivants (alphabet latin) :\n" + liste
             + "\n\nPour CHAQUE numéro, recopie l'écriture arabe imprimée sur la page pour ce nom (le même nom en lettres arabes). "
+            "L'arabe se lit de DROITE à GAUCHE : pour un nom de plusieurs mots, écris les mots dans l'ordre de lecture arabe (le premier mot est celui qui est le plus à droite), "
+            "et n'insère jamais d'espace à l'intérieur d'un mot. "
             "Réponds uniquement par une ligne par numéro, au format « numéro. écriture arabe », sans aucun autre texte. "
             "Si un nom n'a pas d'écriture arabe sur la page, écris « numéro. - ».")
 
@@ -2814,7 +2819,7 @@ def lignes_numerotees(texte: str) -> dict[int, str]:
     return out
 
 
-def completer_arabe(cfg: Config) -> dict:
+def completer_arabe(cfg: Config, ignorer_marques: bool = True) -> dict:
     """Deuxième passe arabe sur le cache (voir l'en-tête de section). Pages lues par le seul modèle de vision (pas « hybride » / « local »),
     ayant au moins un bloc sans arabe. Écrit dans le cache : `passe_arabe` (adoptions) et `propositions_arabe` (lectures refusées)."""
     if VA is None:
@@ -2826,15 +2831,24 @@ def completer_arabe(cfg: Config) -> dict:
     t_debut = time.time()
     revue: list[dict] = []                   # une ligne par lecture (adoptée ou refusée) -> passe_arabe.csv
     a_faire = []
+    n_cache = 0
     for p in cfg.pages:
         d, _ = lire_cache(cfg, p, 1, tolerer=True)
+        n_cache += bool(d)
         if not d or d.get("blanche") or not d.get("entrees") or d.get("methode") not in (None, "", "vlm"):
+            continue
+        if d.get("passe_arabe_faite") and not ignorer_marques:               # déjà tentée (appel automatique) : on ne redemande pas les blocs refusés
             continue
         blocs = [(i, j, b) for i, e in enumerate(d["entrees"]) for j, b in enumerate(e["prenoms"])]
         vides = {(i, j) for i, j, b in blocs if not b.get("arabe") and not b.get("valide")}
         if vides:
             a_faire.append((p, d, blocs, vides))
-    log(f"deuxième passe arabe : {sum(len(v) for *_, v in a_faire)} bloc(s) sans arabe sur {len(a_faire)} page(s) du cache.")
+    if not n_cache:                          # sans cache il n'y a rien à compléter ; surtout ne pas exporter un résultat vide par-dessus un export existant
+        stats["cache_absent"] = True
+        log(f"✘ aucun cache dans « {os.path.join(cfg.sortie, 'cache')} » : la deuxième passe COMPLÈTE un cache existant. Copie ici le dossier `cache` de l'extraction "
+            "précédente (celle qui a produit les pages sans arabe), ou lance d'abord l'extraction ; rien n'a été exporté.", "ERROR")
+        return stats
+    log(f"deuxième passe arabe : {sum(len(v) for *_, v in a_faire)} bloc(s) sans arabe sur {len(a_faire)} page(s) du cache ({n_cache} page(s) en cache sur {len(cfg.pages)} demandée(s)).")
     if not a_faire:
         return stats
     info = resoudre_modele(cfg)
@@ -2906,12 +2920,14 @@ def completer_arabe(cfg: Config) -> dict:
                 revue.append({"page": p, **ligne, "decision": "refusée (à valider)", "indice": indice})
         stats["adoptes"] += len(adoptes)
         stats["refuses"] += len(refuses)
-        if adoptes or refuses:
+        if adoptes or refuses or lus:
+            d["passe_arabe_faite"] = True
             if adoptes:
                 d.setdefault("passe_arabe", []).extend(adoptes)
             if refuses:
                 d.setdefault("propositions_arabe", []).extend(refuses)
-            d.setdefault("avertissements", []).append(f"passe arabe : {len(adoptes)} lecture(s) adoptée(s), {len(refuses)} refusée(s) (incohérentes avec la translittération)")
+            if adoptes or refuses:
+                d.setdefault("avertissements", []).append(f"passe arabe : {len(adoptes)} lecture(s) adoptée(s), {len(refuses)} refusée(s) (incohérentes avec la translittération)")
             ecrire_atomique(chemin_cache(cfg, p, 1), json.dumps(d, ensure_ascii=False, indent=1))
         evenement("passe_arabe", chunk=ident, cibles=len(vides), adoptes=len(adoptes), refuses=len(refuses), ancrages=ancrages, accords=accords)
         log(f"  {ident} : {len(vides)} bloc(s) sans arabe, {len(adoptes)} adopté(s), {len(refuses)} refusé(s)")
@@ -2928,6 +2944,31 @@ def completer_arabe(cfg: Config) -> dict:
     log(f"PASSE ARABE : {stats['adoptes']} lecture(s) adoptée(s) sur {stats['blocs_vides']} bloc(s) vide(s) ; {stats['refuses']} refusée(s) (incohérentes avec la translittération, "
         f"gardées dans `propositions_arabe`) ; {stats['non_lus']} non lue(s) ; {stats['pages_douteuses']} page(s) douteuse(s).")
     return stats
+
+
+def passe_arabe_auto(cfg: Config, resultats: dict) -> dict:
+    """Fin d'extraction : complète l'arabe des blocs restés vides (voir completer_arabe), puis recharge dans `resultats` les pages modifiées pour que l'export
+    les contienne. Ne s'applique qu'aux profils qui attendent de l'arabe, découpe 1 ; une page déjà tentée n'est pas redemandée. Ne lève jamais : un échec
+    est journalisé et l'export se fait avec ce qu'on a."""
+    if not cfg.passe_arabe_auto or not ARABE_ATTENDU or cfg.decoupe != 1 or cfg.sans_llm or not resultats:
+        return {}
+    try:
+        st = completer_arabe(cfg, ignorer_marques=False)
+    except Interrompu:
+        log("passe arabe automatique interrompue.", "WARN")
+        return {}
+    except Exception as e:                                           # noqa: BLE001 : ne jamais empêcher l'export
+        log(f"passe arabe automatique abandonnée : {type(e).__name__}: {e}", "WARN")
+        return {}
+    if st.get("cache_absent") or not st.get("requetes"):
+        return st
+    ecrire_atomique(os.path.join(cfg.sortie, "passe_arabe_stats.json"), json.dumps({"modele": cfg.modele, "seuil": cfg.seuil_passe2, "auto": True, **st}, ensure_ascii=False, indent=1))
+    if st.get("adoptes"):
+        for ch in list(resultats):
+            d, _ = lire_cache(cfg, *ch, tolerer=True)
+            if d is not None:
+                resultats[ch] = d
+    return st
 
 
 # ============================================================================
@@ -3460,6 +3501,8 @@ def creer_parser() -> argparse.ArgumentParser:
     ap.add_argument("--completer-arabe", action="store_true", dest="completer_arabe",
                     help="deuxième passe : redemande au modèle (sans réflexion, liste numérotée des noms) l'arabe des blocs restés vides, ne retient que les lectures "
                          "cohérentes avec la translittération (cache existant, profils « modèle de vision seul »), puis ré-exporte")
+    ap.add_argument("--sans-passe-arabe", action="store_false", dest="passe_arabe_auto",
+                    help="ne lance PAS automatiquement la deuxième passe arabe à la fin d'une extraction (elle reste disponible avec --completer-arabe)")
     ap.add_argument("--seuil-passe2", type=float, default=0.2, dest="seuil_passe2",
                     help="coût d'incohérence (verif_arabe) sous lequel une lecture de --completer-arabe est adoptée (défaut 0,2 ; 0 = parfaitement cohérente)")
     ap.add_argument("--profil", default="", help="profil du document (nom dans profils/ ou chemin .json) ; détecté d'après le nom du PDF sinon")
@@ -3531,7 +3574,7 @@ def construire_cfg(a) -> Config:
                  stall=int(a.stall), attente=int(a.attente), suivi=int(a.suivi), essais=max(1, int(a.essais)), refaire=bool(a.refaire),
                  sauver_images=bool(a.sauver_images), ancien=a.ancien, export_tous=int(a.export_tous), sans_llm=bool(a.export),
                  cle_api=a.cle_api, log_niveau=a.log_niveau, methode=a.methode, tesseract=a.tesseract,
-                 tessdata=a.tessdata, tess_lang=a.tess_lang, seuil_passe2=float(getattr(a, "seuil_passe2", 0.2)))
+                 tessdata=a.tessdata, tess_lang=a.tess_lang, seuil_passe2=float(getattr(a, "seuil_passe2", 0.2)), passe_arabe_auto=bool(getattr(a, "passe_arabe_auto", True)))
     if a.corps_extra:
         try:
             cfg.corps_extra = json.loads(a.corps_extra) if isinstance(a.corps_extra, str) else dict(a.corps_extra)
@@ -3755,6 +3798,8 @@ def main(argv: list[str] | None = None) -> int:
             cfg.sans_llm = True                                # ré-export depuis le cache (relectures comprises)
         if a.completer_arabe:
             st_p2 = completer_arabe(cfg)
+            if st_p2.get("cache_absent"):
+                sys.exit(2)
             ecrire_atomique(os.path.join(cfg.sortie, "passe_arabe_stats.json"), json.dumps({"modele": cfg.modele, "seuil": cfg.seuil_passe2, **st_p2}, ensure_ascii=False, indent=1))
             cfg.sans_llm = True                                # ré-export depuis le cache (passe arabe comprise)
         rows, infos, avert = run_pipeline(cfg)

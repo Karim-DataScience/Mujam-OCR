@@ -81,5 +81,24 @@ class TestMessage(Base):
         self.assertEqual(os.path.basename(vus.get("pdf", "")), ABDUR)
 
 
+class TestCacheAbsent(Base):
+    def test_sans_cache_la_passe_s_arrete_et_n_exporte_rien(self):
+        sortie = os.path.join(self.tmp, "sortie_vide")
+        err = io.StringIO()
+        with mock.patch.object(X.sys, "argv", ["x", "--profil", "abdur_rahman_dictionary_of_muslim_names", "--completer-arabe", "--sortie", sortie]), \
+                mock.patch.object(X, "resoudre_modele") as modele, self.assertRaises(SystemExit) as e:
+            X.main()
+        self.assertEqual(e.exception.code, 2)
+        modele.assert_not_called()                                              # LM Studio n'est même pas sollicité
+        self.assertFalse(os.path.exists(os.path.join(sortie, "prenoms_arabes.csv")))
+        self.assertFalse(os.path.exists(os.path.join(sortie, "passe_arabe_stats.json")))
+
+    def test_stats_cache_absent(self):
+        cfg = X.Config(sortie=os.path.join(self.tmp, "s"), pdf="x.pdf", pages=[7, 8])
+        st = X.completer_arabe(cfg)
+        self.assertTrue(st["cache_absent"])
+        self.assertEqual(st["requetes"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
